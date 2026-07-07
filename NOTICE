@@ -1,0 +1,25 @@
+# NOTICE
+
+PlayerKit links FFmpeg, which is distributed under the LGPL v2.1+ license.
+
+- FFmpeg source: https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.gz
+- Build script: scripts/build_ffmpeg.sh (generates the xcframeworks in Sources/CFFmpeg/xcframeworks/)
+
+## Replacing FFmpeg Libraries
+
+To comply with LGPL, you must be able to replace the FFmpeg libraries with your own build:
+
+1. Clone this repository.
+2. Run `scripts/build_ffmpeg.sh` with your custom FFmpeg configuration.
+3. Replace the contents of `Sources/CFFmpeg/xcframeworks/` with the output.
+4. Rebuild your application.
+
+## Bundled Libraries
+
+The following FFmpeg libraries are bundled as xcframeworks:
+
+- libavcodec (LGPL v2.1+)
+- libavformat (LGPL v2.1+)
+- libavutil (LGPL v2.1+)
+- libswresample (LGPL v2.1+)
+- libswscale (LGPL v2.1+)
