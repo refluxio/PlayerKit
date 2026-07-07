@@ -4,6 +4,9 @@ import CoreImage
 import Metal
 import QuartzCore
 import PlayerKit
+import os
+
+private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "renderer")
 
 final class MetalRenderer: VideoRenderer {
     private let device: MTLDevice
@@ -28,7 +31,7 @@ final class MetalRenderer: VideoRenderer {
         // but set it as a hint to the compositor.
         self.metalLayer.contentsGravity = .resizeAspect
         self.ciContext = CIContext(mtlDevice: device, options: [.workingColorSpace: NSNull()])
-        NSLog("[MetalRenderer] init OK, device=\(device.name)")
+        logger.info("init OK, device=\(device.name)")
     }
 
     func display(pixelBuffer: CVPixelBuffer) {
@@ -61,7 +64,7 @@ final class MetalRenderer: VideoRenderer {
 
         displayedFrames += 1
         if displayedFrames <= 3 {
-            NSLog("[MetalRenderer] displayed frame #\(displayedFrames): \(srcW)x\(srcH)")
+            logger.info("displayed frame #\(self.displayedFrames): \(srcW)x\(srcH)")
         }
     }
 
@@ -71,7 +74,7 @@ final class MetalRenderer: VideoRenderer {
 
     func flush() {
         if displayedFrames > 0 {
-            NSLog("[MetalRenderer] flush, displayed \(displayedFrames) frames total")
+            logger.info("flush, displayed \(self.displayedFrames) frames total")
         }
         displayedFrames = 0
         // Don't set contents = nil — CAMetalLayer's contents is not a CGImage like

@@ -1,14 +1,27 @@
 import Foundation
 
+/// Media metadata probe. Implementations parse containers and extract stream info.
 public protocol MediaProbable: Sendable {
+    /// Probe a media URL and return parsed stream information.
+    /// - Parameters:
+    ///   - url: Media URL to probe.
+    ///   - headers: HTTP headers included in the request.
+    /// - Returns: Parsed probe result with duration and stream lists.
+    /// - Throws: ProbeError on failure.
     func probe(url: URL, headers: [String: String]) async throws -> MediaProbeResult
 }
 
+/// Result of a media probe, containing duration, streams, and container format.
 public struct MediaProbeResult: Sendable {
+    /// Media duration in seconds, nil if unknown.
     public let duration: Double?
+    /// Detected video streams.
     public let videoStreams: [VideoStreamInfo]
+    /// Detected audio streams.
     public let audioStreams: [AudioStreamInfo]
+    /// Detected subtitle streams.
     public let subtitleStreams: [SubtitleStreamInfo]
+    /// Container format string (e.g. "matroska", "mp4").
     public let container: String?
 
     public init(duration: Double?, videoStreams: [VideoStreamInfo],
@@ -22,14 +35,23 @@ public struct MediaProbeResult: Sendable {
     }
 }
 
+/// Metadata for a single video stream.
 public struct VideoStreamInfo: Sendable {
+    /// Stream index in the container.
     public let index: Int
+    /// Video codec name (e.g. "h264", "hevc").
     public let codec: String
+    /// Display width in pixels.
     public let width: Int
+    /// Display height in pixels.
     public let height: Int
+    /// Nominal frame rate in fps.
     public let frameRate: Double
+    /// Whether the stream uses HDR colorimetry.
     public let isHDR: Bool
+    /// HDR format string (e.g. "SMPTE ST 2086", "Dolby Vision").
     public let hdrFormat: String?
+    /// Color transfer characteristic (e.g. "smpte2084", "arib-std-b67").
     public let colorTransfer: String?
 
     public init(index: Int, codec: String, width: Int, height: Int, frameRate: Double,
@@ -45,12 +67,19 @@ public struct VideoStreamInfo: Sendable {
     }
 }
 
+/// Metadata for a single audio stream.
 public struct AudioStreamInfo: Sendable {
+    /// Stream index in the container.
     public let index: Int
+    /// Audio codec name (e.g. "aac", "opus", "ac3").
     public let codec: String
+    /// Language code (BCP 47 or ISO 639).
     public let language: String?
+    /// Number of audio channels.
     public let channels: Int
+    /// Whether this stream is flagged as default in the container.
     public let isDefault: Bool
+    /// Human-readable track title.
     public let title: String?
 
     public init(index: Int, codec: String, language: String?, channels: Int,
@@ -64,11 +93,17 @@ public struct AudioStreamInfo: Sendable {
     }
 }
 
+/// Metadata for a single subtitle stream.
 public struct SubtitleStreamInfo: Sendable {
+    /// Stream index in the container.
     public let index: Int
+    /// Subtitle codec name (e.g. "subrip", "ass", "mov_text").
     public let codec: String
+    /// Language code (BCP 47 or ISO 639).
     public let language: String?
+    /// Whether this stream is flagged as default in the container.
     public let isDefault: Bool
+    /// Human-readable track title.
     public let title: String?
 
     public init(index: Int, codec: String, language: String?,

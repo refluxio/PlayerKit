@@ -1,6 +1,9 @@
 import Foundation
 import AudioToolbox
 import CoreAudio
+import os
+
+private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "audio.output")
 
 final class AudioOutput {
     private var audioQueue: AudioQueueRef?
@@ -39,7 +42,7 @@ final class AudioOutput {
                                      Unmanaged.passUnretained(self).toOpaque(),
                                      nil, nil, 0, &audioQueue)
         guard rc == noErr, let queue = audioQueue else {
-            NSLog("[AudioOutput] AudioQueueNewOutput FAILED: \(rc)")
+            logger.error("AudioQueueNewOutput FAILED: \(rc)")
             return
         }
 
@@ -62,7 +65,7 @@ final class AudioOutput {
         running = true
         enqueuedFrames = 0
         bufferedFrameCount = 0
-        NSLog("[AudioOutput] started: \(sr)Hz \(ch)ch")
+        logger.info("started: \(sr)Hz \(ch)ch")
     }
 
     func stop() {
@@ -74,7 +77,7 @@ final class AudioOutput {
         paused = false
         bufferedFrameCount = 0
         if enqueuedFrames > 0 {
-            NSLog("[AudioOutput] stopped, enqueued \(enqueuedFrames) frames total")
+            logger.info("stopped, enqueued \(self.enqueuedFrames) frames total")
         }
     }
 
@@ -97,7 +100,7 @@ final class AudioOutput {
         var buffer: AudioQueueBufferRef?
         let rc = AudioQueueAllocateBuffer(queue, UInt32(frame.data.count), &buffer)
         guard rc == noErr, let buf = buffer else {
-            NSLog("[AudioOutput] AudioQueueAllocateBuffer FAILED: \(rc)")
+            logger.error("AudioQueueAllocateBuffer FAILED: \(rc)")
             return
         }
         frame.data.copyBytes(to: buf.pointee.mAudioData.assumingMemoryBound(to: UInt8.self),

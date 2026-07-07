@@ -3,6 +3,9 @@ import CoreMedia
 import CoreVideo
 import VideoToolbox
 import CFFmpeg
+import os
+
+private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "decoder.video")
 
 // MARK: - VTVideoDecoder
 // Hardware video decoder using VideoToolbox for H.264 and HEVC.
@@ -39,13 +42,13 @@ final class VTVideoDecoder {
             self.width             = Int(dims.width)
             self.height            = Int(dims.height)
             self.needsParamSetInit = false
-            NSLog("[VTVideoDecoder] init OK from codecpar: \(self.width)x\(self.height)")
+            logger.info("init OK from codecpar: \(self.width)x\(self.height)")
         } else {
             // Will initialise from in-band parameter sets (first IDR packet)
             self.width             = Int(cp.width)
             self.height            = Int(cp.height)
             self.needsParamSetInit = true
-            NSLog("[VTVideoDecoder] \(isH264 ? "H.264" : "HEVC") — waiting for in-band param sets")
+            logger.info("\(self.isH264 ? "H.264" : "HEVC") — waiting for in-band param sets")
         }
     }
 
@@ -122,7 +125,7 @@ final class VTVideoDecoder {
 
     deinit {
         if let session { VTDecompressionSessionInvalidate(session) }
-        NSLog("[VTVideoDecoder] deinit")
+        logger.info("deinit")
     }
 
     // MARK: - Private helpers
@@ -136,7 +139,7 @@ final class VTVideoDecoder {
         } else { desc = nil }
 
         guard let d = desc, let s = VTVideoDecoder.makeSession(formatDesc: d) else {
-            NSLog("[VTVideoDecoder] failed to init from in-band params")
+            logger.error("failed to init from in-band params")
             initFailed = true
             return
         }
@@ -146,7 +149,7 @@ final class VTVideoDecoder {
         self.width  = Int(dims.width)
         self.height = Int(dims.height)
         self.needsParamSetInit = false
-        NSLog("[VTVideoDecoder] init OK from in-band params: \(self.width)x\(self.height)")
+        logger.info("init OK from in-band params: \(self.width)x\(self.height)")
     }
 
     private func vtDecode(lpData: Data,
@@ -206,7 +209,7 @@ final class VTVideoDecoder {
         if let ext = cp.extradata {
             let addr = UInt(bitPattern: ext)
             if addr >= 0x100000000, cp.extradata_size >= 4 {
-                NSLog("[VTVideoDecoder] extradata \(cp.extradata_size)B from codecpar")
+                logger.info("extradata \(cp.extradata_size)B from codecpar")
                 return Array(UnsafeBufferPointer(start: ext, count: Int(cp.extradata_size)))
             }
         }
@@ -219,7 +222,7 @@ final class VTVideoDecoder {
             guard sd.type == AV_PKT_DATA_NEW_EXTRADATA,
                   let data = sd.data, sd.size >= 4,
                   UInt(bitPattern: data) >= 0x100000000 else { continue }
-            NSLog("[VTVideoDecoder] extradata \(sd.size)B from coded_side_data[\(i)]")
+            logger.info("extradata \(sd.size)B from coded_side_data[\(i)]")
             return Array(UnsafeBufferPointer(start: data, count: Int(sd.size)))
         }
         return nil
@@ -266,7 +269,7 @@ final class VTVideoDecoder {
                     nalUnitHeaderLength: 4, formatDescriptionOut: &desc)
             }
         }
-        if status != noErr { NSLog("[VTVideoDecoder] H264FormatDesc failed: \(status)") }
+        if status != noErr { logger.error("H264FormatDesc failed: \(status)") }
         return status == noErr ? desc : nil
     }
 
@@ -312,7 +315,7 @@ final class VTVideoDecoder {
                 }
             }
         }
-        if status != noErr { NSLog("[VTVideoDecoder] HEVCFormatDesc failed: \(status)") }
+        if status != noErr { logger.error("HEVCFormatDesc failed: \(status)") }
         return status == noErr ? desc : nil
     }
 
@@ -356,7 +359,7 @@ final class VTVideoDecoder {
             allocator: kCFAllocatorDefault, formatDescription: formatDesc,
             decoderSpecification: nil, imageBufferAttributes: attrs as CFDictionary,
             outputCallback: nil, decompressionSessionOut: &session)
-        if status != noErr { NSLog("[VTVideoDecoder] session create failed: \(status)") }
+        if status != noErr { logger.error("session create failed: \(status)") }
         return status == noErr ? session : nil
     }
 }

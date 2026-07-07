@@ -1,6 +1,9 @@
 import Foundation
 import CoreMedia
 import CFFmpeg
+import os
+
+private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "demuxer")
 
 enum DemuxerError: Error {
     case openFailed(Int32)
@@ -36,27 +39,27 @@ final class FFmpegDemuxer: @unchecked Sendable {
         av_dict_free(&opts)
 
         guard ret == 0 else {
-            NSLog("[Demuxer] avformat_open_input FAILED, ret=\(ret)")
+            logger.error("avformat_open_input FAILED, ret=\(ret)")
             throw DemuxerError.openFailed(ret)
         }
-        NSLog("[Demuxer] avformat_open_input OK")
+        logger.info("avformat_open_input OK")
 
         let infoRet = avformat_find_stream_info(formatCtx, nil)
         guard infoRet >= 0 else {
-            NSLog("[Demuxer] avformat_find_stream_info FAILED, ret=\(infoRet)")
+            logger.error("avformat_find_stream_info FAILED, ret=\(infoRet)")
             throw DemuxerError.noStreams
         }
 
         guard let ctx = formatCtx else { return }
         let nbStreams = ctx.pointee.nb_streams
-        NSLog("[Demuxer] found \(nbStreams) streams")
+        logger.info("found \(nbStreams) streams")
 
         for i in 0..<Int(nbStreams) {
             guard let stream = ctx.pointee.streams[i] else { continue }
             let codecType = stream.pointee.codecpar.pointee.codec_type
             let codecId = stream.pointee.codecpar.pointee.codec_id
             let cp = stream.pointee.codecpar.pointee
-            NSLog("[Demuxer] stream[\(i)]: type=\(codecType.rawValue) codec=\(codecId != AV_CODEC_ID_NONE ? String(cString: avcodec_get_name(codecId)) : "none") \(cp.width)x\(cp.height)")
+            logger.info("stream[\(i)]: type=\(codecType.rawValue) codec=\(codecId != AV_CODEC_ID_NONE ? String(cString: avcodec_get_name(codecId)) : "none") \(cp.width)x\(cp.height)")
 
             if codecType == AVMEDIA_TYPE_VIDEO && videoStream == nil {
                 videoStream = stream
@@ -84,9 +87,9 @@ final class FFmpegDemuxer: @unchecked Sendable {
         // HTTP connection; no second 115 session is opened.
         duration = seekRefine(ctx: ctx, hint: duration)
         if duration != containerDur {
-            NSLog("[Demuxer] duration refined: \(String(format: "%.1f", containerDur))s → \(String(format: "%.1f", duration))s")
+            logger.info("duration refined: \(String(format: "%.1f", containerDur))s → \(String(format: "%.1f", self.duration))s")
         }
-        NSLog("[Demuxer] videoIdx=\(videoStreamIndex) audioIdx=\(audioStreamIndex) duration=\(String(format: "%.1f", duration))s")
+        logger.info("videoIdx=\(self.videoStreamIndex) audioIdx=\(self.audioStreamIndex) duration=\(String(format: "%.1f", self.duration))s")
     }
 
     // Seek to end of the current context, read the last PTS, then seek back.
@@ -124,7 +127,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
         let ret = av_read_frame(ctx, pkt)
         guard ret == 0, let packet = pkt else {
             if ret < 0 {
-                NSLog("[Demuxer] av_read_frame error: \(ret)")
+                logger.error("av_read_frame error: \(ret)")
             }
             av_packet_free(&pkt)
             return nil
@@ -186,7 +189,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
         guard let ctx = formatCtx else { return false }
         let targetTs = Int64(time * Double(AV_TIME_BASE))
         let ok = av_seek_frame(ctx, -1, targetTs, Int32(AVSEEK_FLAG_BACKWARD)) >= 0
-        NSLog("[Demuxer] seek to \(String(format: "%.1f", time))s \(ok ? "OK" : "FAILED")")
+        logger.info("seek to \(String(format: "%.1f", time))s \(ok ? "OK" : "FAILED")")
         return ok
     }
 

@@ -1,5 +1,8 @@
 import Foundation
 import CFFmpeg
+import os
+
+private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "decoder.audio")
 
 struct PCMFrame {
     let data: Data
@@ -72,13 +75,13 @@ final class FFmpegAudioDecoder {
         self.codecCtx = ctx
 
         guard avcodec_parameters_to_context(ctx, stream.pointee.codecpar) == 0 else {
-            NSLog("[AudioDecoder] avcodec_parameters_to_context FAILED")
+            logger.error("avcodec_parameters_to_context FAILED")
             avcodec_free_context(&self.codecCtx)
             return nil
         }
 
         guard let codec = avcodec_find_decoder(ctx.pointee.codec_id) else {
-            NSLog("[AudioDecoder] codec not found")
+            logger.error("codec not found")
             avcodec_free_context(&self.codecCtx)
             return nil
         }
@@ -89,13 +92,13 @@ final class FFmpegAudioDecoder {
         // avcodec_open2. The codec reads all config (sample_rate, extradata, etc.)
         // from coded_side_data set up by avcodec_parameters_to_context.
 
-        NSLog("[AudioDecoder] opening codec (codecpar sr=\(codecpar.sample_rate) ch=\(codecpar.ch_layout.nb_channels) extradata=\(codecpar.extradata_size)B)")
+        logger.info("opening codec (codecpar sr=\(codecpar.sample_rate) ch=\(codecpar.ch_layout.nb_channels) extradata=\(codecpar.extradata_size)B)")
         guard avcodec_open2(ctx, codec, nil) == 0 else {
-            NSLog("[AudioDecoder] avcodec_open2 FAILED")
+            logger.error("avcodec_open2 FAILED")
             avcodec_free_context(&self.codecCtx)
             return nil
         }
-        NSLog("[AudioDecoder] codec opened OK, output: \(outputSampleRate)Hz \(outputChannels)ch")
+        logger.info("codec opened OK, output: \(self.outputSampleRate)Hz \(self.outputChannels)ch")
     }
 
     func decode(packet: UnsafeMutablePointer<AVPacket>) -> PCMFrame? {
@@ -104,7 +107,7 @@ final class FFmpegAudioDecoder {
         guard sendRet == 0 else {
             failedPackets += 1
             if failedPackets <= 3 {
-                NSLog("[AudioDecoder] send_packet FAILED ret=\(sendRet) (#\(failedPackets))")
+                logger.error("send_packet FAILED ret=\(sendRet) (#\(self.failedPackets))")
             }
             return nil
         }
@@ -116,13 +119,13 @@ final class FFmpegAudioDecoder {
         guard recvRet == 0, let f = frame else {
             failedReceives += 1
             if failedReceives <= 5 || failedReceives % 50 == 0 {
-                NSLog("[AudioDecoder] receive_frame[\(failedReceives)] ret=\(recvRet)")
+                logger.error("receive_frame[\(self.failedReceives)] ret=\(recvRet)")
             }
             return nil
         }
 
         if decodedFrames == 0 {
-            NSLog("[AudioDecoder] first frame: sr=\(f.pointee.sample_rate) nb=\(f.pointee.nb_samples) fmt=\(f.pointee.format) ch=\(f.pointee.ch_layout.nb_channels)")
+            logger.info("first frame: sr=\(f.pointee.sample_rate) nb=\(f.pointee.nb_samples) fmt=\(f.pointee.format) ch=\(f.pointee.ch_layout.nb_channels)")
         }
         decodedFrames += 1
         let pts = Double(f.pointee.pts)
@@ -137,7 +140,7 @@ final class FFmpegAudioDecoder {
         let inFormat     = AVSampleFormat(rawValue: frame.pointee.format)
         let nbSamples    = Int(frame.pointee.nb_samples)
         guard nbSamples > 0, inSampleRate > 0 else {
-            NSLog("[AudioDecoder] resample skip: sr=\(frame.pointee.sample_rate) nb=\(frame.pointee.nb_samples) fmt=\(frame.pointee.format)")
+            logger.info("resample skip: sr=\(frame.pointee.sample_rate) nb=\(frame.pointee.nb_samples) fmt=\(frame.pointee.format)")
             return nil
         }
 
@@ -157,11 +160,11 @@ final class FFmpegAudioDecoder {
                                 &inLayout,  inFormat,           inSampleRate,
                                 0, nil)
             guard swrCtx != nil, swr_init(swrCtx) == 0 else {
-                NSLog("[AudioDecoder] swr_init FAILED")
+                logger.error("swr_init FAILED")
                 if swrCtx != nil { swr_free(&swrCtx) }  // don't leave half-init context
                 return nil
             }
-            NSLog("[AudioDecoder] swr init: \(inSampleRate)→\(outputSampleRate)Hz \(inLayout.nb_channels)ch→\(outputChannels)ch")
+            logger.info("swr init: \(inSampleRate)→\(self.outputSampleRate)Hz \(inLayout.nb_channels)ch→\(self.outputChannels)ch")
         }
 
         let outSamples = swr_get_out_samples(swrCtx, Int32(nbSamples))
@@ -192,6 +195,6 @@ final class FFmpegAudioDecoder {
     deinit {
         avcodec_free_context(&codecCtx)
         if swrCtx != nil { swr_free(&swrCtx) }
-        NSLog("[AudioDecoder] deinit, decoded \(decodedFrames) frames")
+        logger.info("deinit, decoded \(self.decodedFrames) frames")
     }
 }

@@ -5,6 +5,9 @@ import CoreVideo
 import QuartzCore
 import PlayerKit
 import CFFmpeg
+import os
+
+private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "backend")
 
 private final class DisplayLinkProxy: NSObject {
     weak var backend: NativeBackend?
@@ -72,7 +75,7 @@ public final class NativeBackend: PlayerBackend {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         try? AVAudioSession.sharedInstance().setActive(true)
         #endif
-        NSLog("[NativeBackend] init OK")
+        logger.info("init OK")
     }
 
     public func play(url: URL, headers: [String: String], seekTo: Duration?, knownDuration: Duration? = nil) {
@@ -81,7 +84,7 @@ public final class NativeBackend: PlayerBackend {
         state.isBuffering = true
         notifyStateChange()
 
-        NSLog("[NativeBackend] play \(url.absoluteString.prefix(120))")
+        logger.info("play \(url.absoluteString.prefix(120))")
 
         // Increment generation so any previously in-flight open is discarded.
         playGeneration += 1
@@ -96,7 +99,7 @@ public final class NativeBackend: PlayerBackend {
             do {
                 try demuxer.open(url: url, headers: headers)
             } catch {
-                NSLog("[NativeBackend] demuxer.open FAILED: \(error)")
+                logger.error("demuxer.open FAILED: \(error)")
                 let msg = error.localizedDescription
                 await MainActor.run { [weak self] in
                     guard let self, self.playGeneration == gen else { return }
@@ -127,15 +130,15 @@ public final class NativeBackend: PlayerBackend {
             // it already reflects the true end-of-stream PTS, not the container placeholder.
             state.duration = Duration.seconds(demuxDur)
         }
-        NSLog("[NativeBackend] duration: knownDuration=\(knownDuration.map{"\(Double($0.components.seconds))s"} ?? "nil") demuxer=\(String(format:"%.1f",demuxDur))s → using \(String(format:"%.1f",Double(state.duration.components.seconds)))s")
+        logger.info("duration: knownDuration=\(knownDuration.map{"\(Double($0.components.seconds))s"} ?? "nil") demuxer=\(String(format:"%.1f",demuxDur))s → using \(String(format:"%.1f",Double(self.state.duration.components.seconds)))s")
 
         if let vs = demuxer.videoStream {
             if let dec = FFmpegVideoDecoder(stream: vs) {
                 videoDecoder = dec; videoWidth = dec.width; videoHeight = dec.height
-                NSLog("[NativeBackend] video: hw=\(dec.isHardware) \(dec.width)x\(dec.height)")
+                logger.info("video: hw=\(dec.isHardware) \(dec.width)x\(dec.height)")
             } else if let dec = VTVideoDecoder(stream: vs) {
                 videoDecoder = dec; videoWidth = dec.width; videoHeight = dec.height
-                NSLog("[NativeBackend] video: VT \(dec.width)x\(dec.height)")
+                logger.info("video: VT \(dec.width)x\(dec.height)")
             }
         }
 
@@ -144,7 +147,7 @@ public final class NativeBackend: PlayerBackend {
             audioDecoder = dec
             let out = AudioOutput(clock: audioClock)
             audioOutput = out
-            NSLog("[NativeBackend] audio: \(dec.outputSampleRate)Hz \(dec.outputChannels)ch")
+            logger.info("audio: \(dec.outputSampleRate)Hz \(dec.outputChannels)ch")
         }
 
         wireJitterBuffer()
@@ -244,7 +247,7 @@ public final class NativeBackend: PlayerBackend {
                     dLock.unlock()
                     if packetCount == 0, !eofRecoveryDone {
                         eofRecoveryDone = true
-                        NSLog("[NativeBackend] immediate EOF, recovering to 0")
+                        logger.error("immediate EOF, recovering to 0")
                         dLock.lock()
                         _ = demuxer.seek(to: 0)
                         videoDec?.flush(); audioDec?.flush()
@@ -257,7 +260,7 @@ public final class NativeBackend: PlayerBackend {
                         }
                         continue
                     }
-                    NSLog("[NativeBackend] demux EOF after \(packetCount) packets")
+                    logger.info("demux EOF after \(packetCount) packets")
                     break
                 }
 
@@ -270,7 +273,7 @@ public final class NativeBackend: PlayerBackend {
                     let pts = ptsValidator.validate(rawPTS)
                     // Debug: log large PTS jumps to detect stream discontinuities
                     if packetCount < 5 || (packetCount % 500 == 0) {
-                        NSLog("[NativeBackend] pkt#\(packetCount) rawPTS=\(String(format:"%.3f",rawPTS)) pts=\(String(format:"%.3f",pts)) audio=\(String(format:"%.3f",clock.audioTime))")
+                        logger.debug("pkt#\(packetCount) rawPTS=\(String(format:"%.3f",rawPTS)) pts=\(String(format:"%.3f",pts)) audio=\(String(format:"%.3f",clock.audioTime))")
                     }
                     let isKey = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
                     let activeSerial = sLock.withLock { self.seekSerial }
@@ -391,21 +394,21 @@ public final class NativeBackend: PlayerBackend {
         guard elapsed > 5.0 else { return }
         let fps = Double(framesSinceLastLog) / elapsed
         let diff = Int((pts - audioTime) * 1000)
-        NSLog("[NativeBackend] q=\(jitterBuffer.count) dur=\(Int(jitterBuffer.duration*1000))ms fps=\(String(format:"%.1f",fps)) diff=\(diff)ms a=\(String(format:"%.2f",audioTime))s v=\(String(format:"%.2f",pts))s buf=\(state.isBuffering)")
+        logger.info("q=\(self.jitterBuffer.count) dur=\(Int(self.jitterBuffer.duration*1000))ms fps=\(String(format:"%.1f",fps)) diff=\(diff)ms a=\(String(format:"%.2f",audioTime))s v=\(String(format:"%.2f",pts))s buf=\(self.state.isBuffering)")
         lastLogTime = now; framesSinceLastLog = 0; ticksSinceLastLog = 0
     }
 
     // MARK: - Controls
 
     public func pause() {
-        NSLog("[NativeBackend] pause")
+        logger.info("pause")
         displayLink?.invalidate(); displayLink = nil; displayLinkProxy = nil
         audioOutput?.pause()
         state.isPlaying = false; notifyStateChange()
     }
 
     public func resume() {
-        NSLog("[NativeBackend] resume")
+        logger.info("resume")
         if jitterBuffer.state == .playing { audioOutput?.resume() }
         startDisplayLink()
         state.isPlaying = true; notifyStateChange()
@@ -413,7 +416,7 @@ public final class NativeBackend: PlayerBackend {
 
     public func seek(to: Duration) {
         let secs = Double(to.components.seconds) + Double(to.components.attoseconds) * 1e-18
-        NSLog("[NativeBackend] seek to \(String(format:"%.1f",secs))s")
+        logger.info("seek to \(String(format:"%.1f",secs))s")
         demuxLock.lock()
         seekLock.withLock { seekSerial += 1 }
         _ = demuxer?.seek(to: secs)
@@ -445,7 +448,7 @@ public final class NativeBackend: PlayerBackend {
 
     public func stop() {
         playGeneration += 1  // discard any in-flight async open
-        NSLog("[NativeBackend] stop (displayed \(displayedVideoFrames) frames)")
+        logger.info("stop (displayed \(self.displayedVideoFrames) frames)")
         displayLink?.invalidate(); displayLink = nil; displayLinkProxy = nil
         demuxCancelled = true
         audioOutput?.stop()

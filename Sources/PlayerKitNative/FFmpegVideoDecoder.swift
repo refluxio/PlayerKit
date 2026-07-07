@@ -3,6 +3,9 @@ import CoreMedia
 import CoreVideo
 import VideoToolbox
 import CFFmpeg
+import os
+
+private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "decoder.video.sw")
 
 final class FFmpegVideoDecoder {
     private var codecCtx: UnsafeMutablePointer<AVCodecContext>?
@@ -18,15 +21,15 @@ final class FFmpegVideoDecoder {
 
         // HEVC is handled entirely by VTVideoDecoder — skip FFmpeg software path.
         guard codecpar.codec_id != AV_CODEC_ID_HEVC else {
-            NSLog("[VideoDecoder] HEVC — delegating to VTVideoDecoder")
+            logger.info("HEVC — delegating to VTVideoDecoder")
             return nil
         }
 
         guard let codec = avcodec_find_decoder(codecpar.codec_id) else {
-            NSLog("[VideoDecoder] codec not found: \(codecpar.codec_id.rawValue)")
+            logger.error("codec not found: \(codecpar.codec_id.rawValue)")
             return nil
         }
-        NSLog("[VideoDecoder] codec=\(String(cString: avcodec_get_name(codecpar.codec_id))) \(codecpar.width)x\(codecpar.height)")
+        logger.info("codec=\(String(cString: avcodec_get_name(codecpar.codec_id))) \(codecpar.width)x\(codecpar.height)")
 
         guard let ctx = avcodec_alloc_context3(codec) else { return nil }
         self.codecCtx = ctx
@@ -43,18 +46,18 @@ final class FFmpegVideoDecoder {
         cp.pointee.nb_coded_side_data = savedNbSD
 
         guard pRet >= 0 else {
-            NSLog("[VideoDecoder] avcodec_parameters_to_context FAILED ret=\(pRet)")
+            logger.error("avcodec_parameters_to_context FAILED ret=\(pRet)")
             FFmpegVideoDecoder.safeFree(&self.codecCtx)
             return nil
         }
-        NSLog("[VideoDecoder] ctx dims: \(ctx.pointee.width)x\(ctx.pointee.height)")
+        logger.info("ctx dims: \(ctx.pointee.width)x\(ctx.pointee.height)")
 
         // Detect sentinel extradata from FFmpeg 8.x coded_side_data API.
         // If extradata is a low-address sentinel, avcodec_open2 would crash.
         if let ext = ctx.pointee.extradata {
             let addr = UInt(bitPattern: ext)
             if addr < 0x100000000 {
-                NSLog("[VideoDecoder] sentinel extradata 0x\(String(addr, radix:16)) — falling back to VTVideoDecoder")
+                logger.info("sentinel extradata 0x\(String(addr, radix:16)) — falling back to VTVideoDecoder")
                 FFmpegVideoDecoder.safeFree(&self.codecCtx)
                 return nil
             }
@@ -73,23 +76,23 @@ final class FFmpegVideoDecoder {
         let openRet = avcodec_open2(ctx, codec, nil)
         if openRet == 0 {
             self.isHardware = (hwDeviceCtx != nil)
-            NSLog("[VideoDecoder] opened OK hw=\(isHardware) \(ctx.pointee.width)x\(ctx.pointee.height)")
+            logger.info("opened OK hw=\(self.isHardware) \(ctx.pointee.width)x\(ctx.pointee.height)")
         } else if hwDeviceCtx != nil {
             // HW failed — retry software
-            NSLog("[VideoDecoder] HW open failed (\(openRet)), retrying SW")
+            logger.error("HW open failed (\(openRet)), retrying SW")
             av_buffer_unref(&ctx.pointee.hw_device_ctx)
             av_buffer_unref(&self.hwDeviceCtx)
             let swRet = avcodec_open2(ctx, codec, nil)
             if swRet == 0 {
                 self.isHardware = false
-                NSLog("[VideoDecoder] SW fallback OK \(ctx.pointee.width)x\(ctx.pointee.height)")
+                logger.info("SW fallback OK \(ctx.pointee.width)x\(ctx.pointee.height)")
             } else {
-                NSLog("[VideoDecoder] SW open also failed (\(swRet))")
+                logger.error("SW open also failed (\(swRet))")
                 FFmpegVideoDecoder.safeFree(&self.codecCtx)
                 return nil
             }
         } else {
-            NSLog("[VideoDecoder] avcodec_open2 FAILED (\(openRet))")
+            logger.error("avcodec_open2 FAILED (\(openRet))")
             FFmpegVideoDecoder.safeFree(&self.codecCtx)
             return nil
         }
@@ -103,7 +106,7 @@ final class FFmpegVideoDecoder {
         guard avcodec_receive_frame(ctx, frame) == 0, let f = frame else { return nil }
         decodedFrames += 1
         if decodedFrames <= 3 {
-            NSLog("[VideoDecoder] frame #\(decodedFrames): \(f.pointee.width)x\(f.pointee.height) fmt=\(f.pointee.format)")
+            logger.info("frame #\(self.decodedFrames): \(f.pointee.width)x\(f.pointee.height) fmt=\(f.pointee.format)")
         }
         if f.pointee.format == Int32(AV_PIX_FMT_VIDEOTOOLBOX.rawValue) {
             return extractHWPixelBuffer(from: f)
@@ -160,7 +163,7 @@ final class FFmpegVideoDecoder {
     deinit {
         FFmpegVideoDecoder.safeFree(&self.codecCtx)
         if hwDeviceCtx != nil { av_buffer_unref(&self.hwDeviceCtx) }
-        NSLog("[VideoDecoder] deinit, decoded \(decodedFrames) frames")
+        logger.info("deinit, decoded \(self.decodedFrames) frames")
     }
 
     // Safely free a codec context that may have sentinel extradata.
