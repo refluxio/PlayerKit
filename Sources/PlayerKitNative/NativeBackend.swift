@@ -26,8 +26,11 @@ public final class NativeBackend: PlayerBackend {
     public private(set) var colorParams = VideoColorParams()
     public var onStateChange: ((PlayerState) -> Void)?
 
-    private let _renderer: MetalRenderer
+    private let _renderer: any VideoRenderer
     public var renderer: any VideoRenderer { _renderer }
+
+    /// Injected PRO audio output backend. When non-nil, replaces AudioUnitOutput.
+    private var _injectedAudioOutput: (any AudioOutputBackend)?
 
     private var _frameSinks: [WeakFrameSink] = []
     private struct WeakFrameSink {
@@ -40,7 +43,7 @@ public final class NativeBackend: PlayerBackend {
 
     // A/V sync modules
     private let audioClock = AudioClock()
-    private var audioOutput: AudioOutput?
+    private var audioUnitOutput: AudioUnitOutput?
     private let jitterBuffer = VideoJitterBuffer()
     private let syncController = SyncController()
     // Set after seek(); cleared by displayNextFrame on first post-seek frame.
@@ -69,8 +72,18 @@ public final class NativeBackend: PlayerBackend {
     private var lastLogTime: Double = 0
     private var lastNotifiedPos: Duration = .zero
 
-    public init() throws {
-        self._renderer = try MetalRenderer()
+    /// Default init: SDR MetalRenderer + AudioUnitOutput (PCM).
+    public convenience init() throws {
+        try self.init(renderer: nil, audioOutput: nil)
+    }
+
+    /// PRO injection init: accepts custom renderer and audio output.
+    /// - Parameters:
+    ///   - renderer: Custom VideoRenderer. nil defaults to MetalRenderer (SDR).
+    ///   - audioOutput: Custom AudioOutputBackend. nil defaults to AudioUnitOutput.
+    public init(renderer: (any VideoRenderer)?, audioOutput: (any AudioOutputBackend)?) throws {
+        self._renderer = try renderer ?? MetalRenderer()
+        self._injectedAudioOutput = audioOutput
         #if canImport(UIKit)
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         try? AVAudioSession.sharedInstance().setActive(true)
@@ -145,8 +158,8 @@ public final class NativeBackend: PlayerBackend {
         if let as_ = demuxer.audioStream,
            let dec = FFmpegAudioDecoder(stream: as_, sampleRate: 44100, channels: 2) {
             audioDecoder = dec
-            let out = AudioOutput(clock: audioClock)
-            audioOutput = out
+            let out = AudioUnitOutput(clock: audioClock)
+            audioUnitOutput = out
             logger.info("audio: \(dec.outputSampleRate)Hz \(dec.outputChannels)ch")
         }
 
@@ -154,7 +167,7 @@ public final class NativeBackend: PlayerBackend {
         startDemuxLoop()
         startDisplayLink()
 
-        if let out = audioOutput, let dec = audioDecoder {
+        if let out = audioUnitOutput, let dec = audioDecoder {
             out.start(sampleRate: dec.outputSampleRate, channels: dec.outputChannels)
             // Pause immediately — jitterBuffer.onStateChange will resume when
             // enough video is buffered (resumeDuration = 2.0s). Without this,
@@ -174,10 +187,10 @@ public final class NativeBackend: PlayerBackend {
             guard let self else { return }
             switch newState {
             case .buffering:
-                self.audioOutput?.pause()
+                self.audioUnitOutput?.pause()
                 self.state.isBuffering = true
             case .playing:
-                self.audioOutput?.resume()
+                self.audioUnitOutput?.resume()
                 self.state.isBuffering = false
             }
             self.notifyStateChange()
@@ -191,7 +204,7 @@ public final class NativeBackend: PlayerBackend {
         let demuxer = self.demuxer!
         let videoDec = videoDecoder
         let audioDec = audioDecoder
-        let audioOut = audioOutput
+        let audioOut = audioUnitOutput
         let clock = audioClock
         let jitter = jitterBuffer
         let dLock = demuxLock
@@ -370,7 +383,7 @@ public final class NativeBackend: PlayerBackend {
         guard let popped = jitterBuffer.pop() else { return }
         syncController.advance(delay: delay, pts: popped.pts,
                                followingPTS: followingPTS, audioTime: audioTime, now: now)
-        _renderer.display(pixelBuffer: popped.pixelBuffer)
+        _renderer.render(pixelBuffer: popped.pixelBuffer, pts: popped.pts, colorParams: colorParams)
         let ptsCopy = popped.pts
         let sinks = self._frameSinks.compactMap { $0.sink }
         for sink in sinks {
@@ -403,13 +416,13 @@ public final class NativeBackend: PlayerBackend {
     public func pause() {
         logger.info("pause")
         displayLink?.invalidate(); displayLink = nil; displayLinkProxy = nil
-        audioOutput?.pause()
+        audioUnitOutput?.pause()
         state.isPlaying = false; notifyStateChange()
     }
 
     public func resume() {
         logger.info("resume")
-        if jitterBuffer.state == .playing { audioOutput?.resume() }
+        if jitterBuffer.state == .playing { audioUnitOutput?.resume() }
         startDisplayLink()
         state.isPlaying = true; notifyStateChange()
     }
@@ -435,11 +448,11 @@ public final class NativeBackend: PlayerBackend {
         // all buffered frames, each calling clock.advance().  Resetting before stop
         // would let those callbacks push the clock past secs.  Reset after stop so
         // it always lands exactly at secs regardless of how many frames were buffered.
-        audioOutput?.stop()
+        audioUnitOutput?.stop()
         audioClock.reset(to: secs, sampleRate: sr)
-        audioOutput?.start(sampleRate: sr, channels: ch)
+        audioUnitOutput?.start(sampleRate: sr, channels: ch)
         // Pause until jitterBuffer has enough video — same as initial play().
-        audioOutput?.pause()
+        audioUnitOutput?.pause()
         // Signal displayNextFrame to calibrate audioClock to actual I-frame PTS.
         // FFmpeg seek lands on the GOP boundary before secs, so audioClock(=secs)
         // would be ahead of the first decoded frame, triggering PacketDropPolicy.
@@ -451,7 +464,7 @@ public final class NativeBackend: PlayerBackend {
         logger.info("stop (displayed \(self.displayedVideoFrames) frames)")
         displayLink?.invalidate(); displayLink = nil; displayLinkProxy = nil
         demuxCancelled = true
-        audioOutput?.stop()
+        audioUnitOutput?.stop()
         demuxLock.lock()
         demuxer?.close(); demuxer = nil
         videoDecoder = nil; audioDecoder = nil

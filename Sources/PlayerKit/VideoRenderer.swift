@@ -55,14 +55,12 @@ public protocol VideoRenderer: AnyObject {
     /// - Parameters:
     ///   - pixelBuffer: Decoded video frame.
     ///   - pts: Presentation timestamp in seconds.
-    func render(pixelBuffer: CVPixelBuffer, pts: Double)
+    ///   - colorParams: Color space parameters for the frame.
+    func render(pixelBuffer: CVPixelBuffer, pts: Double, colorParams: VideoColorParams)
 
     /// Flush pending rendering commands.
     func flush()
 
     /// Clear the renderer surface and show black.
     func clear()
-
-    /// Update color space parameters for HDR/SDR switching.
-    func updateColorParams(_ params: VideoColorParams)
 }

@@ -12,6 +12,7 @@ enum DemuxerError: Error {
 
 final class FFmpegDemuxer: @unchecked Sendable {
     private var formatCtx: UnsafeMutablePointer<AVFormatContext>?
+    var formatContext: UnsafeMutablePointer<AVFormatContext>? { formatCtx }
     private(set) var duration: Double = 0
 
     var videoStreamIndex: Int32 { videoStream.map { $0.pointee.index } ?? -1 }

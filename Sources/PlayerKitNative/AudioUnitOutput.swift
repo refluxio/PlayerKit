@@ -1,11 +1,13 @@
+import AVFoundation
 import Foundation
 import AudioToolbox
 import CoreAudio
 import os
+import PlayerKit
 
 private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "audio.output")
 
-final class AudioOutput {
+public final class AudioUnitOutput: AudioOutputBackend {
     private var audioQueue: AudioQueueRef?
     private let clock: AudioClock
     private var _channels: Int32 = 2
@@ -14,11 +16,49 @@ final class AudioOutput {
     private var running = false
     private var paused = false
 
+    public let supportsPassthrough: Bool = false
+
+    public var bufferedDuration: Double {
+        // Approximate: assume 1024 samples per frame at the output sample rate.
+        Double(bufferedFrameCount) * 1024.0 / Double(clock.sampleRate)
+    }
+
     init(clock: AudioClock) {
         self.clock = clock
     }
 
     deinit { stop() }
+
+    /// Configure the output for a given stream. AudioQueue is already configured
+    /// in start(), so this is a no-op for AudioUnitOutput.
+    public func configure(streamInfo: AudioStreamInfo) async throws {
+        // no-op
+    }
+
+    /// Convert an AVAudioPCMBuffer to a PCMFrame and enqueue it.
+    public func outputPCM(_ buffer: AVAudioPCMBuffer, pts: Double) {
+        guard let floatData = buffer.floatChannelData else { return }
+        let frameCount = Int(buffer.frameLength)
+        let channelCount = Int(buffer.format.channelCount)
+        let totalSamples = frameCount * channelCount
+        var data = Data(count: totalSamples * 4)
+        data.withUnsafeMutableBytes { raw in
+            let dst = raw.assumingMemoryBound(to: Float.self)
+            for ch in 0..<channelCount {
+                let src = floatData[ch]
+                for i in 0..<frameCount {
+                    dst[i * channelCount + ch] = src[i]
+                }
+            }
+        }
+        let frame = PCMFrame(data: data, pts: pts, sampleCount: frameCount)
+        enqueue(frame)
+    }
+
+    /// Compressed passthrough is not supported. No-op.
+    public func outputCompressed(_ packet: Data, pts: Double, codec: String) {
+        // no-op: AudioUnitOutput does not support passthrough
+    }
 
     func start(sampleRate: Int32, channels: Int32) {
         stop()
@@ -81,15 +121,23 @@ final class AudioOutput {
         }
     }
 
+    /// Flush pending audio buffers. Resets state without disposing the queue.
+    public func flush() {
+        guard let queue = audioQueue else { return }
+        AudioQueueStop(queue, true)
+        bufferedFrameCount = 0
+        enqueuedFrames = 0
+    }
+
     /// Pause without destroying the queue or resetting the clock.
-    func pause() {
+    public func pause() {
         guard let queue = audioQueue, !paused else { return }
         paused = true
         AudioQueuePause(queue)
     }
 
     /// Resume after pause().
-    func resume() {
+    public func resume() {
         guard let queue = audioQueue, paused else { return }
         paused = false
         AudioQueueStart(queue, nil)
@@ -134,7 +182,7 @@ private func audioQueueCallback(_ userData: UnsafeMutableRawPointer?,
                                  _ queue: AudioQueueRef,
                                  _ buffer: AudioQueueBufferRef) {
     guard let p = userData else { AudioQueueFreeBuffer(queue, buffer); return }
-    let output = Unmanaged<AudioOutput>.fromOpaque(p).takeUnretainedValue()
+    let output = Unmanaged<AudioUnitOutput>.fromOpaque(p).takeUnretainedValue()
     output._callbackConsumed(byteCount: Int(buffer.pointee.mAudioDataByteSize))
     AudioQueueFreeBuffer(queue, buffer)
 }

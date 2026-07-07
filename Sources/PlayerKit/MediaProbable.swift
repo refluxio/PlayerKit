@@ -11,6 +11,22 @@ public protocol MediaProbable: Sendable {
     func probe(url: URL, headers: [String: String]) async throws -> MediaProbeResult
 }
 
+/// Chapter metadata (DVD-style chapter markers).
+public struct ChapterInfo: Sendable {
+    /// Chapter title, if available.
+    public let title: String?
+    /// Chapter start time in seconds.
+    public let startDuration: Double
+    /// Chapter end time in seconds.
+    public let endDuration: Double
+
+    public init(title: String?, startDuration: Double, endDuration: Double) {
+        self.title = title
+        self.startDuration = startDuration
+        self.endDuration = endDuration
+    }
+}
+
 /// Result of a media probe, containing duration, streams, and container format.
 public struct MediaProbeResult: Sendable {
     /// Media duration in seconds, nil if unknown.
@@ -23,15 +39,18 @@ public struct MediaProbeResult: Sendable {
     public let subtitleStreams: [SubtitleStreamInfo]
     /// Container format string (e.g. "matroska", "mp4").
     public let container: String?
+    /// Detected chapters.
+    public let chapters: [ChapterInfo]
 
     public init(duration: Double?, videoStreams: [VideoStreamInfo],
                 audioStreams: [AudioStreamInfo], subtitleStreams: [SubtitleStreamInfo],
-                container: String?) {
+                container: String?, chapters: [ChapterInfo] = []) {
         self.duration = duration
         self.videoStreams = videoStreams
         self.audioStreams = audioStreams
         self.subtitleStreams = subtitleStreams
         self.container = container
+        self.chapters = chapters
     }
 }
 
@@ -71,6 +90,8 @@ public struct VideoStreamInfo: Sendable {
 public struct AudioStreamInfo: Sendable {
     /// Stream index in the container.
     public let index: Int
+    /// Sample rate in Hz.
+    public let sampleRate: Int
     /// Audio codec name (e.g. "aac", "opus", "ac3").
     public let codec: String
     /// Language code (BCP 47 or ISO 639).
@@ -82,9 +103,10 @@ public struct AudioStreamInfo: Sendable {
     /// Human-readable track title.
     public let title: String?
 
-    public init(index: Int, codec: String, language: String?, channels: Int,
+    public init(index: Int, sampleRate: Int, codec: String, language: String?, channels: Int,
                 isDefault: Bool, title: String?) {
         self.index = index
+        self.sampleRate = sampleRate
         self.codec = codec
         self.language = language
         self.channels = channels
