@@ -25,10 +25,17 @@ final class VTVideoDecoder {
     private var pendingPPS: [UInt8]?
     private var pendingVPS: [UInt8]?
     private var initFailed = false
-    private var consecutiveFailures = 0
+    private var totalAttempts = 0
+    private var failedAttempts = 0
 
-    /// True when HW decoder has failed enough consecutive frames to warrant SW fallback.
-    var needsSoftwareFallback: Bool { consecutiveFailures >= 50 || initFailed }
+    /// True when HW decoder's failure rate exceeds 80% over 50+ frames.
+    /// Rate-based (not consecutive) so occasional VT successes at high FPS
+    /// don't prevent fallback — e.g. 120fps stream where VT decodes 1 frame
+    /// every 50ms (20fps effective) would reset a consecutive counter.
+    var needsSoftwareFallback: Bool {
+        if initFailed { return true }
+        return totalAttempts >= 50 && Double(failedAttempts) / Double(totalAttempts) > 0.8
+    }
 
     // MARK: - init
 
@@ -119,10 +126,9 @@ final class VTVideoDecoder {
         guard !lpData.isEmpty else { return nil }
 
         let result = vtDecode(lpData: lpData, session: session, formatDesc: formatDesc)
-        if result != nil {
-            consecutiveFailures = 0
-        } else if !needsParamSetInit {
-            consecutiveFailures += 1
+        if !needsParamSetInit {
+            totalAttempts += 1
+            if result == nil { failedAttempts += 1 }
         }
         return result
     }

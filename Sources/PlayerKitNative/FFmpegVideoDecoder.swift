@@ -130,6 +130,8 @@ final class FFmpegVideoDecoder {
         }
         if f.pointee.format == Int32(AV_PIX_FMT_VIDEOTOOLBOX.rawValue) {
             return extractHWPixelBuffer(from: f)
+        } else if Self.is10BitPlanar(f.pointee.format) {
+            return create10BitBiplanarBuffer(from: f)
         } else {
             return convertSWFrame(f)
         }
@@ -185,6 +187,127 @@ final class FFmpegVideoDecoder {
         sws_scale(sws, &srcSlice, &srcStride, 0, Int32(h),
                   [base.assumingMemoryBound(to: UInt8.self)], &dstStride)
         return pb
+    }
+
+    // MARK: - 10-bit biplanar output
+
+    /// True when the FFmpeg pixel format is a 10-bit planar YUV variant that the
+    /// MetalRenderer HDR tone-map path can interpret natively via CIImage +
+    /// BT.2020 color space.  Keeping the native format avoids the BGRA round-trip
+    /// that loses HDR metadata and produces washed-out colours.
+    private static func is10BitPlanar(_ fmt: Int32) -> Bool {
+        let f = AVPixelFormat(rawValue: fmt)
+        return f == AV_PIX_FMT_YUV420P10LE || f == AV_PIX_FMT_YUV420P10BE
+    }
+
+    /// Create a `kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange` pixel buffer
+    /// from the FFmpeg 10-bit planar frame.  Colour attachments are set to
+    /// BT.2020 / PQ so CoreImage + MetalRenderer HDR tone-map correctly.
+    private func create10BitBiplanarBuffer(from frame: UnsafeMutablePointer<AVFrame>) -> CVPixelBuffer? {
+        let w = Int(frame.pointee.width), h = Int(frame.pointee.height)
+        guard w > 0, h > 0 else { return nil }
+
+        var pb: CVPixelBuffer?
+        let attrs: [String: Any] = [
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+        ]
+        guard CVPixelBufferCreate(kCFAllocatorDefault, w, h,
+                                   kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                                   attrs as CFDictionary, &pb) == kCVReturnSuccess,
+              let pb else { return nil }
+
+        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
+                              kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
+                              kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
+        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
+                              kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
+
+        CVPixelBufferLockBaseAddress(pb, [])
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+
+        guard let yDst = CVPixelBufferGetBaseAddressOfPlane(pb, 0),
+              let uvDst = CVPixelBufferGetBaseAddressOfPlane(pb, 1) else { return nil }
+        let yStride  = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+        let uvStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 1)
+
+        Self.pack10BitPlane(src: frame.pointee.data.0, srcStride: Int(frame.pointee.linesize.0),
+                            dst: yDst, dstStride: yStride, width: w, height: h)
+        Self.pack10BitUVPlane(srcU: frame.pointee.data.1, srcV: frame.pointee.data.2,
+                               srcStrideU: Int(frame.pointee.linesize.1),
+                               srcStrideV: Int(frame.pointee.linesize.2),
+                               dst: uvDst, dstStride: uvStride,
+                               uvWidth: (w + 1) / 2, height: (h + 1) / 2)
+
+        return pb
+    }
+
+    /// Pack Y plane: width × height samples, 3 × 10-bit → one UInt32 LE.
+    private static func pack10BitPlane(src: UnsafeMutablePointer<UInt8>!, srcStride: Int,
+                                        dst: UnsafeMutableRawPointer, dstStride: Int,
+                                        width: Int, height: Int) {
+        for y in 0..<height {
+            let srcRow = src.advanced(by: y * srcStride)
+            let dstRow = dst.advanced(by: y * dstStride).assumingMemoryBound(to: UInt32.self)
+            pack10BitRow(srcRow: srcRow, dstRow: dstRow, count: width)
+        }
+    }
+
+    /// Pack UV plane: interleave U and V, then pack 3 × 10-bit → one UInt32 LE.
+    private static func pack10BitUVPlane(srcU: UnsafeMutablePointer<UInt8>!, srcV: UnsafeMutablePointer<UInt8>!,
+                                          srcStrideU: Int, srcStrideV: Int,
+                                          dst: UnsafeMutableRawPointer, dstStride: Int,
+                                          uvWidth: Int, height: Int) {
+        for y in 0..<height {
+            let uRow = srcU.advanced(by: y * srcStrideU)
+            let vRow = srcV.advanced(by: y * srcStrideV)
+            let dstRow = dst.advanced(by: y * dstStride).assumingMemoryBound(to: UInt32.self)
+
+            // Build interleaved sample stream: U[0], V[0], U[1], V[1], ...
+            var samples = [UInt32]()
+            samples.reserveCapacity(uvWidth * 2)
+            for i in 0..<uvWidth {
+                samples.append(UInt32(Self.readU16LE(uRow, offset: i * 2)) & 0x3FF)
+                samples.append(UInt32(Self.readU16LE(vRow, offset: i * 2)) & 0x3FF)
+            }
+            while samples.count % 3 != 0 { samples.append(0) }
+
+            var di = 0
+            for ri in stride(from: 0, to: samples.count, by: 3) {
+                dstRow[di] = samples[ri] | (samples[ri + 1] << 10) | (samples[ri + 2] << 20)
+                di += 1
+            }
+        }
+    }
+
+    /// Read a UInt16 LE from an UnsafeMutablePointer<UInt8> at the given byte offset.
+    private static func readU16LE(_ ptr: UnsafeMutablePointer<UInt8>, offset: Int) -> UInt16 {
+        UnsafeRawPointer(ptr).load(fromByteOffset: offset, as: UInt16.self)
+    }
+
+    /// Pack `count` 10-bit samples (UInt16 LE, low 10 bits) into UInt32 LE words (3 per word).
+    private static func pack10BitRow(srcRow: UnsafeMutablePointer<UInt8>,
+                                      dstRow: UnsafeMutablePointer<UInt32>,
+                                      count: Int) {
+        var si = 0, di = 0
+        while si + 2 < count {
+            let s0 = UInt32(readU16LE(srcRow, offset: si * 2)) & 0x3FF; si += 1
+            let s1 = UInt32(readU16LE(srcRow, offset: si * 2)) & 0x3FF; si += 1
+            let s2 = UInt32(readU16LE(srcRow, offset: si * 2)) & 0x3FF; si += 1
+            dstRow[di] = s0 | (s1 << 10) | (s2 << 20)
+            di += 1
+        }
+        // Remainder (1–2 samples) — pad with zero
+        if si < count {
+            var rem = [UInt32]()
+            while si < count {
+                rem.append(UInt32(readU16LE(srcRow, offset: si * 2)) & 0x3FF)
+                si += 1
+            }
+            while rem.count < 3 { rem.append(0) }
+            dstRow[di] = rem[0] | (rem[1] << 10) | (rem[2] << 20)
+        }
     }
 
     func flush() {
