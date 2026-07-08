@@ -44,10 +44,81 @@ final class MetalRenderer: VideoRenderer {
         self.metalLayer.contentsGravity = .resizeAspect
         self.ciContext = CIContext(mtlDevice: device, options: [.workingColorSpace: NSNull()])
 
-        // Load HDR tone-mapping compute pipeline
-        if let lib = device.makeDefaultLibrary(),
-           let fn = lib.makeFunction(name: "hdr_to_sdr") {
+        // Compile the HDR tone-mapping shader at runtime.
+        // Shaders.metal is not auto-compiled by SPM (it warns "unhandled"),
+        // so we embed the source inline and use makeLibrary(source:).
+        let mtlSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        constant float PQ_m1 = 0.1593017578125;
+        constant float PQ_m2 = 78.84375;
+        constant float PQ_c1 = 0.8359375;
+        constant float PQ_c2 = 18.8515625;
+        constant float PQ_c3 = 18.6875;
+
+        float pq_to_linear(float x) {
+            float xp = pow(max(x, 0.0f), 1.0f / PQ_m2);
+            float num = max(xp - PQ_c1, 0.0f);
+            float den = PQ_c2 - PQ_c3 * xp;
+            return pow(num / max(den, 0.0001f), 1.0f / PQ_m1);
+        }
+        float3 pq_to_linear(float3 rgb) {
+            return float3(pq_to_linear(rgb.r), pq_to_linear(rgb.g), pq_to_linear(rgb.b));
+        }
+
+        float hlg_ootf(float x) {
+            float a = 0.17883277f;
+            float b = 1.0f - 4.0f * a;
+            float c = 0.5f - a * log(4.0f * a);
+            if (x <= 1.0f / 12.0f) return sqrt(3.0f * x);
+            else return a * log(12.0f * x - b) + c;
+        }
+        float3 hlg_to_linear(float3 rgb) {
+            return float3(hlg_ootf(rgb.r), hlg_ootf(rgb.g), hlg_ootf(rgb.b));
+        }
+
+        constant float3x3 bt2020_to_bt709 = float3x3(
+            float3( 1.6605f, -0.5876f, -0.0728f),
+            float3(-0.1246f,  1.1329f, -0.0083f),
+            float3(-0.0182f, -0.1006f,  1.1187f)
+        );
+
+        float bt2390_eetf(float x) {
+            float peak = 100.0f;
+            float target = 1.0f;
+            float xp = x / peak;
+            float s = peak / target;
+            return xp < 0.0001f ? 0.0f : xp / sqrt(1.0f + s * s * xp * xp) * target;
+        }
+        float3 bt2390_eetf(float3 rgb) {
+            float luma = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
+            if (luma < 0.0001f) return float3(0.0f);
+            float s = bt2390_eetf(luma) / luma;
+            return rgb * s;
+        }
+
+        kernel void hdr_to_sdr(texture2d<float, access::read>  in  [[texture(0)]],
+                                texture2d<float, access::write> out [[texture(1)]],
+                                constant int  &transfer     [[buffer(0)]],
+                                constant bool &doColorMatrix [[buffer(1)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+            if (gid.x >= in.get_width() || gid.y >= in.get_height()) return;
+            float3 rgb = in.read(gid).rgb;
+            if (transfer == 0)      rgb = pq_to_linear(rgb);
+            else if (transfer == 1) rgb = hlg_to_linear(rgb);
+            rgb = bt2390_eetf(rgb);
+            if (doColorMatrix) rgb = bt2020_to_bt709 * rgb;
+            rgb = clamp(rgb, 0.0f, 1.0f);
+            out.write(float4(rgb, 1.0f), gid);
+        }
+        """
+        if let lib = try? device.makeLibrary(source: mtlSource, options: nil),
+           let fn  = lib.makeFunction(name: "hdr_to_sdr") {
             toneMapPipeline = try? device.makeComputePipelineState(function: fn)
+            logger.info("HDR tone-map shader compiled OK")
+        } else {
+            logger.warning("HDR tone-map shader compile failed — HDR will display as SDR")
         }
 
         logger.info("init OK, device=\(device.name)")

@@ -40,6 +40,7 @@ final class FFmpegAudioDecoder {
     private var swrCtx: OpaquePointer?
     let outputSampleRate: Int32
     let outputChannels: Int32
+    private let inputChannels: Int32
     private var decodedFrames = 0
     private var failedPackets = 0
     private var failedReceives = 0
@@ -57,11 +58,15 @@ final class FFmpegAudioDecoder {
         } else {
             effectiveSR = resolveHz(codecpar.sample_rate, fallback: sampleRate)
         }
-        let effectiveCh = codecpar.ch_layout.nb_channels > 0
-            ? codecpar.ch_layout.nb_channels
-            : (channels > 0 ? channels : 2)
+        // outputChannels is the DESIRED output (from the `channels` param, default stereo),
+        // not the source stream's channel count.  swresample will downmix 5.1→stereo with
+        // proper centre-channel weighting.  Passing the source channels as output bypasses
+        // downmix entirely, losing the centre channel on stereo speakers → barely audible voice.
+        let inCh  = codecpar.ch_layout.nb_channels > 0 ? codecpar.ch_layout.nb_channels : 2
+        let outCh = channels > 0 ? channels : 2
         self.outputSampleRate = effectiveSR
-        self.outputChannels   = effectiveCh
+        self.outputChannels   = outCh
+        self.inputChannels    = inCh
 
         // Standard FFmpeg init (per KSPlayer):
         // 1. alloc with nil — no codec priv_data allocated yet, so
@@ -151,7 +156,7 @@ final class FFmpegAudioDecoder {
             if frame.pointee.ch_layout.nb_channels > 0 {
                 inLayout = frame.pointee.ch_layout
             } else {
-                av_channel_layout_default(&inLayout, outputChannels)
+                av_channel_layout_default(&inLayout, inputChannels)
             }
             var outLayout = AVChannelLayout()
             av_channel_layout_default(&outLayout, outputChannels)
@@ -178,7 +183,7 @@ final class FFmpegAudioDecoder {
             // Build the pointer array for all channels dynamically.
             let chCount = Int(frame.pointee.ch_layout.nb_channels > 0
                 ? frame.pointee.ch_layout.nb_channels
-                : outputChannels)
+                : inputChannels)
             var inPtrs = [UnsafePointer<UInt8>?](repeating: nil, count: max(chCount, 1))
             if chCount >= 1 { inPtrs[0] = UnsafePointer(frame.pointee.data.0) }
             if chCount >= 2 { inPtrs[1] = UnsafePointer(frame.pointee.data.1) }
