@@ -108,7 +108,7 @@ public final class NativeBackend: PlayerBackend {
         state.isBuffering = true
         notifyStateChange()
 
-        logger.info("play \(url.absoluteString.prefix(120))")
+        logger.notice("play \(url.absoluteString.prefix(120))")
 
         // Increment generation so any previously in-flight open is discarded.
         playGeneration += 1
@@ -347,7 +347,7 @@ public final class NativeBackend: PlayerBackend {
                     if let vt = self.videoDecoder as? VTVideoDecoder, vt.needsSoftwareFallback,
                        let vs = demuxer.videoStream,
                        let sw = FFmpegVideoDecoder(stream: vs, forceSoftware: true) {
-                        logger.warning("VT→SW fallback: \(sw.width)x\(sw.height) — HW decoder failed")
+                        logger.notice("VT→SW fallback: \(sw.width)x\(sw.height) — HW decoder failed, using FFmpeg SW")
                         self.videoDecoder = sw
                     }
 

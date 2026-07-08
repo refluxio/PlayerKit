@@ -82,7 +82,7 @@ final class FFmpegVideoDecoder {
                 return nil
             }
             self.isHardware = false
-            logger.info("SW fallback OK \(ctx.pointee.width)x\(ctx.pointee.height)")
+            logger.notice("SW fallback OK \(ctx.pointee.width)x\(ctx.pointee.height) fmt=\(ctx.pointee.pix_fmt.rawValue)")
         } else {
             // Try VideoToolbox hardware acceleration first.
             var hwCtx: UnsafeMutablePointer<AVBufferRef>?

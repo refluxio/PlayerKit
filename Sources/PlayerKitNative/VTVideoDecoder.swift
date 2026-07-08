@@ -20,6 +20,7 @@ final class VTVideoDecoder {
     private var session: VTDecompressionSession?
     private var formatDesc: CMVideoFormatDescription?
     private let isH264: Bool
+    private let is10Bit: Bool
     private var needsParamSetInit: Bool
     private var pendingSPS: [UInt8]?
     private var pendingPPS: [UInt8]?
@@ -42,11 +43,14 @@ final class VTVideoDecoder {
     init?(stream: UnsafeMutablePointer<AVStream>) {
         let cp = stream.pointee.codecpar.pointee
         self.isH264 = (cp.codec_id == AV_CODEC_ID_H264)
+        // HEVC Main 10 or higher bit depth — request 10-bit output from VT.
+        // Older hardware may reject 10-bit; makeSession falls back to 8-bit automatically.
+        self.is10Bit = !isH264 && cp.bits_per_raw_sample >= 10
 
         // Try to build format description from parameter sets in codecpar.
         // FFmpeg 8.x may store them in coded_side_data with a sentinel in extradata.
         if let desc = VTVideoDecoder.formatDescFromCodecpar(cp, isH264: isH264),
-           let s    = VTVideoDecoder.makeSession(formatDesc: desc) {
+           let s    = VTVideoDecoder.makeSession(formatDesc: desc, is10Bit: is10Bit) {
             self.formatDesc        = desc
             self.session           = s
             let dims               = CMVideoFormatDescriptionGetDimensions(desc)
@@ -154,7 +158,7 @@ final class VTVideoDecoder {
             desc = VTVideoDecoder.makeHEVCFormatDesc(vps: vps, sps: sps, pps: pps)
         } else { desc = nil }
 
-        guard let d = desc, let s = VTVideoDecoder.makeSession(formatDesc: d) else {
+        guard let d = desc, let s = VTVideoDecoder.makeSession(formatDesc: d, is10Bit: is10Bit) else {
             logger.error("failed to init from in-band params")
             initFailed = true
             return
@@ -364,19 +368,34 @@ final class VTVideoDecoder {
         return result
     }
 
-    static func makeSession(formatDesc: CMVideoFormatDescription) -> VTDecompressionSession? {
-        let attrs: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            kCVPixelBufferMetalCompatibilityKey: true,
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any],
-        ]
-        var session: VTDecompressionSession?
-        let status = VTDecompressionSessionCreate(
-            allocator: kCFAllocatorDefault, formatDescription: formatDesc,
-            decoderSpecification: nil, imageBufferAttributes: attrs as CFDictionary,
-            outputCallback: nil, decompressionSessionOut: &session)
-        if status != noErr { logger.error("session create failed: \(status)") }
-        return status == noErr ? session : nil
+    /// Create a VTDecompressionSession. When `is10Bit` is true, requests 10-bit
+    /// output from the hardware decoder (for HEVC Main 10 HDR content). Falls back
+    /// to 8-bit if the hardware rejects 10-bit (older devices / Intel Macs).
+    static func makeSession(formatDesc: CMVideoFormatDescription, is10Bit: Bool = false) -> VTDecompressionSession? {
+        let pixelFormats: [OSType] = is10Bit
+            ? [kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+               kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
+            : [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
+
+        for (i, fmt) in pixelFormats.enumerated() {
+            if i > 0 { logger.info("retrying with 8-bit pixel format") }
+            let attrs: [CFString: Any] = [
+                kCVPixelBufferPixelFormatTypeKey: fmt,
+                kCVPixelBufferMetalCompatibilityKey: true,
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any],
+            ]
+            var session: VTDecompressionSession?
+            let status = VTDecompressionSessionCreate(
+                allocator: kCFAllocatorDefault, formatDescription: formatDesc,
+                decoderSpecification: nil, imageBufferAttributes: attrs as CFDictionary,
+                outputCallback: nil, decompressionSessionOut: &session)
+            if status == noErr {
+                if i > 0 { logger.info("8-bit fallback OK") }
+                return session
+            }
+            logger.error("session create failed (fmt=\(fmt)): \(status)")
+        }
+        return nil
     }
 }
 
