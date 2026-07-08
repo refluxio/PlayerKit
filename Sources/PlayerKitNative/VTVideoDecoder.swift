@@ -46,7 +46,12 @@ final class VTVideoDecoder {
     init?(stream: UnsafeMutablePointer<AVStream>, prefer10Bit: Bool = false) {
         let cp = stream.pointee.codecpar.pointee
         self.isH264 = (cp.codec_id == AV_CODEC_ID_H264)
-        let isHDR10 = !isH264 && cp.bits_per_raw_sample >= 10
+        // MKV containers often leave bits_per_raw_sample = 0 even for HEVC Main10.
+        // Fall back to profile check: AV_PROFILE_HEVC_MAIN_10 = 2, REXT = 4.
+        let isHEVC = cp.codec_id == AV_CODEC_ID_HEVC
+        let is10BitByProfile = isHEVC && (cp.profile == AV_PROFILE_HEVC_MAIN_10 ||
+                                          cp.profile == AV_PROFILE_HEVC_REXT)
+        let isHDR10 = !isH264 && (cp.bits_per_raw_sample >= 10 || is10BitByProfile)
         // 10-bit output: required by EDRRenderer so CI color management sees real PQ
         // values, not 8-bit SDR-range values falsely tagged as PQ (which appear black).
         // MetalRenderer uses 8-bit + needsHDRTag + CIToneCurve instead.

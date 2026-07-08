@@ -346,9 +346,11 @@ public final class NativeBackend: PlayerBackend {
             switch newState {
             case .buffering:
                 self.audioUnitOutput?.pause()
+                self._injectedAudioOutput?.pause()
                 self.state.isBuffering = true
             case .playing:
                 self.audioUnitOutput?.resume()
+                self._injectedAudioOutput?.resume()
                 self.state.isBuffering = false
             }
             self.notifyStateChange()
@@ -535,7 +537,14 @@ public final class NativeBackend: PlayerBackend {
             audioClock.reset(to: firstFrame.pts, sampleRate: audioDecoder?.outputSampleRate ?? 44100)
         }
 
-        let audioTime = audioClock.audioTime
+        // In passthrough mode AudioUnitOutput never runs so audioClock stays at 0.
+        // Use video PTS as master clock so A/V sync still advances frames.
+        let audioTime: Double
+        if _injectedAudioOutput != nil {
+            audioTime = jitterBuffer.peek(at: 0)?.pts ?? audioClock.audioTime
+        } else {
+            audioTime = audioClock.audioTime
+        }
         let serial = seekLock.withLock { seekSerial }
 
         // --- Freeze-ahead / Skip-behind (commercial player A/V sync) ---
