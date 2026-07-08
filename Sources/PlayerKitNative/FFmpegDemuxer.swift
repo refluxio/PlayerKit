@@ -39,18 +39,59 @@ final class FFmpegDemuxer: @unchecked Sendable {
     var audioStreamIndex: Int32 { audioStream.map { $0.pointee.index } ?? -1 }
 
     /// Returns true if the current audio stream carries a passthrough-capable codec
-    /// (AC3, E-AC3, DTS).
+    /// (AC3, E-AC3, DTS, TrueHD).
     var isPassthroughCodec: Bool {
         guard let audioStream else { return false }
         let codecId = audioStream.pointee.codecpar.pointee.codec_id
         switch codecId {
         case AV_CODEC_ID_AC3,
              AV_CODEC_ID_EAC3,
-             AV_CODEC_ID_DTS:
+             AV_CODEC_ID_DTS,
+             AV_CODEC_ID_TRUEHD:
             return true
         default:
             return false
         }
+    }
+
+    /// True when the video stream has a Dolby Vision configuration record
+    /// (AV_PKT_DATA_DOVI_CONF) in its codec parameters side data.
+    var isDolbyVision: Bool {
+        guard let vs = videoStream else { return false }
+        let par = vs.pointee.codecpar.pointee
+        guard par.nb_coded_side_data > 0, let sideData = par.coded_side_data else {
+            return false
+        }
+        for i in 0..<Int(par.nb_coded_side_data) {
+            if sideData[i].type == AV_PKT_DATA_DOVI_CONF { return true }
+        }
+        return false
+    }
+
+    /// True when the active audio stream carries Dolby Atmos metadata.
+    /// - TrueHD: profile == AV_PROFILE_TRUEHD_ATMOS (30)
+    /// - E-AC3: stream title contains "atmos" (case-insensitive) or channel count > 8
+    var audioIsAtmos: Bool {
+        guard let as_ = audioStream else { return false }
+        let par = as_.pointee.codecpar.pointee
+        let codecId = par.codec_id
+
+        if codecId == AV_CODEC_ID_TRUEHD {
+            return Int32(par.profile) == AV_PROFILE_TRUEHD_ATMOS
+        }
+
+        if codecId == AV_CODEC_ID_EAC3 {
+            if let meta = as_.pointee.metadata {
+                let titleEntry = av_dict_get(meta, "title", nil, 0)
+                if let titleEntry, let titleVal = titleEntry.pointee.value {
+                    let title = String(cString: titleVal).lowercased()
+                    if title.contains("atmos") { return true }
+                }
+            }
+            return par.ch_layout.nb_channels > 8
+        }
+
+        return false
     }
 
     private(set) var videoStream: UnsafeMutablePointer<AVStream>?
