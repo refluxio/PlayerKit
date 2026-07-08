@@ -103,13 +103,12 @@ final class MetalRenderer: VideoRenderer {
             let toneCurve = CIFilter(name: "CIToneCurve")!
             toneCurve.setValue(ciImage, forKey: kCIInputImageKey)
             // PQ→sRGB approximate mapping (1000-nit mastering display).
-            // PQ 0.0→0.0, 0.1→0.06, 0.3→0.15, 0.5→0.40, 0.7→0.72, 1.0→1.0
+            // 5 control points for CIToneCurve (indices 0–4).
             toneCurve.setValue(CIVector(x: 0.0, y: 0.0),  forKey: "inputPoint0")
-            toneCurve.setValue(CIVector(x: 0.1, y: 0.06), forKey: "inputPoint1")
-            toneCurve.setValue(CIVector(x: 0.3, y: 0.15), forKey: "inputPoint2")
-            toneCurve.setValue(CIVector(x: 0.5, y: 0.40), forKey: "inputPoint3")
-            toneCurve.setValue(CIVector(x: 0.7, y: 0.72), forKey: "inputPoint4")
-            toneCurve.setValue(CIVector(x: 1.0, y: 1.0),  forKey: "inputPoint5")
+            toneCurve.setValue(CIVector(x: 0.15, y: 0.08), forKey: "inputPoint1")
+            toneCurve.setValue(CIVector(x: 0.4, y: 0.25),  forKey: "inputPoint2")
+            toneCurve.setValue(CIVector(x: 0.7, y: 0.68),  forKey: "inputPoint3")
+            toneCurve.setValue(CIVector(x: 1.0, y: 1.0),   forKey: "inputPoint4")
             ciImage = toneCurve.outputImage ?? ciImage
         }
         ciContext.render(ciImage,
