@@ -13,7 +13,6 @@ final class MetalRenderer: VideoRenderer {
     private let commandQueue: MTLCommandQueue
     private let metalLayer: CAMetalLayer
     private let ciContext: CIContext
-    private var toneMapPipeline: MTLComputePipelineState?
     private var displayedFrames = 0
     private var lastVideoSize: CGSize = .zero
 
@@ -43,80 +42,6 @@ final class MetalRenderer: VideoRenderer {
         // but set it as a hint to the compositor.
         self.metalLayer.contentsGravity = .resizeAspect
         self.ciContext = CIContext(mtlDevice: device, options: [.workingColorSpace: NSNull()])
-
-        // Compile the HDR tone-mapping shader at runtime.
-        // Shaders.metal is not auto-compiled by SPM (it warns "unhandled"),
-        // so we embed the source inline and use makeLibrary(source:).
-        let mtlSource = """
-        #include <metal_stdlib>
-        using namespace metal;
-
-        constant float PQ_m1 = 0.1593017578125;
-        constant float PQ_m2 = 78.84375;
-        constant float PQ_c1 = 0.8359375;
-        constant float PQ_c2 = 18.8515625;
-        constant float PQ_c3 = 18.6875;
-
-        float pq_to_linear(float x) {
-            float xp = pow(max(x, 0.0f), 1.0f / PQ_m2);
-            float num = max(xp - PQ_c1, 0.0f);
-            float den = PQ_c2 - PQ_c3 * xp;
-            return pow(num / max(den, 0.0001f), 1.0f / PQ_m1);
-        }
-        float3 pq_to_linear(float3 rgb) {
-            return float3(pq_to_linear(rgb.r), pq_to_linear(rgb.g), pq_to_linear(rgb.b));
-        }
-
-        float hlg_ootf(float x) {
-            float a = 0.17883277f;
-            float b = 1.0f - 4.0f * a;
-            float c = 0.5f - a * log(4.0f * a);
-            if (x <= 1.0f / 12.0f) return sqrt(3.0f * x);
-            else return a * log(12.0f * x - b) + c;
-        }
-        float3 hlg_to_linear(float3 rgb) {
-            return float3(hlg_ootf(rgb.r), hlg_ootf(rgb.g), hlg_ootf(rgb.b));
-        }
-
-        constant float3x3 bt2020_to_bt709 = float3x3(
-            float3( 1.6605f, -0.5876f, -0.0728f),
-            float3(-0.1246f,  1.1329f, -0.0083f),
-            float3(-0.0182f, -0.1006f,  1.1187f)
-        );
-
-        float3 bt2390_eetf(float3 rgb) {
-            // Simple Reinhard tone-map: x is linear light in nits (0–10 000 for PQ).
-            // SDR white ≈ 80 nits gives mid-gray at ~0.5, highlights compress toward 1.0.
-            float exposure = 1.0f / 80.0f;
-            float luma = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
-            if (luma < 0.0001f) return float3(0.0f);
-            float xp = luma * exposure;
-            float s = (xp / (1.0f + xp)) / luma;
-            return rgb * s;
-        }
-
-        kernel void hdr_to_sdr(texture2d<float, access::read>  in  [[texture(0)]],
-                                texture2d<float, access::write> out [[texture(1)]],
-                                constant int  &transfer     [[buffer(0)]],
-                                constant bool &doColorMatrix [[buffer(1)]],
-                                uint2 gid [[thread_position_in_grid]]) {
-            if (gid.x >= in.get_width() || gid.y >= in.get_height()) return;
-            float3 rgb = in.read(gid).rgb;
-            if (transfer == 0)      rgb = pq_to_linear(rgb);
-            else if (transfer == 1) rgb = hlg_to_linear(rgb);
-            rgb = bt2390_eetf(rgb);
-            if (doColorMatrix) rgb = bt2020_to_bt709 * rgb;
-            rgb = clamp(rgb, 0.0f, 1.0f);
-            out.write(float4(rgb, 1.0f), gid);
-        }
-        """
-        if let lib = try? device.makeLibrary(source: mtlSource, options: nil),
-           let fn  = lib.makeFunction(name: "hdr_to_sdr") {
-            toneMapPipeline = try? device.makeComputePipelineState(function: fn)
-            logger.info("HDR tone-map shader compiled OK")
-        } else {
-            logger.warning("HDR tone-map shader compile failed — HDR will display as SDR")
-        }
 
         logger.info("init OK, device=\(device.name)")
     }
@@ -171,53 +96,23 @@ final class MetalRenderer: VideoRenderer {
             ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
         }
 
-        // Tone-map only when we have native 10-bit HDR pixel data.
-        // With 8-bit VT output, VT handles 10→8 conversion internally and the output
-        // is SDR-ready — applying another tone map would over-darken.
-        let pixelIs10Bit = CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-        let needsToneMap = pixelIs10Bit && (colorParams.transfer == .pq || colorParams.transfer == .hlg) && toneMapPipeline != nil
-
-        if needsToneMap {
-            // HDR path: CIImage → compute shader (tone-map) → drawable
-            let texDesc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .rgba16Float, width: dispW, height: dispH, mipmapped: false)
-            texDesc.usage = [.shaderRead, .shaderWrite]
-            guard let pipeline = toneMapPipeline,
-                  let inTex = device.makeTexture(descriptor: texDesc),
-                  let outTex = device.makeTexture(descriptor: texDesc) else { return }
-
-            ciContext.render(ciImage, to: inTex, commandBuffer: commandBuffer,
-                             bounds: CGRect(x: 0, y: 0, width: dispW, height: dispH),
-                             colorSpace: CGColorSpace(name: CGColorSpace.itur_2020)!)
-
-            guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
-            computeEncoder.setTexture(inTex, index: 0)
-            computeEncoder.setTexture(outTex, index: 1)
-            var transferVal: Int32 = (colorParams.transfer == .hlg) ? 1 : 0
-            var doMatrix: Bool = (colorParams.matrix == .bt2020)
-            computeEncoder.setBytes(&transferVal, length: MemoryLayout<Int32>.size, index: 0)
-            computeEncoder.setBytes(&doMatrix, length: MemoryLayout<Bool>.size, index: 1)
-            let tgSize = MTLSize(width: 16, height: 16, depth: 1)
-            let tgCount = MTLSize(width: (dispW + 15) / 16, height: (dispH + 15) / 16, depth: 1)
-            computeEncoder.setComputePipelineState(pipeline)
-            computeEncoder.dispatchThreadgroups(tgCount, threadsPerThreadgroup: tgSize)
-            computeEncoder.endEncoding()
-
-            guard let blitEncoder = commandBuffer.makeBlitCommandEncoder() else { return }
-            blitEncoder.copy(from: outTex, sourceSlice: 0, sourceLevel: 0,
-                             sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                             sourceSize: MTLSize(width: dispW, height: dispH, depth: 1),
-                             to: drawable.texture, destinationSlice: 0, destinationLevel: 0,
-                             destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-            blitEncoder.endEncoding()
+        // Color-space-aware rendering.
+        // For HDR content (PQ/HLG transfer), tell CoreImage the destination is
+        // extended linear sRGB.  CoreImage applies the EOTF from the CIImage's
+        // embedded colour space (BT.2020/PQ via VT attachments) → linear, then
+        // maps to extended sRGB.  The bgra8Unorm drawable clips values > 1.0
+        // which acts as a simple hard-clip tone-map.
+        let dstColorSpace: CGColorSpace
+        if colorParams.transfer == .pq || colorParams.transfer == .hlg {
+            dstColorSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
         } else {
-            // SDR path: CIImage → drawable directly
-            ciContext.render(ciImage,
-                             to: drawable.texture,
-                             commandBuffer: commandBuffer,
-                             bounds: CGRect(x: 0, y: 0, width: dispW, height: dispH),
-                             colorSpace: CGColorSpaceCreateDeviceRGB())
+            dstColorSpace = CGColorSpaceCreateDeviceRGB()
         }
+        ciContext.render(ciImage,
+                         to: drawable.texture,
+                         commandBuffer: commandBuffer,
+                         bounds: CGRect(x: 0, y: 0, width: dispW, height: dispH),
+                         colorSpace: dstColorSpace)
 
         commandBuffer.present(drawable)
 
