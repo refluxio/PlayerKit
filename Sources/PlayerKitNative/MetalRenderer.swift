@@ -104,7 +104,10 @@ final class MetalRenderer: VideoRenderer {
         // which acts as a simple hard-clip tone-map.
         let dstColorSpace: CGColorSpace
         if colorParams.transfer == .pq || colorParams.transfer == .hlg {
-            dstColorSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
+            // bgra8Unorm expects sRGB gamma-encoded values (not linear).
+            // CoreImage reads BT.2020/PQ from the buffer's colour attachments
+            // and converts to sRGB: PQ→linear, BT.2020→sRGB primaries, linear→sRGB gamma.
+            dstColorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
         } else {
             dstColorSpace = CGColorSpaceCreateDeviceRGB()
         }

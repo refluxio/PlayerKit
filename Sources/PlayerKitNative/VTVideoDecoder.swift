@@ -43,12 +43,11 @@ final class VTVideoDecoder {
     init?(stream: UnsafeMutablePointer<AVStream>) {
         let cp = stream.pointee.codecpar.pointee
         self.isH264 = (cp.codec_id == AV_CODEC_ID_H264)
-        // HEVC Main 10 content: request 8-bit output from VT.
-        // VT applies internal 10→8 tone mapping, producing SDR-ready pixel buffers.
-        // 10-bit output (kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) can cause
-        // blocky artefacts through the CIImage→rgba16Float→compute→blit pipeline.
-        // TODO: fix the Metal pipeline for native 10-bit, then enable this path.
-        self.is10Bit = false  // !isH264 && cp.bits_per_raw_sample >= 10
+        // HEVC Main 10 or higher bit depth — request 10-bit output from VT.
+        // The 10-bit biplanar buffer carries BT.2020/PQ colour attachments that
+        // CoreImage reads to apply the correct EOTF when rendering through
+        // extendedLinearSRGB.  8-bit output strips this metadata → washed-out SDR.
+        self.is10Bit = !isH264 && cp.bits_per_raw_sample >= 10
 
         // Try to build format description from parameter sets in codecpar.
         // FFmpeg 8.x may store them in coded_side_data with a sentinel in extradata.
@@ -209,6 +208,17 @@ final class VTVideoDecoder {
         var result: CVPixelBuffer?
         VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb, flags: [], infoFlagsOut: nil) { _, _, buf, _, _ in
             result = buf
+        }
+        // Tag 10-bit HEVC output with BT.2020/PQ colour metadata so CoreImage
+        // applies the correct EOTF during rendering.  VT may not attach these
+        // automatically in all configurations.
+        if let buf = result, is10Bit {
+            CVBufferSetAttachment(buf, kCVImageBufferColorPrimariesKey,
+                                  kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+            CVBufferSetAttachment(buf, kCVImageBufferTransferFunctionKey,
+                                  kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
+            CVBufferSetAttachment(buf, kCVImageBufferYCbCrMatrixKey,
+                                  kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
         }
         return result
     }
