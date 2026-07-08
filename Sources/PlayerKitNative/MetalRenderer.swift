@@ -84,17 +84,14 @@ final class MetalRenderer: VideoRenderer {
             float3(-0.0182f, -0.1006f,  1.1187f)
         );
 
-        float bt2390_eetf(float x) {
-            float peak = 100.0f;
-            float target = 1.0f;
-            float xp = x / peak;
-            float s = peak / target;
-            return xp < 0.0001f ? 0.0f : xp / sqrt(1.0f + s * s * xp * xp) * target;
-        }
         float3 bt2390_eetf(float3 rgb) {
+            // Simple Reinhard tone-map: x is linear light in nits (0–10 000 for PQ).
+            // SDR white ≈ 80 nits gives mid-gray at ~0.5, highlights compress toward 1.0.
+            float exposure = 1.0f / 80.0f;
             float luma = dot(rgb, float3(0.2627f, 0.6780f, 0.0593f));
             if (luma < 0.0001f) return float3(0.0f);
-            float s = bt2390_eetf(luma) / luma;
+            float xp = luma * exposure;
+            float s = (xp / (1.0f + xp)) / luma;
             return rgb * s;
         }
 
@@ -174,7 +171,11 @@ final class MetalRenderer: VideoRenderer {
             ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
         }
 
-        let needsToneMap = (colorParams.transfer == .pq || colorParams.transfer == .hlg) && toneMapPipeline != nil
+        // Tone-map only when we have native 10-bit HDR pixel data.
+        // With 8-bit VT output, VT handles 10→8 conversion internally and the output
+        // is SDR-ready — applying another tone map would over-darken.
+        let pixelIs10Bit = CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        let needsToneMap = pixelIs10Bit && (colorParams.transfer == .pq || colorParams.transfer == .hlg) && toneMapPipeline != nil
 
         if needsToneMap {
             // HDR path: CIImage → compute shader (tone-map) → drawable

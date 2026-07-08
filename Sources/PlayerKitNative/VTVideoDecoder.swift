@@ -43,9 +43,12 @@ final class VTVideoDecoder {
     init?(stream: UnsafeMutablePointer<AVStream>) {
         let cp = stream.pointee.codecpar.pointee
         self.isH264 = (cp.codec_id == AV_CODEC_ID_H264)
-        // HEVC Main 10 or higher bit depth — request 10-bit output from VT.
-        // Older hardware may reject 10-bit; makeSession falls back to 8-bit automatically.
-        self.is10Bit = !isH264 && cp.bits_per_raw_sample >= 10
+        // HEVC Main 10 content: request 8-bit output from VT.
+        // VT applies internal 10→8 tone mapping, producing SDR-ready pixel buffers.
+        // 10-bit output (kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) can cause
+        // blocky artefacts through the CIImage→rgba16Float→compute→blit pipeline.
+        // TODO: fix the Metal pipeline for native 10-bit, then enable this path.
+        self.is10Bit = false  // !isH264 && cp.bits_per_raw_sample >= 10
 
         // Try to build format description from parameter sets in codecpar.
         // FFmpeg 8.x may store them in coded_side_data with a sentinel in extradata.
