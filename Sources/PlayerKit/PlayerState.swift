@@ -43,13 +43,17 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     public let codec: String?
     /// Whether this track is the default selection.
     public let isDefault: Bool
+    /// Whether this audio track carries Dolby Atmos object metadata.
+    public let isAtmos: Bool
 
-    public init(id: Int, title: String? = nil, lang: String? = nil, codec: String? = nil, isDefault: Bool = false) {
+    public init(id: Int, title: String? = nil, lang: String? = nil,
+                codec: String? = nil, isDefault: Bool = false, isAtmos: Bool = false) {
         self.id = id
         self.title = title
         self.lang = lang
         self.codec = codec
         self.isDefault = isDefault
+        self.isAtmos = isAtmos
     }
 }
 
@@ -67,14 +71,19 @@ public struct VideoInfo: Sendable, Equatable {
     public let colorMatrix: String?
     /// Transfer characteristic (e.g. "smpte2084").
     public let transfer: String?
+    /// Whether the stream is Dolby Vision (profile 5/8/9 detected via DOVI_CONF side data).
+    public let isDolbyVision: Bool
 
-    public init(width: Int, height: Int, codec: String? = nil, isHDR: Bool = false, colorMatrix: String? = nil, transfer: String? = nil) {
+    public init(width: Int, height: Int, codec: String? = nil,
+                isHDR: Bool = false, colorMatrix: String? = nil,
+                transfer: String? = nil, isDolbyVision: Bool = false) {
         self.width = width
         self.height = height
         self.codec = codec
         self.isHDR = isHDR
         self.colorMatrix = colorMatrix
         self.transfer = transfer
+        self.isDolbyVision = isDolbyVision
     }
 }
 
