@@ -41,7 +41,10 @@ public final class NativeBackend: PlayerBackend {
     }
 
     private var demuxer: FFmpegDemuxer?
-    private var videoDecoder: (any VideoDecoding)?
+    /// VT may fail on extreme-parameter streams (e.g. 4K@120fps).
+    /// When that happens the demux loop hot-swaps in a software FFmpegVideoDecoder.
+    /// Written once in _finishOpen(), then swapped from the demux queue on fallback.
+    private nonisolated(unsafe) var videoDecoder: (any VideoDecoding)?
     private var audioDecoder: FFmpegAudioDecoder?
 
     // A/V sync modules
@@ -257,7 +260,6 @@ public final class NativeBackend: PlayerBackend {
     private func startDemuxLoop() {
         demuxCancelled = false
         let demuxer = self.demuxer!
-        let videoDec = videoDecoder
         let audioDec = audioDecoder
         let audioOut = audioUnitOutput
         let clock = audioClock
@@ -306,7 +308,7 @@ public final class NativeBackend: PlayerBackend {
                         logger.error("immediate EOF, recovering to 0")
                         dLock.lock()
                         _ = demuxer.seek(to: 0)
-                        videoDec?.flush(); audioDec?.flush()
+                        self.videoDecoder?.flush(); audioDec?.flush()
                         dLock.unlock()
                         jitter.flush()
                         clock.reset(to: 0, sampleRate: audioDec?.outputSampleRate ?? 44100)
@@ -338,7 +340,18 @@ public final class NativeBackend: PlayerBackend {
                     // cannot cause the "skip to next I-frame" cascade that
                     // demux-level dropping produced after seek.  JitterBuffer's
                     // maxDuration backpressure caps memory growth.
-                    let pixelBuffer = videoDec?.decode(packet: packet)
+
+                    // VT→SW fallback: when VideoToolbox repeatedly fails to decode
+                    // (e.g. 4K@120fps exceeds HW limits), hot-swap to FFmpeg software
+                    // decoder without restarting the demux loop.
+                    if let vt = self.videoDecoder as? VTVideoDecoder, vt.needsSoftwareFallback,
+                       let vs = demuxer.videoStream,
+                       let sw = FFmpegVideoDecoder(stream: vs, forceSoftware: true) {
+                        logger.warning("VT→SW fallback: \(sw.width)x\(sw.height) — HW decoder failed")
+                        self.videoDecoder = sw
+                    }
+
+                    let pixelBuffer = self.videoDecoder?.decode(packet: packet)
                     dLock.unlock()
 
                     if let buf = pixelBuffer,

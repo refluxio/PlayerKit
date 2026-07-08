@@ -25,6 +25,10 @@ final class VTVideoDecoder {
     private var pendingPPS: [UInt8]?
     private var pendingVPS: [UInt8]?
     private var initFailed = false
+    private var consecutiveFailures = 0
+
+    /// True when HW decoder has failed enough consecutive frames to warrant SW fallback.
+    var needsSoftwareFallback: Bool { consecutiveFailures >= 50 || initFailed }
 
     // MARK: - init
 
@@ -114,7 +118,13 @@ final class VTVideoDecoder {
         }
         guard !lpData.isEmpty else { return nil }
 
-        return vtDecode(lpData: lpData, session: session, formatDesc: formatDesc)
+        let result = vtDecode(lpData: lpData, session: session, formatDesc: formatDesc)
+        if result != nil {
+            consecutiveFailures = 0
+        } else if !needsParamSetInit {
+            consecutiveFailures += 1
+        }
+        return result
     }
 
     // MARK: - flush / deinit

@@ -16,14 +16,19 @@ final class FFmpegVideoDecoder {
     var width:  Int { Int(codecCtx?.pointee.width  ?? 0) }
     var height: Int { Int(codecCtx?.pointee.height ?? 0) }
 
-    init?(stream: UnsafeMutablePointer<AVStream>) {
+    init?(stream: UnsafeMutablePointer<AVStream>, forceSoftware: Bool = false) {
         let codecpar = stream.pointee.codecpar.pointee
 
         // HEVC and H.264 are handled by VTVideoDecoder — its VT session
         // explicitly requests Metal-compatible IOSurface-backed pixel buffers
         // (kCVPixelBufferMetalCompatibilityKey), avoiding the alignment-padding
         // and buffer-pool inconsistencies of FFmpeg's hwaccel integration.
-        if codecpar.codec_id == AV_CODEC_ID_HEVC || codecpar.codec_id == AV_CODEC_ID_H264 {
+        //
+        // When forceSoftware is true, accept HEVC/H.264 here so the decoder
+        // acts as a software fallback — used when VT repeatedly fails (e.g.
+        // 4K@120fps exceeding hardware limits).
+        if !forceSoftware,
+           codecpar.codec_id == AV_CODEC_ID_HEVC || codecpar.codec_id == AV_CODEC_ID_H264 {
             logger.info("\(codecpar.codec_id == AV_CODEC_ID_HEVC ? "HEVC" : "H.264") — delegating to VTVideoDecoder")
             return nil
         }
@@ -68,36 +73,48 @@ final class FFmpegVideoDecoder {
 
         ctx.pointee.time_base = stream.pointee.time_base
 
-        // Try VideoToolbox hardware acceleration first.
-        var hwCtx: UnsafeMutablePointer<AVBufferRef>?
-        if av_hwdevice_ctx_create(&hwCtx, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nil, nil, 0) == 0,
-           let hwCtx {
-            ctx.pointee.hw_device_ctx = av_buffer_ref(hwCtx)
-            self.hwDeviceCtx = hwCtx
-        }
-
-        let openRet = avcodec_open2(ctx, codec, nil)
-        if openRet == 0 {
-            self.isHardware = (hwDeviceCtx != nil)
-            logger.info("opened OK hw=\(self.isHardware) \(ctx.pointee.width)x\(ctx.pointee.height)")
-        } else if hwDeviceCtx != nil {
-            // HW failed — retry software
-            logger.error("HW open failed (\(openRet)), retrying SW")
-            av_buffer_unref(&ctx.pointee.hw_device_ctx)
-            av_buffer_unref(&self.hwDeviceCtx)
+        if forceSoftware {
+            // Bypass VT hwaccel — open codec directly in software mode.
             let swRet = avcodec_open2(ctx, codec, nil)
-            if swRet == 0 {
-                self.isHardware = false
-                logger.info("SW fallback OK \(ctx.pointee.width)x\(ctx.pointee.height)")
-            } else {
-                logger.error("SW open also failed (\(swRet))")
+            guard swRet == 0 else {
+                logger.error("SW open failed (\(swRet))")
                 FFmpegVideoDecoder.safeFree(&self.codecCtx)
                 return nil
             }
+            self.isHardware = false
+            logger.info("SW fallback OK \(ctx.pointee.width)x\(ctx.pointee.height)")
         } else {
-            logger.error("avcodec_open2 FAILED (\(openRet))")
-            FFmpegVideoDecoder.safeFree(&self.codecCtx)
-            return nil
+            // Try VideoToolbox hardware acceleration first.
+            var hwCtx: UnsafeMutablePointer<AVBufferRef>?
+            if av_hwdevice_ctx_create(&hwCtx, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nil, nil, 0) == 0,
+               let hwCtx {
+                ctx.pointee.hw_device_ctx = av_buffer_ref(hwCtx)
+                self.hwDeviceCtx = hwCtx
+            }
+
+            let openRet = avcodec_open2(ctx, codec, nil)
+            if openRet == 0 {
+                self.isHardware = (hwDeviceCtx != nil)
+                logger.info("opened OK hw=\(self.isHardware) \(ctx.pointee.width)x\(ctx.pointee.height)")
+            } else if hwDeviceCtx != nil {
+                // HW failed — retry software
+                logger.error("HW open failed (\(openRet)), retrying SW")
+                av_buffer_unref(&ctx.pointee.hw_device_ctx)
+                av_buffer_unref(&self.hwDeviceCtx)
+                let swRet = avcodec_open2(ctx, codec, nil)
+                if swRet == 0 {
+                    self.isHardware = false
+                    logger.info("SW fallback OK \(ctx.pointee.width)x\(ctx.pointee.height)")
+                } else {
+                    logger.error("SW open also failed (\(swRet))")
+                    FFmpegVideoDecoder.safeFree(&self.codecCtx)
+                    return nil
+                }
+            } else {
+                logger.error("avcodec_open2 FAILED (\(openRet))")
+                FFmpegVideoDecoder.safeFree(&self.codecCtx)
+                return nil
+            }
         }
     }
 
