@@ -169,13 +169,13 @@ public final class NativeBackend: PlayerBackend {
                 videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
                 let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
                 logger.info("video: hw=\(dec.isHardware) \(dec.width)x\(dec.height)\(sarStr) display=\(self.videoWidth)x\(self.videoHeight)")
-            } else if let dec = VTVideoDecoder(stream: vs) {
+            } else if let dec = VTVideoDecoder(stream: vs, prefer10Bit: _renderer.prefersTenBit) {
                 videoDecoder = dec
                 codedVideoWidth  = dec.width; codedVideoHeight = dec.height
                 videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
                 videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
                 let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
-                logger.info("video: VT \(dec.width)x\(dec.height)\(sarStr) display=\(self.videoWidth)x\(self.videoHeight)")
+                logger.info("video: VT \(dec.width)x\(dec.height)\(sarStr) display=\(self.videoWidth)x\(self.videoHeight) 10bit=\(dec.is10Bit)")
             }
         }
 

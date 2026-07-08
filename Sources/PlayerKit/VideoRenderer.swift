@@ -51,6 +51,10 @@ public protocol VideoRenderer: AnyObject {
     /// The Core Animation layer that displays the video content.
     var layer: CALayer { get }
 
+    /// Whether this renderer requires 10-bit VT output for correct HDR rendering.
+    /// EDRRenderer returns true; MetalRenderer uses 8-bit (its CIToneCurve handles fake-PQ).
+    var prefersTenBit: Bool { get }
+
     /// Render a decoded pixel buffer immediately.
     /// - Parameters:
     ///   - pixelBuffer: Decoded video frame.
@@ -63,4 +67,8 @@ public protocol VideoRenderer: AnyObject {
 
     /// Clear the renderer surface and show black.
     func clear()
+}
+
+public extension VideoRenderer {
+    var prefersTenBit: Bool { false }
 }
