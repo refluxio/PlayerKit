@@ -85,12 +85,14 @@ CODEC_FLAGS=(
   --enable-parser=ac3
   --enable-parser=mpegaudio
 
-  # Legacy video decoders — RealVideo (RMVB), common in 2000s-era Chinese TV
-  # rips (e.g. 红楼梦). Software-only, but cheap to enable.
+  # Legacy video decoders — RealVideo (RMVB), MPEG-4 ASP (DivX/Xvid), MPEG-2.
+  # Software-only, but cheap to enable and covers a long tail of old media.
   --enable-decoder=rv10
   --enable-decoder=rv20
   --enable-decoder=rv30
   --enable-decoder=rv40
+  --enable-decoder=mpeg4
+  --enable-decoder=mpeg2video
 
   # Demuxers
   --enable-demuxer=mov        # mp4/m4v/mov
@@ -105,6 +107,7 @@ CODEC_FLAGS=(
   --enable-demuxer=flac
   --enable-demuxer=aac
   --enable-demuxer=rm         # RealMedia (.rm/.rmvb)
+  --enable-demuxer=mpegps     # MPEG-PS (.vob/.mpg/.mpeg)
 
   # Network protocols
   --enable-protocol=file
