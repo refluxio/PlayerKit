@@ -102,18 +102,10 @@ final class MetalRenderer: VideoRenderer {
         if colorParams.transfer == .pq || colorParams.transfer == .hlg {
             let toneCurve = CIFilter(name: "CIToneCurve")!
             toneCurve.setValue(ciImage, forKey: kCIInputImageKey)
-            // Standard PQ (ST.2084) EOTF → sRGB mapping.
-            // Computed by chaining the PQ inverse EOTF (nit output) with sRGB
-            // forward OETF, using 100-nit SDR reference white.
-            //   PQ 0.00 →   0 nit → sRGB 0.00
-            //   PQ 0.25 → 2.4 nit → sRGB 0.16
-            //   PQ 0.50 →  96 nit → sRGB 0.98  (near reference white)
-            //   PQ 0.51 → 100 nit → sRGB 1.00  (reference white, clipped)
-            // Above PQ 0.51 the sRGB output exceeds 1.0 — clipped by the renderer.
             toneCurve.setValue(CIVector(x: 0.0, y: 0.0),  forKey: "inputPoint0")
-            toneCurve.setValue(CIVector(x: 0.25, y: 0.16), forKey: "inputPoint1")
-            toneCurve.setValue(CIVector(x: 0.5, y: 0.98),  forKey: "inputPoint2")
-            toneCurve.setValue(CIVector(x: 0.75, y: 1.0),  forKey: "inputPoint3")
+            toneCurve.setValue(CIVector(x: 0.15, y: 0.08), forKey: "inputPoint1")
+            toneCurve.setValue(CIVector(x: 0.4, y: 0.25),  forKey: "inputPoint2")
+            toneCurve.setValue(CIVector(x: 0.7, y: 0.68),  forKey: "inputPoint3")
             toneCurve.setValue(CIVector(x: 1.0, y: 1.0),   forKey: "inputPoint4")
             ciImage = toneCurve.outputImage ?? ciImage
         }
