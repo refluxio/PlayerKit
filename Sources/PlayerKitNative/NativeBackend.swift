@@ -587,6 +587,9 @@ public final class NativeBackend: PlayerBackend {
         audioClock.reset(to: 0, sampleRate: 44100)  // critical: must reset or stale seek position
                                                      // from previous session pollutes AudioClock
         _renderer.flush()
+        _renderer.clear()  // hide the previous video's last frame until the new
+                           // video renders its first frame (MetalRenderer.display
+                           // flips opacity back to 1 on first frame)
         displayedVideoFrames = 0
         state = PlayerState()
     }

@@ -167,6 +167,13 @@ final class MetalRenderer: VideoRenderer {
         if displayedFrames <= 3 {
             logger.info("displayed frame #\(self.displayedFrames): \(dispW)x\(dispH)")
         }
+        // Reveal the layer on the first frame after a flush/clear.  We keep
+        // opacity = 0 between stop() and the first new frame so the previous
+        // video's last frame doesn't linger on screen during the (potentially
+        // slow) demux + decode of the new video's first frame.
+        if metalLayer.opacity == 0 {
+            metalLayer.opacity = 1
+        }
     }
 
     func render(pixelBuffer: CVPixelBuffer, pts: Double, colorParams: VideoColorParams) {
