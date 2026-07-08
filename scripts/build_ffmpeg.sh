@@ -79,10 +79,18 @@ CODEC_FLAGS=(
   --enable-decoder=pcm_s24le
   --enable-decoder=pcm_s32le
   --enable-decoder=pcm_f32le
+  --enable-decoder=cook            # RealAudio Cooker (RMVB audio)
   --enable-parser=aac
   --enable-parser=aac_latm
   --enable-parser=ac3
   --enable-parser=mpegaudio
+
+  # Legacy video decoders — RealVideo (RMVB), common in 2000s-era Chinese TV
+  # rips (e.g. 红楼梦). Software-only, but cheap to enable.
+  --enable-decoder=rv10
+  --enable-decoder=rv20
+  --enable-decoder=rv30
+  --enable-decoder=rv40
 
   # Demuxers
   --enable-demuxer=mov        # mp4/m4v/mov
@@ -96,6 +104,7 @@ CODEC_FLAGS=(
   --enable-demuxer=mp3
   --enable-demuxer=flac
   --enable-demuxer=aac
+  --enable-demuxer=rm         # RealMedia (.rm/.rmvb)
 
   # Network protocols
   --enable-protocol=file

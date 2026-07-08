@@ -21,6 +21,9 @@ struct MinimalPlayerApp: App {
         WindowGroup {
             PlayerWindow()
                 .frame(minWidth: 480, minHeight: 300)
+                .onOpenURL { url in
+                    NotificationCenter.default.post(name: .openURLSubmitted, object: url)
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 960, height: 540)

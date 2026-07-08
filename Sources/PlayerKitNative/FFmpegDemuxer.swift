@@ -94,7 +94,12 @@ final class FFmpegDemuxer: @unchecked Sendable {
         }
         logger.info("opening url=\(urlString, privacy: .public)")
 
-        let ret = avformat_open_input(&formatCtx, urlString, nil, &opts)
+        var localCtx = formatCtx
+        let ret = avformat_open_input(&localCtx, urlString, nil, &opts)
+        // avformat_open_input takes ownership of freeing formatCtx on failure
+        // and may set it to nil — write back so our state stays consistent.
+        formatCtx = localCtx
+
         av_dict_free(&opts)
 
         guard ret == 0 else {
