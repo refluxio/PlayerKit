@@ -200,6 +200,106 @@ public final class NativeBackend: PlayerBackend {
             }
         }
 
+        // Populate state.videoInfo
+        if let vs = demuxer.videoStream {
+            let cp = vs.pointee.codecpar.pointee
+            let codecName: String? = cp.codec_id != AV_CODEC_ID_NONE
+                ? String(cString: avcodec_get_name(cp.codec_id))
+                : nil
+            let isHDR = colorParams.transfer == .pq || colorParams.transfer == .hlg
+            state.videoInfo = VideoInfo(
+                width: videoWidth,
+                height: videoHeight,
+                codec: codecName,
+                isHDR: isHDR,
+                colorMatrix: isHDR ? "\(colorParams.matrix)" : nil,
+                transfer: isHDR ? "\(colorParams.transfer)" : nil,
+                isDolbyVision: demuxer.isDolbyVision
+            )
+            if demuxer.isDolbyVision {
+                logger.info("Dolby Vision detected")
+            }
+        }
+
+        // Populate state.audioTracks
+        if let ctx = demuxer.formatContext {
+            var tracks: [TrackInfo] = []
+            let nb = Int(ctx.pointee.nb_streams)
+            for i in 0..<nb {
+                guard let s = ctx.pointee.streams[i] else { continue }
+                let cp = s.pointee.codecpar.pointee
+                guard cp.codec_type == AVMEDIA_TYPE_AUDIO else { continue }
+
+                let codecName: String? = cp.codec_id != AV_CODEC_ID_NONE
+                    ? String(cString: avcodec_get_name(cp.codec_id))
+                    : nil
+
+                var title: String?
+                var lang: String?
+                if let meta = s.pointee.metadata {
+                    if let e = av_dict_get(meta, "title", nil, 0), let v = e.pointee.value {
+                        title = String(cString: v)
+                    }
+                    if let e = av_dict_get(meta, "language", nil, 0), let v = e.pointee.value {
+                        lang = String(cString: v)
+                    }
+                }
+
+                let isDefault = (s.pointee.disposition & Int32(AV_DISPOSITION_DEFAULT)) != 0
+                let isAtmos = (s.pointee.index == demuxer.audioStreamIndex)
+                    ? demuxer.audioIsAtmos
+                    : false
+
+                tracks.append(TrackInfo(
+                    id: Int(s.pointee.index),
+                    title: title,
+                    lang: lang,
+                    codec: codecName,
+                    isDefault: isDefault,
+                    isAtmos: isAtmos
+                ))
+            }
+            state.audioTracks = tracks
+            logger.info("audio tracks: \(tracks.count)")
+        }
+
+        // Populate state.subtitleTracks
+        if let ctx = demuxer.formatContext {
+            var subs: [TrackInfo] = []
+            let nb = Int(ctx.pointee.nb_streams)
+            for i in 0..<nb {
+                guard let s = ctx.pointee.streams[i] else { continue }
+                let cp = s.pointee.codecpar.pointee
+                guard cp.codec_type == AVMEDIA_TYPE_SUBTITLE else { continue }
+
+                let codecName: String? = cp.codec_id != AV_CODEC_ID_NONE
+                    ? String(cString: avcodec_get_name(cp.codec_id))
+                    : nil
+
+                var title: String?
+                var lang: String?
+                if let meta = s.pointee.metadata {
+                    if let e = av_dict_get(meta, "title", nil, 0), let v = e.pointee.value {
+                        title = String(cString: v)
+                    }
+                    if let e = av_dict_get(meta, "language", nil, 0), let v = e.pointee.value {
+                        lang = String(cString: v)
+                    }
+                }
+
+                let isDefault = (s.pointee.disposition & Int32(AV_DISPOSITION_DEFAULT)) != 0
+                subs.append(TrackInfo(
+                    id: Int(s.pointee.index),
+                    title: title,
+                    lang: lang,
+                    codec: codecName,
+                    isDefault: isDefault
+                ))
+            }
+            state.subtitleTracks = subs
+            logger.info("subtitle tracks: \(subs.count)")
+        }
+
         if let as_ = demuxer.audioStream,
            let dec = FFmpegAudioDecoder(stream: as_, sampleRate: 44100, channels: 2) {
             audioDecoder = dec
