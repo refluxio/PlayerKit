@@ -56,8 +56,9 @@ let package = Package(
             path: "Tests/PlayerKitTests"
         ),
 
-        // NativeBackend FFmpeg — built from source by scripts/build_ffmpeg.sh
-        // xcframeworks are in .gitignore; run the script to generate them.
+        // NativeBackend FFmpeg — built from source by scripts/build_ffmpeg.sh.
+        // xcframeworks are committed to the refluxio/PlayerKit independent repo;
+        // in the reflux monorepo they are git-ignored — run the script after cloning.
         .binaryTarget(name: "FFAvcodec",    path: "Sources/CFFmpeg/xcframeworks/libavcodec.xcframework"),
         .binaryTarget(name: "FFAvformat",   path: "Sources/CFFmpeg/xcframeworks/libavformat.xcframework"),
         .binaryTarget(name: "FFAvutil",     path: "Sources/CFFmpeg/xcframeworks/libavutil.xcframework"),

@@ -8,6 +8,14 @@ import PlayerKit
 private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "audio.output")
 
 public final class AudioUnitOutput: AudioOutputBackend {
+    /// Guards `audioQueue`, `running`, `paused`, `bufferedFrameCount`, `enqueuedFrames`.
+    /// The AudioQueue callback runs on an internal AudioToolbox thread and calls
+    /// back into `_callbackConsumed`; dispose is synchronous (inSync=true), so
+    /// we must NOT hold the lock during AudioQueueDispose or we'd deadlock when
+    /// the callback tries to acquire it.  See stop() for the swap-then-dispose
+    /// pattern.
+    private let lock = NSLock()
+
     private var audioQueue: AudioQueueRef?
     private let clock: AudioClock
     private var _channels: Int32 = 2
@@ -61,7 +69,13 @@ public final class AudioUnitOutput: AudioOutputBackend {
     }
 
     func start(sampleRate: Int32, channels: Int32) {
-        stop()
+        // Dispose any pre-existing queue first (swap-then-dispose to avoid
+        // holding the lock during the synchronous AudioQueueDispose).
+        let (oldQueue, _) = disposeUnderLock()
+        if let old = oldQueue {
+            AudioQueueDispose(old, true)
+        }
+
         let sr = sampleRate > 0 ? sampleRate : 44100
         let ch = channels > 0 ? channels : 2
         _channels = ch
@@ -78,10 +92,11 @@ public final class AudioUnitOutput: AudioOutputBackend {
             mReserved: 0
         )
 
+        var newQueue: AudioQueueRef?
         let rc = AudioQueueNewOutput(&format, audioQueueCallback,
                                      Unmanaged.passUnretained(self).toOpaque(),
-                                     nil, nil, 0, &audioQueue)
-        guard rc == noErr, let queue = audioQueue else {
+                                     nil, nil, 0, &newQueue)
+        guard rc == noErr, let queue = newQueue else {
             logger.error("AudioQueueNewOutput FAILED: \(rc)")
             return
         }
@@ -102,52 +117,96 @@ public final class AudioUnitOutput: AudioOutputBackend {
         }
 
         AudioQueueStart(queue, nil)
+
+        // Swap in the new queue atomically.  Any in-flight enqueue() that was
+        // waiting on the lock will see the new queue, not the disposed one.
+        lock.lock()
+        audioQueue = queue
         running = true
+        paused = false
         enqueuedFrames = 0
         bufferedFrameCount = 0
+        lock.unlock()
+
         logger.info("started: \(sr)Hz \(ch)ch")
     }
 
-    func stop() {
-        guard let queue = audioQueue else { return }
-        AudioQueueStop(queue, true)
-        AudioQueueDispose(queue, true)
+    /// Atomically null out `audioQueue` and return the previous value (plus the
+    /// final enqueued-frame count for logging) so the queue can be disposed
+    /// outside the lock.  After this returns, no enqueue() can observe the old
+    /// queue pointer, so disposing it is safe from the producer side; and
+    /// because enqueue() holds the lock across its AudioQueue calls, dispose
+    /// won't start until any in-flight enqueue() finishes.
+    private func disposeUnderLock() -> (AudioQueueRef?, Int) {
+        lock.lock()
+        let old = audioQueue
+        let finalEnqueued = enqueuedFrames
         audioQueue = nil
         running = false
         paused = false
         bufferedFrameCount = 0
-        if enqueuedFrames > 0 {
-            logger.info("stopped, enqueued \(self.enqueuedFrames) frames total")
+        enqueuedFrames = 0
+        lock.unlock()
+        return (old, finalEnqueued)
+    }
+
+    func stop() {
+        let (oldQueue, finalEnqueued) = disposeUnderLock()
+        if let old = oldQueue {
+            AudioQueueDispose(old, true)
+            if finalEnqueued > 0 {
+                logger.info("stopped, enqueued \(finalEnqueued) frames total")
+            }
         }
     }
 
     /// Flush pending audio buffers. Resets state without disposing the queue.
     public func flush() {
-        guard let queue = audioQueue else { return }
-        AudioQueueStop(queue, true)
-        bufferedFrameCount = 0
-        enqueuedFrames = 0
+        // Same swap-then-dispose as stop(): null the queue reference under the
+        // lock, then dispose outside the lock so the AudioQueue callback can't
+        // deadlock against us.  A fresh queue will be created by start().
+        let (oldQueue, _) = disposeUnderLock()
+        if let old = oldQueue {
+            AudioQueueDispose(old, true)
+        }
     }
 
     /// Pause without destroying the queue or resetting the clock.
     public func pause() {
-        guard let queue = audioQueue, !paused else { return }
-        paused = true
-        AudioQueuePause(queue)
+        lock.lock()
+        let queue = audioQueue
+        if !paused { paused = true }
+        lock.unlock()
+        if let queue {
+            AudioQueuePause(queue)
+        }
     }
 
     /// Resume after pause().
     public func resume() {
-        guard let queue = audioQueue, paused else { return }
-        paused = false
-        AudioQueueStart(queue, nil)
+        lock.lock()
+        let queue = audioQueue
+        if paused { paused = false }
+        lock.unlock()
+        if let queue {
+            AudioQueueStart(queue, nil)
+        }
     }
 
     func enqueue(_ frame: PCMFrame) {
-        guard let queue = audioQueue else { return }
+        // Hold the lock across allocate+copy+enqueue so the dispose path can't
+        // tear down the queue between the guard and the AudioQueue calls.
+        // disposeUnderLock() also takes this lock, so it waits for any in-flight
+        // enqueue() to finish before nulling the queue and disposing it.
+        lock.lock()
+        guard let queue = audioQueue else {
+            lock.unlock()
+            return
+        }
         var buffer: AudioQueueBufferRef?
         let rc = AudioQueueAllocateBuffer(queue, UInt32(frame.data.count), &buffer)
         guard rc == noErr, let buf = buffer else {
+            lock.unlock()
             logger.error("AudioQueueAllocateBuffer FAILED: \(rc)")
             return
         }
@@ -157,14 +216,20 @@ public final class AudioUnitOutput: AudioOutputBackend {
         AudioQueueEnqueueBuffer(queue, buf, 0, nil)
         enqueuedFrames += 1
         bufferedFrameCount += 1
+        let shouldRestart = !paused
+        lock.unlock()
+
         // Only (re)start if not deliberately paused by the buffering state machine.
-        if !paused { AudioQueueStart(queue, nil) }
+        if shouldRestart { AudioQueueStart(queue, nil) }
     }
 
     /// Called from the AudioQueue callback — do not call directly.
     func _callbackConsumed(byteCount: Int) {
+        lock.lock()
         if bufferedFrameCount > 0 { bufferedFrameCount &-= 1 }
-        clock.advance(byteCount: byteCount, channels: _channels)
+        let ch = _channels
+        lock.unlock()
+        clock.advance(byteCount: byteCount, channels: ch)
     }
 
     /// Proxy for clock.audioTime.

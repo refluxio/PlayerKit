@@ -19,9 +19,12 @@ final class FFmpegVideoDecoder {
     init?(stream: UnsafeMutablePointer<AVStream>) {
         let codecpar = stream.pointee.codecpar.pointee
 
-        // HEVC is handled entirely by VTVideoDecoder — skip FFmpeg software path.
-        guard codecpar.codec_id != AV_CODEC_ID_HEVC else {
-            logger.info("HEVC — delegating to VTVideoDecoder")
+        // HEVC and H.264 are handled by VTVideoDecoder — its VT session
+        // explicitly requests Metal-compatible IOSurface-backed pixel buffers
+        // (kCVPixelBufferMetalCompatibilityKey), avoiding the alignment-padding
+        // and buffer-pool inconsistencies of FFmpeg's hwaccel integration.
+        if codecpar.codec_id == AV_CODEC_ID_HEVC || codecpar.codec_id == AV_CODEC_ID_H264 {
+            logger.info("\(codecpar.codec_id == AV_CODEC_ID_HEVC ? "HEVC" : "H.264") — delegating to VTVideoDecoder")
             return nil
         }
 
@@ -116,8 +119,19 @@ final class FFmpegVideoDecoder {
     }
 
     private func extractHWPixelBuffer(from frame: UnsafeMutablePointer<AVFrame>) -> CVPixelBuffer? {
+        // AVFrame.data.3 holds a CVPixelBuffer returned by VideoToolbox. The
+        // buffer is owned by the AVFrame: av_frame_free() drops the AVFrame's
+        // reference, but VideoToolbox itself still holds one (the pool will
+        // reuse the buffer once the refcount hits 1).
+        //
+        // takeRetainedValue() (+1) detaches the buffer from the AVFrame's
+        // lifetime so it survives av_frame_free(). The decoded frame then
+        // travels through JitterBuffer → MetalRenderer → CIImage.render(),
+        // which encodes a GPU read into an async MTLCommandBuffer. Without
+        // this +1, VideoToolbox could reuse the buffer while the GPU is still
+        // reading it → torn frames / 花屏 / flicker.
         guard let ptr = frame.pointee.data.3 else { return nil }
-        return Unmanaged<CVPixelBuffer>.fromOpaque(ptr).takeUnretainedValue()
+        return Unmanaged<CVPixelBuffer>.fromOpaque(ptr).takeRetainedValue()
     }
 
     private func convertSWFrame(_ frame: UnsafeMutablePointer<AVFrame>) -> CVPixelBuffer? {

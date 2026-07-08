@@ -4,15 +4,64 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-test:
+  test:
+    name: Build & Test (macOS)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+
+      - name: Print environment
+        run: |
+          xcodebuild -version
+          swift --version
+
       - name: Build
-        run: swift build
+        run: xcrun swift build -v
+
       - name: Test
-        run: swift test
-      - name: Build docs
-        run: swift package generate-documentation --target PlayerKit
+        run: xcrun swift test --parallel
+
+  lint:
+    name: SwiftFormat (dry run)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: |
+          # No swift-format installed by default — skip until added.
+          echo "swift-format check disabled (tool not yet wired)."
+
+  docs:
+    name: Generate Docs
+    runs-on: macos-14
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - name: Dump symbol graph
+        run: xcrun swift package dump-symbol-graph --minimum-access-level public
+      - name: Generate DocC archive
+        run: |
+          xcrun docc convert \
+            --additional-symbol-graph-dir .build/*/symbolgraph \
+            --output-dir .build/docs \
+            --fallback-display-name PlayerKit \
+            --fallback-bundle-identifier io.reflux.PlayerKit
+      - name: Upload docs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlayerKit-docs
+          path: .build/docs

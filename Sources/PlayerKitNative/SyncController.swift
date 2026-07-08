@@ -4,14 +4,16 @@ import Foundation
 final class SyncController {
 
     let alpha: Double = 0.1
-    let syncThresholdMin: Double = 0.04
-    let syncThresholdMax: Double = 0.10
-    let maxDelay: Double = 0.15
+    let maxDelay: Double = 0.5
 
     private var frameTimer: Double = 0
     private var frameTimerSerial: Int64 = -1
-    private var lastDisplayedPTS: Double = -1
+    private(set) var lastDisplayedPTS: Double = -1
     private var lastDuration: Double = 0.04
+
+    /// Whether at least one frame has been displayed since creation or reset.
+    /// Used by display loop to gate freeze/skip — first post-seek frame always shows.
+    var hasDisplayedFrame: Bool { lastDisplayedPTS >= 0 }
 
     /// Call every CADisplayLink tick. Returns (shouldDisplay, computedDelay).
     /// Pass the returned delay to advance() when displaying.
@@ -31,7 +33,7 @@ final class SyncController {
         if lastDisplayedPTS < 0 { return (true, 0) }
 
         let nominalDelay = nominalFrameDuration(nextPTS: nextPTS, followingPTS: followingPTS)
-        let delay = computeDelay(nominalDelay: nominalDelay, audioTime: audioTime)
+        let delay = computeDelay(nominalDelay: nominalDelay, nextPTS: nextPTS, audioTime: audioTime)
         return (now >= frameTimer + delay, delay)
     }
 
@@ -60,14 +62,17 @@ final class SyncController {
         return lastDuration > 0 ? lastDuration : 0.04
     }
 
-    private func computeDelay(nominalDelay: Double, audioTime: Double) -> Double {
-        let diff = lastDisplayedPTS - audioTime  // >0: video ahead; <0: video behind
-        let syncThreshold = max(syncThresholdMin, min(syncThresholdMax, nominalDelay))
-        var delay = nominalDelay
-        if abs(diff) >= syncThreshold {
-            // Low-pass: correct α×diff per frame rather than all at once
-            delay = nominalDelay + alpha * diff
-        }
+    private func computeDelay(nominalDelay: Double, nextPTS: Double, audioTime: Double) -> Double {
+        // Continuous low-pass correction: delay = nominal + α·diff, no hard
+        // threshold. The previous `if abs(diff) >= syncThreshold` gate made the
+        // correction kick in/out across consecutive frames as diff hovered near
+        // the threshold, causing delay to oscillate between nominalDelay and
+        // nominalDelay + α·diff → frame pacing jitter / 来回拉扯.
+        // With α=0.1 and typical diff in ±50ms, correction is ±5ms — well below
+        // one-frame duration (~33ms) and imperceptible, but still pulls video
+        // toward audio continuously.
+        let diff = nextPTS - audioTime  // >0: video ahead; <0: video behind
+        let delay = nominalDelay + alpha * diff
         return max(0, min(delay, maxDelay))
     }
 }

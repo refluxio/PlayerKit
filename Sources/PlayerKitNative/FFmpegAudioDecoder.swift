@@ -174,11 +174,20 @@ final class FFmpegAudioDecoder {
         let converted = outData.withUnsafeMutableBytes { outBuf -> Int in
             guard let outPtr = outBuf.baseAddress else { return 0 }
             var outPtrs: [UnsafeMutablePointer<UInt8>?] = [outPtr.assumingMemoryBound(to: UInt8.self)]
-            var inPtrs: [UnsafePointer<UInt8>?] = [
-                UnsafePointer(frame.pointee.data.0),
-                UnsafePointer(frame.pointee.data.1),
-                UnsafePointer(frame.pointee.data.2),
-            ]
+            // AVFrame.data is a C array imported as a tuple in Swift.
+            // Build the pointer array for all channels dynamically.
+            let chCount = Int(frame.pointee.ch_layout.nb_channels > 0
+                ? frame.pointee.ch_layout.nb_channels
+                : outputChannels)
+            var inPtrs = [UnsafePointer<UInt8>?](repeating: nil, count: max(chCount, 1))
+            if chCount >= 1 { inPtrs[0] = UnsafePointer(frame.pointee.data.0) }
+            if chCount >= 2 { inPtrs[1] = UnsafePointer(frame.pointee.data.1) }
+            if chCount >= 3 { inPtrs[2] = UnsafePointer(frame.pointee.data.2) }
+            if chCount >= 4 { inPtrs[3] = UnsafePointer(frame.pointee.data.3) }
+            if chCount >= 5 { inPtrs[4] = UnsafePointer(frame.pointee.data.4) }
+            if chCount >= 6 { inPtrs[5] = UnsafePointer(frame.pointee.data.5) }
+            if chCount >= 7 { inPtrs[6] = UnsafePointer(frame.pointee.data.6) }
+            if chCount >= 8 { inPtrs[7] = UnsafePointer(frame.pointee.data.7) }
             return Int(swr_convert(swrCtx, &outPtrs, outSamples, &inPtrs, Int32(nbSamples)))
         }
 

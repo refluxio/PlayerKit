@@ -23,6 +23,8 @@ public final class NativeBackend: PlayerBackend {
     public private(set) var state = PlayerState()
     public private(set) var videoWidth: Int = 0
     public private(set) var videoHeight: Int = 0
+    private var codedVideoWidth: Int = 0
+    private var codedVideoHeight: Int = 0
     public private(set) var colorParams = VideoColorParams()
     public var onStateChange: ((PlayerState) -> Void)?
 
@@ -30,7 +32,8 @@ public final class NativeBackend: PlayerBackend {
     public var renderer: any VideoRenderer { _renderer }
 
     /// Injected PRO audio output backend. When non-nil, replaces AudioUnitOutput.
-    private var _injectedAudioOutput: (any AudioOutputBackend)?
+    /// Written once in init(), only read afterwards — safe to access from any thread.
+    private nonisolated(unsafe) var _injectedAudioOutput: (any AudioOutputBackend)?
 
     private var _frameSinks: [WeakFrameSink] = []
     private struct WeakFrameSink {
@@ -46,21 +49,26 @@ public final class NativeBackend: PlayerBackend {
     private var audioUnitOutput: AudioUnitOutput?
     private let jitterBuffer = VideoJitterBuffer()
     private let syncController = SyncController()
-    // Set after seek(); cleared by displayNextFrame on first post-seek frame.
-    // Calibrates audioClock to actual I-frame PTS rather than seek target,
-    // preventing "video behind audio" false positive that triggers PacketDropPolicy overshoot.
-    private var seekPendingClock: Bool = false
+    // Set after play() or seek(); cleared by displayNextFrame on first frame.
+    // Calibrates audioClock to actual first decoded frame PTS so audio and video
+    // start from the same position — required for H.264 streams whose PTS does
+    // not start at 0 (e.g. B-frame reorder delays).
+    private var needsClockCalibration: Bool = false
 
     // Pipeline control
     private let demuxLock = NSLock()
     private let seekLock = NSLock()
-    private var seekSerial: Int64 = 0
-    // demuxCancelled is read from DispatchQueue.global() without a lock.
-    // Bool reads/writes are atomic on ARM64 in practice; a proper fix would use
-    // an OSAtomicBool wrapper, but this matches the pre-refactor pattern.
-    private var demuxCancelled = false
+    // Guarded by seekLock — safe to access from any thread holding the lock.
+    private nonisolated(unsafe) var seekSerial: Int64 = 0
+    // demuxCancelled is read from DispatchQueue.global() under demuxLock.
+    // Bool reads/writes are atomic on ARM64 in practice; nonisolated(unsafe) makes
+    // that contract explicit for the compiler's concurrency checker.
+    private nonisolated(unsafe) var demuxCancelled = false
     private var displayLink: CADisplayLink?
     private var displayLinkProxy: DisplayLinkProxy?
+    #if os(macOS)
+    private var cvDisplayLink: CVDisplayLink?
+    #endif
 
     // Cancellation: incremented on every play()/stop() to discard stale async opens
     private var playGeneration: Int = 0
@@ -113,7 +121,11 @@ public final class NativeBackend: PlayerBackend {
                 try demuxer.open(url: url, headers: headers)
             } catch {
                 logger.error("demuxer.open FAILED: \(error)")
-                let msg = error.localizedDescription
+                // Prefer CustomStringConvertible.description (our DemuxerError
+                // provides FFmpeg ret + av_err2str). localizedDescription would
+                // just return "The operation couldn't be completed. ... error N."
+                let msg = (error as? CustomStringConvertible)?.description
+                    ?? String(describing: error)
                 await MainActor.run { [weak self] in
                     guard let self, self.playGeneration == gen else { return }
                     self.state.error = msg
@@ -146,12 +158,42 @@ public final class NativeBackend: PlayerBackend {
         logger.info("duration: knownDuration=\(knownDuration.map{"\(Double($0.components.seconds))s"} ?? "nil") demuxer=\(String(format:"%.1f",demuxDur))s → using \(String(format:"%.1f",Double(self.state.duration.components.seconds)))s")
 
         if let vs = demuxer.videoStream {
+            let sar = demuxer.sampleAspectRatio
             if let dec = FFmpegVideoDecoder(stream: vs) {
-                videoDecoder = dec; videoWidth = dec.width; videoHeight = dec.height
-                logger.info("video: hw=\(dec.isHardware) \(dec.width)x\(dec.height)")
+                videoDecoder = dec
+                codedVideoWidth  = dec.width; codedVideoHeight = dec.height
+                videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
+                videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
+                let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
+                logger.info("video: hw=\(dec.isHardware) \(dec.width)x\(dec.height)\(sarStr) display=\(self.videoWidth)x\(self.videoHeight)")
             } else if let dec = VTVideoDecoder(stream: vs) {
-                videoDecoder = dec; videoWidth = dec.width; videoHeight = dec.height
-                logger.info("video: VT \(dec.width)x\(dec.height)")
+                videoDecoder = dec
+                codedVideoWidth  = dec.width; codedVideoHeight = dec.height
+                videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
+                videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
+                let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
+                logger.info("video: VT \(dec.width)x\(dec.height)\(sarStr) display=\(self.videoWidth)x\(self.videoHeight)")
+            }
+        }
+
+        // Extract HDR color metadata from the video stream's codec parameters
+        if let vs = demuxer.videoStream {
+            let cp = vs.pointee.codecpar.pointee
+            var cpParams = VideoColorParams()
+            switch cp.color_trc {
+            case AVCOL_TRC_SMPTE2084:   cpParams.transfer = .pq
+            case AVCOL_TRC_ARIB_STD_B67: cpParams.transfer = .hlg
+            default: break
+            }
+            switch cp.color_space {
+            case AVCOL_SPC_BT2020_NCL, AVCOL_SPC_BT2020_CL: cpParams.matrix = .bt2020
+            case AVCOL_SPC_BT470BG, AVCOL_SPC_SMPTE170M:     cpParams.matrix = .bt601
+            default: break
+            }
+            cpParams.range = cp.color_range == AVCOL_RANGE_JPEG ? .full : .limited
+            self.colorParams = cpParams
+            if self.colorParams.transfer == .pq || self.colorParams.transfer == .hlg {
+                logger.info("HDR: transfer=\(String(describing: self.colorParams.transfer)) matrix=\(String(describing: self.colorParams.matrix))")
             }
         }
 
@@ -161,6 +203,14 @@ public final class NativeBackend: PlayerBackend {
             let out = AudioUnitOutput(clock: audioClock)
             audioUnitOutput = out
             logger.info("audio: \(dec.outputSampleRate)Hz \(dec.outputChannels)ch")
+        }
+
+        // Forward coded dimensions and SAR to the renderer for correct DAR.
+        // Hardware decoders may return alignment-padded CVPixelBuffers;
+        // the codec-level pixel dimensions are the ground truth.
+        if let mr = _renderer as? MetalRenderer {
+            mr.codedSize = CGSize(width: codedVideoWidth, height: codedVideoHeight)
+            mr.sampleAspectRatio = demuxer.sampleAspectRatio
         }
 
         wireJitterBuffer()
@@ -175,6 +225,11 @@ public final class NativeBackend: PlayerBackend {
             // 500ms–1s ahead of video before the first frame appears.
             out.pause()
         }
+
+        // Calibrate audioClock to first decoded frame PTS on the first display
+        // tick — same as post-seek calibration. Required for H.264 B-frame streams
+        // whose PTS does not start at 0 (priming delay).
+        needsClockCalibration = true
 
         state.isPlaying = true
         notifyStateChange()
@@ -211,15 +266,10 @@ public final class NativeBackend: PlayerBackend {
         let sLock = seekLock
 
         DispatchQueue.global().async { [weak self] in
-            var dropPolicy = PacketDropPolicy()
             var ptsValidator = PTSValidator()
             var packetCount: Int32 = 0
             var eofRecoveryDone = false
             var lastSeenSerial: Int64 = -1
-            // Disabled after each seek until jitterBuffer enters .playing, preventing
-            // PacketDropPolicy from skipping to the next I-frame when the actual decoded
-            // I-frame lands before the seek target (GOP boundary alignment).
-            var droppingEnabled = true
 
             let frameDuration: Double
             if let vs = demuxer.videoStream {
@@ -246,14 +296,7 @@ public final class NativeBackend: PlayerBackend {
                 // Reset state on seek so stale values don't affect post-seek packets.
                 if currentSerial != lastSeenSerial {
                     ptsValidator.reset()
-                    dropPolicy = PacketDropPolicy()
-                    droppingEnabled = false
                     lastSeenSerial = currentSerial
-                }
-
-                // Re-enable drop policy once jitterBuffer is playing (audioClock is live).
-                if !droppingEnabled && jitter.state == .playing {
-                    droppingEnabled = true
                 }
 
                 guard let result = demuxer.readPacket() else {
@@ -284,25 +327,17 @@ public final class NativeBackend: PlayerBackend {
                 if streamIndex == demuxer.videoStreamIndex {
                     let rawPTS = Self.ptsFromPacket(packet, demuxer: demuxer)
                     let pts = ptsValidator.validate(rawPTS)
-                    // Debug: log large PTS jumps to detect stream discontinuities
                     if packetCount < 5 || (packetCount % 500 == 0) {
                         logger.debug("pkt#\(packetCount) rawPTS=\(String(format:"%.3f",rawPTS)) pts=\(String(format:"%.3f",pts)) audio=\(String(format:"%.3f",clock.audioTime))")
                     }
-                    let isKey = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
-                    let activeSerial = sLock.withLock { self.seekSerial }
 
-                    let skip = droppingEnabled
-                        && activeSerial == currentSerial
-                        && dropPolicy.shouldDrop(packetPTS: pts,
-                                                 audioTime: clock.audioTime,
-                                                 isKeyframe: isKey)
-                    if skip {
-                        dLock.unlock()
-                        var p: UnsafeMutablePointer<AVPacket>? = packet
-                        av_packet_free(&p)
-                        continue
-                    }
-
+                    // Decode every video packet in stream order — no pre-decode
+                    // drop filtering.  A/V sync is enforced at render time by the
+                    // display loop's freeze-ahead / skip-behind guard (±60ms),
+                    // which is far tighter than any demux-level threshold and
+                    // cannot cause the "skip to next I-frame" cascade that
+                    // demux-level dropping produced after seek.  JitterBuffer's
+                    // maxDuration backpressure caps memory growth.
                     let pixelBuffer = videoDec?.decode(packet: packet)
                     dLock.unlock()
 
@@ -318,9 +353,31 @@ public final class NativeBackend: PlayerBackend {
                     }
 
                 } else if streamIndex == demuxer.audioStreamIndex {
-                    let pcm = audioDec?.decode(packet: packet)
-                    dLock.unlock()
-                    if let pcm { audioOut?.enqueue(pcm) }
+                    // Passthrough path: if PRO backend is injected and codec supports it,
+                    // route compressed packets directly without decoding.
+                    if let injected = _injectedAudioOutput,
+                       injected.supportsPassthrough,
+                       demuxer.isPassthroughCodec {
+
+                        let pkt = packet.pointee
+                        let size = Int(pkt.size)
+                        let pts = NativeBackend.ptsFromPacket(packet, demuxer: demuxer)
+                        var data = Data(count: size)
+                        if size > 0, let buf = pkt.data {
+                            data.withUnsafeMutableBytes { raw in
+                                raw.baseAddress!.copyMemory(from: buf, byteCount: size)
+                            }
+                        }
+                        dLock.unlock()
+                        let codecName = String(cString: avcodec_get_name(
+                            demuxer.audioStream!.pointee.codecpar.pointee.codec_id))
+                        injected.outputCompressed(data, pts: pts, codec: codecName)
+                    } else {
+                        // PCM path (existing behavior): decode and enqueue
+                        let pcm = audioDec?.decode(packet: packet)
+                        dLock.unlock()
+                        if let pcm { audioOut?.enqueue(pcm) }
+                    }
                 } else {
                     dLock.unlock()
                 }
@@ -353,8 +410,15 @@ public final class NativeBackend: PlayerBackend {
         // nearest prior I-frame, so the first decodable frame's PTS < seek target.
         // Without this, PacketDropPolicy sees "video behind audio" and drops all
         // non-keyframes up to the next I-frame, causing a 6+ second overshoot.
-        if seekPendingClock, let firstFrame = jitterBuffer.peek(at: 0) {
-            seekPendingClock = false
+        //
+        // We re-calibrate on every tick until the first frame is actually rendered.
+        // This is critical: AudioQueueStop(immediate=true) and AudioQueueStart can
+        // fire callbacks asynchronously that advance the clock *after* our reset,
+        // polluting audioClock to be ahead of the first video frame PTS.  If we
+        // cleared the flag on peek (before render), the next tick's audioTime
+        // would already be ahead and trigger skip-behind, dropping 5-10 frames
+        // → the user-visible "1s 花屏/卡顿" right after seek.
+        if needsClockCalibration, let firstFrame = jitterBuffer.peek(at: 0) {
             audioClock.reset(to: firstFrame.pts, sampleRate: audioDecoder?.outputSampleRate ?? 44100)
         }
 
@@ -362,6 +426,37 @@ public final class NativeBackend: PlayerBackend {
         let serial = seekLock.withLock { seekSerial }
 
         guard let frame = jitterBuffer.peek(at: 0) else { return }
+
+        // --- Freeze-ahead / Skip-behind (commercial player A/V sync) ---
+        // After the first post-seek frame has been displayed, guard against large
+        // desync without changing playback speed.  Video ahead of audio: freeze
+        // current frame until audio catches up.  Video behind audio: silently pop
+        // the frame so video jumps toward audio without visible stutter.
+        // SyncController's low-pass correction handles the rest within ±~60ms.
+        //
+        // Suppress this guard during the calibration window (first frame not yet
+        // rendered): during this window audioTime is being repeatedly reset to
+        // firstFrame.pts, so diff is ~0 and the guard wouldn't fire anyway — but
+        // keeping the flag check explicit avoids any edge case where a stray
+        // audio callback lands between the reset above and the diff check below.
+        if syncController.hasDisplayedFrame, !needsClockCalibration {
+            let guardWindow = 0.06  // ~1.5 frames at 24fps — imperceptible
+            let diff = frame.pts - audioTime
+            if diff > guardWindow {
+                // Video ahead: freeze, track position to audio so slider doesn't stick.
+                let pos = Duration.milliseconds(Int64(audioTime * 1000))
+                if (pos - lastNotifiedPos) >= .milliseconds(500) {
+                    state.position = pos; notifyStateChange(); lastNotifiedPos = pos
+                }
+                return
+            }
+            if diff < -guardWindow {
+                // Video behind: skip this frame silently.
+                jitterBuffer.pop()
+                return
+            }
+        }
+
         let followingPTS = jitterBuffer.peek(at: 1)?.pts
 
         let (shouldShow, delay) = syncController.check(
@@ -391,13 +486,18 @@ public final class NativeBackend: PlayerBackend {
         }
         displayedVideoFrames += 1; framesSinceLastLog += 1
 
+        // First frame rendered — calibration window is over.  Subsequent ticks
+        // let audioClock advance naturally via AudioQueue callbacks.
+        if needsClockCalibration {
+            needsClockCalibration = false
+        }
+
         let posDur = Duration.milliseconds(Int64(popped.pts * 1000))
         state.position = posDur
-        // Duration is kept up-to-date by the demux loop (which runs 5s ahead).
-        // We only update here as a fallback if display somehow catches up to or
-        // exceeds the demux-reported duration (e.g. near EOF).
         if posDur > state.duration { state.duration = posDur }
-        notifyStateChange(); lastNotifiedPos = posDur
+        if (posDur - lastNotifiedPos) >= .milliseconds(500) {
+            notifyStateChange(); lastNotifiedPos = posDur
+        }
 
         logSync(now: now, pts: popped.pts, audioTime: audioTime)
     }
@@ -415,7 +515,15 @@ public final class NativeBackend: PlayerBackend {
 
     public func pause() {
         logger.info("pause")
-        displayLink?.invalidate(); displayLink = nil; displayLinkProxy = nil
+        displayLink?.invalidate(); displayLink = nil
+        #if os(macOS)
+        // Keep displayLinkProxy alive: CVDisplayLink's output callback holds an
+        // unretained raw pointer to it. Releasing the proxy here would leave a
+        // dangling pointer that gets dereferenced on the next CVDisplayLinkStart.
+        if let cv = cvDisplayLink, CVDisplayLinkIsRunning(cv) { CVDisplayLinkStop(cv) }
+        #else
+        displayLinkProxy = nil
+        #endif
         audioUnitOutput?.pause()
         state.isPlaying = false; notifyStateChange()
     }
@@ -455,14 +563,19 @@ public final class NativeBackend: PlayerBackend {
         audioUnitOutput?.pause()
         // Signal displayNextFrame to calibrate audioClock to actual I-frame PTS.
         // FFmpeg seek lands on the GOP boundary before secs, so audioClock(=secs)
-        // would be ahead of the first decoded frame, triggering PacketDropPolicy.
-        seekPendingClock = true
+        // would be ahead of the first decoded frame; without re-calibration the
+        // display loop's skip-behind guard would drop the first few frames.
+        needsClockCalibration = true
     }
 
     public func stop() {
         playGeneration += 1  // discard any in-flight async open
         logger.info("stop (displayed \(self.displayedVideoFrames) frames)")
         displayLink?.invalidate(); displayLink = nil; displayLinkProxy = nil
+        #if os(macOS)
+        if let cv = cvDisplayLink, CVDisplayLinkIsRunning(cv) { CVDisplayLinkStop(cv) }
+        cvDisplayLink = nil
+        #endif
         demuxCancelled = true
         audioUnitOutput?.stop()
         demuxLock.lock()
@@ -496,13 +609,48 @@ public final class NativeBackend: PlayerBackend {
     // MARK: - Display link
 
     private func startDisplayLink() {
-        displayLink?.invalidate()
+        #if os(iOS) || os(tvOS)
         let proxy = DisplayLinkProxy(backend: self)
         displayLinkProxy = proxy
-        #if os(iOS) || os(tvOS)
+        displayLink?.invalidate()
         let link = CADisplayLink(target: proxy, selector: #selector(DisplayLinkProxy.tick))
+        // Request high refresh rate for smooth video — 25fps/24fps content on
+        // 60Hz suffers visible 3:2 pulldown judder (33/50ms alternating gaps).
+        // At 120Hz the same content maps to ~5-tick gaps (41ms), near-perfect.
+        if #available(iOS 15.0, tvOS 15.0, *) {
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+        }
         link.add(to: .main, forMode: .common)
         displayLink = link
+        #elseif os(macOS)
+        // CVDisplayLink runs on a high-priority background thread; the callback
+        // must hop to the main actor to call displayNextFrame (which touches
+        // @MainActor-isolated backend state and the Metal renderer).
+        if cvDisplayLink == nil {
+            var link: CVDisplayLink?
+            CVDisplayLinkCreateWithActiveCGDisplays(&link)
+            guard let link else {
+                logger.error("CVDisplayLinkCreateWithActiveCGDisplays FAILED")
+                return
+            }
+            cvDisplayLink = link
+        }
+        // Always (re)bind the output callback to the current proxy.  pause()
+        // keeps displayLinkProxy alive on macOS so the raw pointer stays valid
+        // across pause/resume cycles; we still reset the callback each start
+        // so a fresh proxy (after stop()) is correctly wired.
+        let proxy = displayLinkProxy ?? DisplayLinkProxy(backend: self)
+        displayLinkProxy = proxy
+        let proxyPtr = Unmanaged.passUnretained(proxy).toOpaque()
+        CVDisplayLinkSetOutputCallback(cvDisplayLink!, { _, _, _, _, _, ctx in
+            guard let ctx else { return kCVReturnSuccess }
+            let p = Unmanaged<DisplayLinkProxy>.fromOpaque(ctx).takeUnretainedValue()
+            DispatchQueue.main.async { p.tick() }
+            return kCVReturnSuccess
+        }, proxyPtr)
+        if let cv = cvDisplayLink, !CVDisplayLinkIsRunning(cv) {
+            CVDisplayLinkStart(cv)
+        }
         #endif
     }
 }

@@ -1,25 +1,56 @@
-# NOTICE
+PlayerKit
+========
 
-PlayerKit links FFmpeg, which is distributed under the LGPL v2.1+ license.
+Copyright (c) 2026 refluxio. All rights reserved.
 
-- FFmpeg source: https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.gz
-- Build script: scripts/build_ffmpeg.sh (generates the xcframeworks in Sources/CFFmpeg/xcframeworks/)
+PlayerKit is licensed under the GNU Lesser General Public License v2.1 or
+later (LGPL v2.1+). See [LICENSE](LICENSE) for the full text.
 
-## Replacing FFmpeg Libraries
 
-To comply with LGPL, you must be able to replace the FFmpeg libraries with your own build:
+FFmpeg
+------
 
-1. Clone this repository.
-2. Run `scripts/build_ffmpeg.sh` with your custom FFmpeg configuration.
-3. Replace the contents of `Sources/CFFmpeg/xcframeworks/` with the output.
-4. Rebuild your application.
+PlayerKit links against FFmpeg (https://ffmpeg.org/), which is distributed
+under the GNU Lesser General Public License v2.1 or later (LGPL v2.1+).
 
-## Bundled Libraries
+  - FFmpeg source:        https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.gz
+  - FFmpeg build script:  scripts/build_ffmpeg.sh
+  - Built xcframeworks:  Sources/CFFmpeg/xcframeworks/{libavcodec,libavformat,
+                          libavutil,libswresample,libswscale}.xcframework
 
-The following FFmpeg libraries are bundled as xcframeworks:
+The pre-built FFmpeg xcframeworks are committed to the refluxio/PlayerKit
+independent repository. Inside the reflux monorepo they are git-ignored and
+regenerated locally by `scripts/build_ffmpeg.sh`. They were built with
+`--enable-gpl` disabled, so only LGPL-compatible components are included.
 
-- libavcodec (LGPL v2.1+)
-- libavformat (LGPL v2.1+)
-- libavutil (LGPL v2.1+)
-- libswresample (LGPL v2.1+)
-- libswscale (LGPL v2.1+)
+### LGPL compliance — replacing FFmpeg
+
+Under LGPL v2.1, users of PlayerKit must be able to replace the FFmpeg
+libraries with their own builds. To do so:
+
+1. Build FFmpeg from source:
+   ```bash
+   cd PlayerKit
+   scripts/build_ffmpeg.sh
+   ```
+   This regenerates the 5 xcframeworks under `Sources/CFFmpeg/xcframeworks/`.
+
+2. Or supply your own pre-built xcframeworks by replacing the contents of
+   `Sources/CFFmpeg/xcframeworks/` and re-linking:
+   ```bash
+   xcrun swift build
+   ```
+
+3. Applications that statically link PlayerKit must also provide their
+   users a way to relink against a modified FFmpeg (e.g. by distributing
+   the PlayerKit object files alongside the executable, or by using dynamic
+   linking instead of static).
+
+
+Trademarks
+----------
+
+Apple, macOS, iOS, tvOS, VideoToolbox, Metal, and AVFoundation are
+trademarks of Apple Inc. FFmpeg is a trademark of Fabrice Bellard. This
+project is not affiliated with or endorsed by Apple Inc. or the FFmpeg
+project.

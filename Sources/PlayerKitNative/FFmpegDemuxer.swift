@@ -5,9 +5,29 @@ import os
 
 private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "demuxer")
 
-enum DemuxerError: Error {
+enum DemuxerError: Error, CustomStringConvertible {
+    /// avformat_open_input returned non-zero. Carries the FFmpeg error code.
     case openFailed(Int32)
-    case noStreams
+    /// avformat_find_stream_info returned < 0.
+    case noStreams(Int32)
+    /// No usable video or audio stream found after probing.
+    case noUsableStreams
+
+    var description: String {
+        switch self {
+        case .openFailed(let ret):
+            // av_err2str returns a thread-local C string; copy it into Swift.
+            let buf = UnsafeMutablePointer<CChar>.allocate(capacity: Int(AV_ERROR_MAX_STRING_SIZE))
+            defer { buf.deallocate() }
+            _ = av_make_error_string(buf, Int(AV_ERROR_MAX_STRING_SIZE), ret)
+            let msg = String(cString: buf)
+            return "demux open failed (ret=\(ret)): \(msg)"
+        case .noStreams(let ret):
+            return "demux find_stream_info failed (ret=\(ret))"
+        case .noUsableStreams:
+            return "no usable video/audio stream found in container"
+        }
+    }
 }
 
 final class FFmpegDemuxer: @unchecked Sendable {
@@ -18,8 +38,33 @@ final class FFmpegDemuxer: @unchecked Sendable {
     var videoStreamIndex: Int32 { videoStream.map { $0.pointee.index } ?? -1 }
     var audioStreamIndex: Int32 { audioStream.map { $0.pointee.index } ?? -1 }
 
+    /// Returns true if the current audio stream carries a passthrough-capable codec
+    /// (AC3, E-AC3, DTS).
+    var isPassthroughCodec: Bool {
+        guard let audioStream else { return false }
+        let codecId = audioStream.pointee.codecpar.pointee.codec_id
+        switch codecId {
+        case AV_CODEC_ID_AC3,
+             AV_CODEC_ID_EAC3,
+             AV_CODEC_ID_DTS:
+            return true
+        default:
+            return false
+        }
+    }
+
     private(set) var videoStream: UnsafeMutablePointer<AVStream>?
     private(set) var audioStream: UnsafeMutablePointer<AVStream>?
+
+    /// Video stream's sample aspect ratio (SAR). Defaults to 1:1 if not set.
+    /// Non-square pixels are common in H.264 SD content — e.g. 720×576 with
+    /// SAR 16:15 gives a display aspect of 768×576 (4:3).
+    var sampleAspectRatio: Double {
+        guard let vs = videoStream else { return 1.0 }
+        let sar = vs.pointee.sample_aspect_ratio
+        guard sar.num > 0, sar.den > 0 else { return 1.0 }
+        return Double(sar.num) / Double(sar.den)
+    }
 
     func open(url: URL, headers: [String: String] = [:]) throws {
         close()
@@ -36,11 +81,24 @@ final class FFmpegDemuxer: @unchecked Sendable {
             av_dict_set(&opts, "headers", dict, 0)
         }
 
-        let ret = avformat_open_input(&formatCtx, url.absoluteString, nil, &opts)
+        // For local files, pass the plain filesystem path — FFmpeg's `file:`
+        // protocol does not URL-decode (%20 → space), so `absoluteString` like
+        // `file:///foo%20bar/baz.mp4` would fail with ENOENT (-2) for any path
+        // containing spaces or other percent-encoded characters. Network URLs
+        // (http/https/rtmp/...) must go through as absoluteString.
+        let urlString: String
+        if url.isFileURL {
+            urlString = url.path
+        } else {
+            urlString = url.absoluteString
+        }
+        logger.info("opening url=\(urlString, privacy: .public)")
+
+        let ret = avformat_open_input(&formatCtx, urlString, nil, &opts)
         av_dict_free(&opts)
 
         guard ret == 0 else {
-            logger.error("avformat_open_input FAILED, ret=\(ret)")
+            logger.error("avformat_open_input FAILED, ret=\(ret) url=\(urlString, privacy: .public)")
             throw DemuxerError.openFailed(ret)
         }
         logger.info("avformat_open_input OK")
@@ -48,7 +106,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
         let infoRet = avformat_find_stream_info(formatCtx, nil)
         guard infoRet >= 0 else {
             logger.error("avformat_find_stream_info FAILED, ret=\(infoRet)")
-            throw DemuxerError.noStreams
+            throw DemuxerError.noStreams(infoRet)
         }
 
         guard let ctx = formatCtx else { return }
@@ -153,7 +211,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
             let dict = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n")
             av_dict_set(&opts, "headers", dict, 0)
         }
-        guard avformat_open_input(&probeCtx, url.absoluteString, nil, &opts) == 0 else {
+        guard avformat_open_input(&probeCtx, url.isFileURL ? url.path : url.absoluteString, nil, &opts) == 0 else {
             av_dict_free(&opts); return nil
         }
         av_dict_free(&opts)

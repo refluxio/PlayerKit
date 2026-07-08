@@ -49,6 +49,13 @@ public final class Player {
     /// Set playback rate (1.0 = normal, 2.0 = double speed).
     public func setRate(_ r: Double)           { backend.setRate(r) }
 
+    /// Clear the current error status. UI calls this when the user dismisses
+    /// the error overlay.
+    public func clearError() {
+        guard state.error != nil else { return }
+        state.error = nil
+    }
+
     /// Select an audio track by its identifier.
     public func selectAudioTrack(id: String)   { backend.selectAudioTrack(id: id) }
 
