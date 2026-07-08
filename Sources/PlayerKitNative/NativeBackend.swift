@@ -438,37 +438,33 @@ public final class NativeBackend: PlayerBackend {
         let audioTime = audioClock.audioTime
         let serial = seekLock.withLock { seekSerial }
 
-        guard let frame = jitterBuffer.peek(at: 0) else { return }
-
         // --- Freeze-ahead / Skip-behind (commercial player A/V sync) ---
         // After the first post-seek frame has been displayed, guard against large
         // desync without changing playback speed.  Video ahead of audio: freeze
         // current frame until audio catches up.  Video behind audio: silently pop
-        // the frame so video jumps toward audio without visible stutter.
-        // SyncController's low-pass correction handles the rest within ±~60ms.
+        // stale frames.
         //
-        // Suppress this guard during the calibration window (first frame not yet
-        // rendered): during this window audioTime is being repeatedly reset to
-        // firstFrame.pts, so diff is ~0 and the guard wouldn't fire anyway — but
-        // keeping the flag check explicit avoids any edge case where a stray
-        // audio callback lands between the reset above and the diff check below.
+        // For high-source-fps content (120fps) on a 60Hz display, 2+ source frames
+        // age per display tick.  A single pop would fall further behind each cycle
+        // until almost every frame triggers the guard → the user sees a frozen image.
+        // Draining ALL stale frames in one pass keeps video locked to audio regardless
+        // of the source→display ratio.
         if syncController.hasDisplayedFrame, !needsClockCalibration {
-            let guardWindow = 0.06  // ~1.5 frames at 24fps — imperceptible
-            let diff = frame.pts - audioTime
-            if diff > guardWindow {
-                // Video ahead: freeze, track position to audio so slider doesn't stick.
+            // Drain frames significantly behind audio
+            while let lagging = jitterBuffer.peek(at: 0), lagging.pts < audioTime - 0.06 {
+                jitterBuffer.pop()
+            }
+            // Freeze-ahead: if the front frame is ahead of audio, stall
+            if let ahead = jitterBuffer.peek(at: 0), ahead.pts > audioTime + 0.06 {
                 let pos = Duration.milliseconds(Int64(audioTime * 1000))
                 if (pos - lastNotifiedPos) >= .milliseconds(500) {
                     state.position = pos; notifyStateChange(); lastNotifiedPos = pos
                 }
                 return
             }
-            if diff < -guardWindow {
-                // Video behind: skip this frame silently.
-                jitterBuffer.pop()
-                return
-            }
         }
+
+        guard let frame = jitterBuffer.peek(at: 0) else { return }
 
         let followingPTS = jitterBuffer.peek(at: 1)?.pts
 
