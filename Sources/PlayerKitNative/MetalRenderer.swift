@@ -96,26 +96,27 @@ final class MetalRenderer: VideoRenderer {
             ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
         }
 
-        // Color-space-aware rendering.
-        // For HDR content (PQ/HLG transfer), tell CoreImage the destination is
-        // extended linear sRGB.  CoreImage applies the EOTF from the CIImage's
-        // embedded colour space (BT.2020/PQ via VT attachments) → linear, then
-        // maps to extended sRGB.  The bgra8Unorm drawable clips values > 1.0
-        // which acts as a simple hard-clip tone-map.
-        let dstColorSpace: CGColorSpace
+        // Apply PQ→sRGB tone curve for HDR content.  We use an explicit
+        // CIToneCurve rather than relying on CoreImage automatic colour management,
+        // because VT's 8-bit output may not carry BT.2020/PQ attachments reliably.
         if colorParams.transfer == .pq || colorParams.transfer == .hlg {
-            // bgra8Unorm expects sRGB gamma-encoded values (not linear).
-            // CoreImage reads BT.2020/PQ from the buffer's colour attachments
-            // and converts to sRGB: PQ→linear, BT.2020→sRGB primaries, linear→sRGB gamma.
-            dstColorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
-        } else {
-            dstColorSpace = CGColorSpaceCreateDeviceRGB()
+            let toneCurve = CIFilter(name: "CIToneCurve")!
+            toneCurve.setValue(ciImage, forKey: kCIInputImageKey)
+            // PQ→sRGB approximate mapping (1000-nit mastering display).
+            // PQ 0.0→0.0, 0.1→0.06, 0.3→0.15, 0.5→0.40, 0.7→0.72, 1.0→1.0
+            toneCurve.setValue(CIVector(x: 0.0, y: 0.0),  forKey: "inputPoint0")
+            toneCurve.setValue(CIVector(x: 0.1, y: 0.06), forKey: "inputPoint1")
+            toneCurve.setValue(CIVector(x: 0.3, y: 0.15), forKey: "inputPoint2")
+            toneCurve.setValue(CIVector(x: 0.5, y: 0.40), forKey: "inputPoint3")
+            toneCurve.setValue(CIVector(x: 0.7, y: 0.72), forKey: "inputPoint4")
+            toneCurve.setValue(CIVector(x: 1.0, y: 1.0),  forKey: "inputPoint5")
+            ciImage = toneCurve.outputImage ?? ciImage
         }
         ciContext.render(ciImage,
                          to: drawable.texture,
                          commandBuffer: commandBuffer,
                          bounds: CGRect(x: 0, y: 0, width: dispW, height: dispH),
-                         colorSpace: dstColorSpace)
+                         colorSpace: CGColorSpaceCreateDeviceRGB())
 
         commandBuffer.present(drawable)
 
