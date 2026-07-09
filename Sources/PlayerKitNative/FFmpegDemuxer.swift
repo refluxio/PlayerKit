@@ -144,6 +144,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
 
     private(set) var videoStream: UnsafeMutablePointer<AVStream>?
     private(set) var audioStream: UnsafeMutablePointer<AVStream>?
+    private var audioStreamScore: Int = 0
 
     /// Video stream's sample aspect ratio (SAR). Defaults to 1:1 if not set.
     /// Non-square pixels are common in H.264 SD content — e.g. 720×576 with
@@ -216,8 +217,23 @@ final class FFmpegDemuxer: @unchecked Sendable {
 
             if codecType == AVMEDIA_TYPE_VIDEO && videoStream == nil {
                 videoStream = stream
-            } else if codecType == AVMEDIA_TYPE_AUDIO && audioStream == nil {
-                audioStream = stream
+            } else if codecType == AVMEDIA_TYPE_AUDIO {
+                // Prefer lightweight codecs for PCM decode (DTS > AC3 > AAC > TrueHD).
+                // TrueHD is extremely expensive to software decode (8-channel MLP),
+                // causing CPU starvation on iOS alongside 4K HEVC decoding.
+                // Only pick TrueHD if no lighter codec is available.
+                let score: Int
+                switch codecId {
+                case AV_CODEC_ID_AAC, AV_CODEC_ID_MP3: score = 4
+                case AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3: score = 3
+                case AV_CODEC_ID_DTS: score = 2
+                case AV_CODEC_ID_TRUEHD: score = 1
+                default: score = 3
+                }
+                if audioStream == nil || score > audioStreamScore {
+                    audioStream = stream
+                    audioStreamScore = score
+                }
             }
         }
 
@@ -353,6 +369,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
         }
         videoStream = nil
         audioStream = nil
+        audioStreamScore = 0
         duration = 0
     }
 
