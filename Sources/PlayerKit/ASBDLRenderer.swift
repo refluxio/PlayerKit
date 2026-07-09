@@ -55,6 +55,8 @@ public class ASBDLRenderer: VideoRenderer {
 
     public func clear() {
         displayLayer.flushAndRemoveImage()
+        // Show black to satisfy the protocol "show black" contract.
+        displayLayer.isHidden = true
     }
 
     public func configure(codedSize: CGSize, sampleAspectRatio: Double) {
@@ -77,7 +79,7 @@ public class ASBDLRenderer: VideoRenderer {
         )
 
         var sampleBuffer: CMSampleBuffer?
-        CMSampleBufferCreateForImageBuffer(
+        let sbufStatus = CMSampleBufferCreateForImageBuffer(
             allocator: kCFAllocatorDefault,
             imageBuffer: pixelBuffer,
             dataReady: true,
@@ -87,6 +89,7 @@ public class ASBDLRenderer: VideoRenderer {
             sampleTiming: &timing,
             sampleBufferOut: &sampleBuffer
         )
-        return sampleBuffer
+        guard sbufStatus == noErr, let sbuf = sampleBuffer else { return nil }
+        return sbuf
     }
 }
