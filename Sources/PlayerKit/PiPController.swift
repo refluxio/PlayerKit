@@ -9,7 +9,10 @@ import Foundation
 private class PiPPlaybackDelegate: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate {
     func pictureInPictureController(_: AVPictureInPictureController, setPlaying _: Bool) {}
     func pictureInPictureControllerTimeRangeForPlayback(_: AVPictureInPictureController) -> CMTimeRange {
-        .invalid
+        // Return a large finite range so AVKit stays in "playing" state rather
+        // than the loading spinner. Exact value doesn't matter since we don't
+        // expose scrubbing via this delegate.
+        CMTimeRange(start: .zero, duration: CMTime(value: 86400, timescale: 1))
     }
     func pictureInPictureControllerIsPlaybackPaused(_: AVPictureInPictureController) -> Bool {
         false
