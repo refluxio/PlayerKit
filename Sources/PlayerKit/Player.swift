@@ -70,6 +70,16 @@ public final class Player {
         (backend as? any PlayerBackend)?.renderer.layer
     }
 
+    // MARK: - PiP (requires ASBDLRenderer)
+
+    /// A controller for Picture in Picture playback.
+    /// Requires an ASBDLRenderer-based backend; nil otherwise.
+    @available(iOS 15.0, macOS 12.0, *)
+    public var pipController: PiPController? {
+        guard let asbdlRenderer = (backend as? any PlayerBackend)?.renderer as? ASBDLRenderer else { return nil }
+        return PiPController(displayLayer: asbdlRenderer.displayLayer)
+    }
+
     // MARK: - Frame sinks (requires PlayerBackend)
 
     /// Register a frame sink to receive decoded video frames.
