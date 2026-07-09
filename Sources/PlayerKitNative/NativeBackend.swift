@@ -601,18 +601,17 @@ public final class NativeBackend: PlayerBackend {
                     if let injected = _injectedAudioOutput,
                        injected.supportsPassthrough,
                        demuxer.isPassthroughCodec {
-                        // TrueHD passthrough silently drops on non-digital outputs
-                        // (built-in speakers / headphones). On iOS/tvOS there is no
-                        // HDMI ARC or SPDIF — always route through PCM decode.
-                        if codecName == "truehd" {
-                            #if os(iOS) || os(tvOS)
-                            usePassthrough = false
-                            #else
-                            usePassthrough = true
-                            #endif
-                        } else {
-                            usePassthrough = true
-                        }
+                        // Compressed passthrough (AC3, E-AC3, DTS, TrueHD)
+                        // requires a digital audio output (HDMI ARC / SPDIF).
+                        // iOS and tvOS have no such output path — the
+                        // AVSampleBufferAudioRenderer silently drops packets on
+                        // built-in speakers / headphones. Route through PCM
+                        // decode instead so audio is always audible.
+                        #if os(iOS) || os(tvOS)
+                        usePassthrough = false
+                        #else
+                        usePassthrough = true
+                        #endif
                     } else {
                         usePassthrough = false
                     }
