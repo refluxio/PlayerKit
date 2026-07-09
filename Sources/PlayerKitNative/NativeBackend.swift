@@ -26,6 +26,23 @@ public final class NativeBackend: PlayerBackend {
     private var codedVideoWidth: Int = 0
     private var codedVideoHeight: Int = 0
     public private(set) var colorParams = VideoColorParams()
+    /// Display capability used to resolve `RendererStrategy`. Defaults to
+    /// `appleMobile` (no EDR); PlayerController should set this to `macEDR` /
+    /// `macSDR` on macOS after observing NSScreen EDR support. Propagates to
+    /// the renderer so EDRRenderer's tone-map uniform picks up the new target
+    /// peak nits on the next frame.
+    public var displayCapability: DisplayCapability = .appleMobile {
+        didSet {
+            // Strategy is only resolved at stream open time; while a stream is
+            // playing we can still refresh the renderer's tone-map target.
+            _renderer.displayCapability = displayCapability
+        }
+    }
+    /// Strategy resolved once at open time from stream attributes + display
+    /// capability + renderer's `prefersTenBit`. Drives decoder selection and
+    /// is forwarded to `VideoRenderer.render` every frame so EDRRenderer can
+    /// pick its tone-map algorithm without re-reading stream attributes.
+    public private(set) var rendererStrategy: RendererStrategy?
     public var onStateChange: ((PlayerState) -> Void)?
 
     private let _renderer: any VideoRenderer
@@ -165,39 +182,6 @@ public final class NativeBackend: PlayerBackend {
         }
         logger.info("duration: knownDuration=\(knownDuration.map{"\(Double($0.components.seconds))s"} ?? "nil") demuxer=\(String(format:"%.1f",demuxDur))s → using \(String(format:"%.1f",Double(self.state.duration.components.seconds)))s")
 
-        if let vs = demuxer.videoStream {
-            let sar = demuxer.sampleAspectRatio
-            // DoVi streams: VT cannot extract the RPU (Dolby Vision metadata
-            // is stripped by VideoToolbox), so for Profile 5/8 we force FFmpeg
-            // software decoding to preserve per-frame DM Level 1/6 metadata.
-            // Profile 7 (BL+EL dual-layer) is left to VT as HDR10 — software
-            // dual-layer decode is out of scope here.
-            let isDoVi = demuxer.isDolbyVision
-            let doViSW = isDoVi && _renderer.prefersTenBit
-            if doViSW, let dec = FFmpegVideoDecoder(stream: vs, forceSoftware: true) {
-                videoDecoder = dec
-                codedVideoWidth  = dec.width; codedVideoHeight = dec.height
-                videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
-                videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
-                let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
-                logger.info("video: DoVi SW \(dec.width)x\(dec.height)\(sarStr) display=\(self.videoWidth)x\(self.videoHeight) (profile gated by renderer.prefersTenBit)")
-            } else if !isDoVi, let dec = FFmpegVideoDecoder(stream: vs) {
-                videoDecoder = dec
-                codedVideoWidth  = dec.width; codedVideoHeight = dec.height
-                videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
-                videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
-                let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
-                logger.info("video: hw=\(dec.isHardware) \(dec.width)x\(dec.height)\(sarStr) display=\(self.videoWidth)x\(self.videoHeight)")
-            } else if let dec = VTVideoDecoder(stream: vs, prefer10Bit: _renderer.prefersTenBit) {
-                videoDecoder = dec
-                codedVideoWidth  = dec.width; codedVideoHeight = dec.height
-                videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
-                videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
-                let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
-                logger.info("video: VT \(dec.width)x\(dec.height)\(sarStr) display=\(self.videoWidth)x\(self.videoHeight) 10bit=\(dec.is10Bit)\(isDoVi ? " (DoVi fallback as HDR10)" : "")")
-            }
-        }
-
         // Extract HDR color metadata from the video stream's codec parameters
         if let vs = demuxer.videoStream {
             let cp = vs.pointee.codecpar.pointee
@@ -216,6 +200,96 @@ public final class NativeBackend: PlayerBackend {
             self.colorParams = cpParams
             if self.colorParams.transfer == .pq || self.colorParams.transfer == .hlg {
                 logger.info("HDR: transfer=\(String(describing: self.colorParams.transfer)) matrix=\(String(describing: self.colorParams.matrix))")
+            }
+
+            // Resolve the renderer strategy from stream attributes + display
+            // capability + renderer's 10-bit preference. DoVi profile and HDR10+
+            // presence come from the demuxer (side-data scanning at open time);
+            // matrix/transfer/range mirror the per-frame `colorParams` snapshot.
+            let attrs = VideoStreamAttributes(
+                width: Int(cp.width),
+                height: Int(cp.height),
+                codecID: UInt32(cp.codec_id.rawValue),
+                colorMatrix: cpParams.matrix,
+                transfer: cpParams.transfer,
+                range: cpParams.range,
+                isDolbyVision: demuxer.isDolbyVision,
+                doviProfile: demuxer.doviProfile,
+                blSignalCompatibilityId: demuxer.doviBLSignalCompatibilityId,
+                hasHDR10Plus: demuxer.hasHDR10Plus
+            )
+            let strat = decideRendererStrategy(
+                stream: attrs,
+                prefersTenBit: _renderer.prefersTenBit,
+                display: displayCapability
+            )
+            self.rendererStrategy = strat
+            logger.info("renderer strategy: \(String(describing: strat))")
+        }
+
+        // Sync the display capability snapshot to the renderer. EDRRenderer
+        // reads `targetPeakNits` for its tone-map uniform; MetalRenderer
+        // ignores the value (SDR pipeline).
+        _renderer.displayCapability = displayCapability
+
+        // Instantiate the video decoder based on the resolved strategy's
+        // decoder preference. The previous version hardcoded DoVi → SW here;
+        // routing through `RendererStrategy.decoderPreference` keeps the
+        // decision in one place (the strategy resolver) so the renderer and
+        // decoder can't disagree about which path a stream takes.
+        if let vs = demuxer.videoStream {
+            let sar = demuxer.sampleAspectRatio
+            let preference = rendererStrategy?.decoderPreference ?? .vtHW
+            let isDoVi = demuxer.isDolbyVision
+            switch preference {
+            case .ffmpegSW:
+                if let dec = FFmpegVideoDecoder(stream: vs, forceSoftware: true) {
+                    videoDecoder = dec
+                    codedVideoWidth  = dec.width; codedVideoHeight = dec.height
+                    videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
+                    videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
+                    let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
+                    logger.info("video: FFmpeg SW \(dec.width)x\(dec.height)\(sarStr) display=\(self.videoWidth)x\(self.videoHeight) (strategy \(String(describing: self.rendererStrategy)))")
+                } else if let dec = VTVideoDecoder(stream: vs, prefer10Bit: _renderer.prefersTenBit) {
+                    videoDecoder = dec
+                    codedVideoWidth  = dec.width; codedVideoHeight = dec.height
+                    videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
+                    videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
+                    let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
+                    logger.info("video: FFmpeg SW failed, VT fallback \(dec.width)x\(dec.height)\(sarStr) 10bit=\(dec.is10Bit)\(isDoVi ? " (DoVi as HDR10)" : "")")
+                }
+            case .ffmpegHW:
+                if let dec = FFmpegVideoDecoder(stream: vs) {
+                    videoDecoder = dec
+                    codedVideoWidth  = dec.width; codedVideoHeight = dec.height
+                    videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
+                    videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
+                    let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
+                    logger.info("video: FFmpeg VT \(dec.width)x\(dec.height)\(sarStr) display=\(self.videoWidth)x\(self.videoHeight) hw=\(dec.isHardware)")
+                } else if let dec = VTVideoDecoder(stream: vs, prefer10Bit: _renderer.prefersTenBit) {
+                    videoDecoder = dec
+                    codedVideoWidth  = dec.width; codedVideoHeight = dec.height
+                    videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
+                    videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
+                    let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
+                    logger.info("video: FFmpeg HW failed, VT fallback \(dec.width)x\(dec.height)\(sarStr) 10bit=\(dec.is10Bit)")
+                }
+            case .vtHW:
+                if let dec = VTVideoDecoder(stream: vs, prefer10Bit: _renderer.prefersTenBit) {
+                    videoDecoder = dec
+                    codedVideoWidth  = dec.width; codedVideoHeight = dec.height
+                    videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
+                    videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
+                    let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
+                    logger.info("video: VT \(dec.width)x\(dec.height)\(sarStr) display=\(self.videoWidth)x\(self.videoHeight) 10bit=\(dec.is10Bit)\(isDoVi ? " (DoVi as HDR10)" : "")")
+                } else if let dec = FFmpegVideoDecoder(stream: vs) {
+                    videoDecoder = dec
+                    codedVideoWidth  = dec.width; codedVideoHeight = dec.height
+                    videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
+                    videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
+                    let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
+                    logger.info("video: VT failed, FFmpeg fallback \(dec.width)x\(dec.height)\(sarStr) hw=\(dec.isHardware)")
+                }
             }
         }
 
@@ -478,7 +552,7 @@ public final class NativeBackend: PlayerBackend {
 
                     if let frame = decoded,
                        sLock.withLock({ self.seekSerial }) == currentSerial {
-                        jitter.append(.init(pixelBuffer: frame.pixelBuffer, pts: pts, dovi: frame.dovi))
+                        jitter.append(.init(pixelBuffer: frame.pixelBuffer, pts: pts, metadata: frame.metadata))
                         let ptsCopy = pts
                         DispatchQueue.main.async { [weak self] in
                             guard let self else { return }
@@ -634,8 +708,12 @@ public final class NativeBackend: PlayerBackend {
         syncController.advance(delay: delay, pts: popped.pts,
                                followingPTS: followingPTS, audioTime: audioTime, now: now)
         var cp = colorParams
-        cp.dovi = popped.dovi
-        _renderer.render(pixelBuffer: popped.pixelBuffer, pts: popped.pts, colorParams: cp)
+        cp.dovi = popped.metadata.dovi
+        _renderer.render(pixelBuffer: popped.pixelBuffer,
+                         pts: popped.pts,
+                         colorParams: cp,
+                         metadata: popped.metadata,
+                         strategy: rendererStrategy)
         let ptsCopy = popped.pts
         let sinks = self._frameSinks.compactMap { $0.sink }
         for sink in sinks {

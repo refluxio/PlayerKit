@@ -19,6 +19,9 @@ final class MetalRenderer: VideoRenderer {
     private var codedSize: CGSize = .zero
     private var sampleAspectRatio: Double = 1.0
 
+    /// Unused on SDR pipeline — see `VideoRenderer.displayCapability`.
+    var displayCapability: DisplayCapability = .appleMobile
+
     var layer: CALayer { metalLayer }
 
     init() throws {
@@ -142,7 +145,11 @@ final class MetalRenderer: VideoRenderer {
         self.sampleAspectRatio = sampleAspectRatio
     }
 
-    func render(pixelBuffer: CVPixelBuffer, pts: Double, colorParams: VideoColorParams) {
+    func render(pixelBuffer: CVPixelBuffer,
+                pts: Double,
+                colorParams: VideoColorParams,
+                metadata: FrameMetadata,
+                strategy: RendererStrategy?) {
         display(pixelBuffer: pixelBuffer, colorParams: colorParams)
     }
 

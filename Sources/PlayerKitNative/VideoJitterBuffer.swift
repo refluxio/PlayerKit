@@ -7,7 +7,7 @@ final class VideoJitterBuffer: @unchecked Sendable {
     struct Frame {
         let pixelBuffer: CVPixelBuffer
         let pts: Double
-        let dovi: DolbyVisionFrameMetadata?
+        let metadata: FrameMetadata
     }
 
     enum State: Equatable { case playing, buffering }

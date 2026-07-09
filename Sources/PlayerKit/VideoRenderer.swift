@@ -119,12 +119,27 @@ public protocol VideoRenderer: AnyObject {
     /// EDRRenderer returns true; MetalRenderer uses 8-bit (its CIToneCurve handles fake-PQ).
     var prefersTenBit: Bool { get }
 
+    /// Display capability snapshot — set by `NativeBackend` at stream open time
+    /// after `decideRendererStrategy` runs. EDRRenderer reads `targetPeakNits`
+    /// to drive the tone-map uniform. MetalRenderer ignores this (SDR pipeline).
+    var displayCapability: DisplayCapability { get set }
+
     /// Render a decoded pixel buffer immediately.
     /// - Parameters:
     ///   - pixelBuffer: Decoded video frame.
     ///   - pts: Presentation timestamp in seconds.
-    ///   - colorParams: Color space parameters for the frame.
-    func render(pixelBuffer: CVPixelBuffer, pts: Double, colorParams: VideoColorParams)
+    ///   - colorParams: Stream-level color params (matrix/transfer/range) plus
+    ///     legacy `dovi` field — kept for backward compatibility with
+    ///     `EDRRenderer.makeDoviUniform`. New code should prefer `metadata`.
+    ///   - metadata: Per-frame HDR side data (DoVi / HDR10+ / mastering display).
+    ///     Empty `FrameMetadata()` for SDR / VT-decoded frames.
+    ///   - strategy: The `RendererStrategy` chosen for this stream at open time,
+    ///     or nil when no strategy resolution was performed (legacy callers).
+    func render(pixelBuffer: CVPixelBuffer,
+                pts: Double,
+                colorParams: VideoColorParams,
+                metadata: FrameMetadata,
+                strategy: RendererStrategy?)
 
     /// Flush pending rendering commands.
     func flush()

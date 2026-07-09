@@ -157,9 +157,9 @@ final class VTVideoDecoder {
             totalAttempts += 1
             if lastVTError { failedAttempts += 1 }
         }
-        // VT strips Dolby Vision RPU side data, so dovi is always nil here.
+        // VT strips Dolby Vision RPU side data, so per-frame metadata is empty.
         // DoVi streams forced to FFmpeg SW in NativeBackend carry per-frame DM.
-        return DecodedVideoFrame(pixelBuffer: pb, dovi: nil)
+        return DecodedVideoFrame(pixelBuffer: pb, metadata: FrameMetadata())
     }
 
     // MARK: - flush / deinit

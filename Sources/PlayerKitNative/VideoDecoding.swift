@@ -4,10 +4,11 @@ import PlayerKit
 import CFFmpeg
 
 /// Output of `VideoDecoding.decode(packet:)`: a decoded pixel buffer paired
-/// with optional per-frame Dolby Vision metadata extracted from the AVFrame.
+/// with optional per-frame HDR side data (DoVi / HDR10+ / mastering display)
+/// extracted from the AVFrame.
 struct DecodedVideoFrame {
     let pixelBuffer: CVPixelBuffer
-    let dovi: DolbyVisionFrameMetadata?
+    let metadata: FrameMetadata
 }
 
 protocol VideoDecoding {

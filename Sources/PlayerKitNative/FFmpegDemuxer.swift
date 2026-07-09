@@ -68,6 +68,54 @@ final class FFmpegDemuxer: @unchecked Sendable {
         return false
     }
 
+    /// Parsed Dolby Vision configuration record (profile + signal compatibility id).
+    /// Returns nil for non-DV streams, or when the side data payload is too short
+    /// to contain a valid `AVDOVIDecoderConfigurationRecord` (needs ≥9 bytes).
+    var doviConfiguration: AVDOVIDecoderConfigurationRecord? {
+        guard let vs = videoStream else { return nil }
+        let par = vs.pointee.codecpar.pointee
+        guard par.nb_coded_side_data > 0, let sideData = par.coded_side_data else {
+            return nil
+        }
+        for i in 0..<Int(par.nb_coded_side_data) {
+            let sd = sideData[i]
+            guard sd.type == AV_PKT_DATA_DOVI_CONF else { continue }
+            // The payload is a fixed-layout 9-byte record; verify size before
+            // binding the pointer (avformat may attach shorter payloads from
+            // malformed streams).
+            guard Int(sd.size) >= MemoryLayout<AVDOVIDecoderConfigurationRecord>.size,
+                  let raw = sd.data else { return nil }
+            return raw.withMemoryRebound(
+                to: AVDOVIDecoderConfigurationRecord.self,
+                capacity: 1
+            ) { $0.pointee }
+        }
+        return nil
+    }
+
+    /// DV profile (4/5/7/8). 0 when the stream is not Dolby Vision.
+    var doviProfile: UInt8 { doviConfiguration?.dv_profile ?? 0 }
+
+    /// BL signal compatibility id from the DV config record. 0 for non-DV
+    /// streams; 2 = HDR10-compatible CT mode (can fall back to HDR10 rendering).
+    var doviBLSignalCompatibilityId: UInt8 {
+        doviConfiguration?.dv_bl_signal_compatibility_id ?? 0
+    }
+
+    /// True when the video stream carries HDR10+ ST 2094-40 dynamic metadata
+    /// (AV_PKT_DATA_DYNAMIC_HDR10_PLUS) in its codec parameters side data.
+    var hasHDR10Plus: Bool {
+        guard let vs = videoStream else { return false }
+        let par = vs.pointee.codecpar.pointee
+        guard par.nb_coded_side_data > 0, let sideData = par.coded_side_data else {
+            return false
+        }
+        for i in 0..<Int(par.nb_coded_side_data) {
+            if sideData[i].type == AV_PKT_DATA_DYNAMIC_HDR10_PLUS { return true }
+        }
+        return false
+    }
+
     /// True when the active audio stream carries Dolby Atmos metadata.
     /// - TrueHD: profile == AV_PROFILE_TRUEHD_ATMOS (30)
     /// - E-AC3: stream title contains "atmos" (case-insensitive) or channel count > 8

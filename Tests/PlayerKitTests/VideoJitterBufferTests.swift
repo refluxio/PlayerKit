@@ -1,5 +1,6 @@
 import XCTest
 import CoreVideo
+import PlayerKit
 @testable import PlayerKitNative
 
 final class VideoJitterBufferTests: XCTestCase {
@@ -7,7 +8,7 @@ final class VideoJitterBufferTests: XCTestCase {
     private func makeFrame(pts: Double) -> VideoJitterBuffer.Frame {
         var pixelBuffer: CVPixelBuffer?
         CVPixelBufferCreate(nil, 2, 2, kCVPixelFormatType_32BGRA, nil, &pixelBuffer)
-        return VideoJitterBuffer.Frame(pixelBuffer: pixelBuffer!, pts: pts)
+        return VideoJitterBuffer.Frame(pixelBuffer: pixelBuffer!, pts: pts, metadata: FrameMetadata())
     }
 
     func testInitialStateIsBuffering() {
