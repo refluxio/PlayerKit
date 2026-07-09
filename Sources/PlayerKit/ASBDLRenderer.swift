@@ -1,0 +1,92 @@
+import AVFoundation
+import CoreVideo
+
+/// Video renderer wrapping `AVSampleBufferDisplayLayer`.
+///
+/// `AVSampleBufferDisplayLayer` is a Core Animation layer that handles
+/// pixel-buffer-to-display rendering natively via the video pipeline,
+/// including HDR tone-mapping and display refresh coordination.
+///
+/// This renderer is best suited for:
+/// - HDR (PQ/HLG) content where system-level EDR is desired.
+/// - 10-bit pixel formats.
+/// - Streams that don't require custom shader-based processing.
+///
+/// It is **not** suitable for:
+/// - Dolby Vision Profile 5 (needs custom RPU injection).
+/// - Real-time filter chains.
+public class ASBDLRenderer: VideoRenderer {
+
+    public let displayLayer: AVSampleBufferDisplayLayer
+    public var layer: CALayer { displayLayer }
+
+    public var prefersTenBit: Bool { true }
+
+    public var displayCapability: DisplayCapability
+
+    private let serialQueue = DispatchQueue(label: "io.reflux.asbdl-renderer")
+
+    public init(displayCapability: DisplayCapability = .macSDR) {
+        self.displayCapability = displayCapability
+        displayLayer = AVSampleBufferDisplayLayer()
+        displayLayer.videoGravity = .resizeAspect
+    }
+
+    public func render(
+        pixelBuffer: CVPixelBuffer,
+        pts: Double,
+        colorParams: VideoColorParams,
+        metadata: FrameMetadata,
+        strategy: RendererStrategy?
+    ) {
+        serialQueue.async { [weak self] in
+            guard let self = self else { return }
+            let cmPts = CMTime(seconds: pts, preferredTimescale: 90000)
+            guard let sbuf = self.makeSampleBuffer(pixelBuffer: pixelBuffer, pts: cmPts) else {
+                return
+            }
+            self.displayLayer.enqueue(sbuf)
+        }
+    }
+
+    public func flush() {
+        displayLayer.flushAndRemoveImage()
+    }
+
+    public func clear() {
+        displayLayer.flushAndRemoveImage()
+    }
+
+    public func configure(codedSize: CGSize, sampleAspectRatio: Double) {
+        // ASBDL auto-configures from sample buffers; no explicit config needed.
+    }
+
+    private func makeSampleBuffer(pixelBuffer: CVPixelBuffer, pts: CMTime) -> CMSampleBuffer? {
+        var formatDesc: CMVideoFormatDescription?
+        let status = CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescriptionOut: &formatDesc
+        )
+        guard status == noErr, let fd = formatDesc else { return nil }
+
+        var timing = CMSampleTimingInfo(
+            duration: CMTime.invalid,
+            presentationTimeStamp: pts,
+            decodeTimeStamp: CMTime.invalid
+        )
+
+        var sampleBuffer: CMSampleBuffer?
+        CMSampleBufferCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            dataReady: true,
+            makeDataReadyCallback: nil,
+            refcon: nil,
+            formatDescription: fd,
+            sampleTiming: &timing,
+            sampleBufferOut: &sampleBuffer
+        )
+        return sampleBuffer
+    }
+}
