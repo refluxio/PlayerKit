@@ -206,6 +206,8 @@ public final class NativeBackend: PlayerBackend {
             // capability + renderer's 10-bit preference. DoVi profile and HDR10+
             // presence come from the demuxer (side-data scanning at open time);
             // matrix/transfer/range mirror the per-frame `colorParams` snapshot.
+            let isHEVC10Bit = cp.codec_id == AV_CODEC_ID_HEVC
+                && cp.bits_per_raw_sample == 10
             let attrs = VideoStreamAttributes(
                 width: Int(cp.width),
                 height: Int(cp.height),
@@ -216,7 +218,8 @@ public final class NativeBackend: PlayerBackend {
                 isDolbyVision: demuxer.isDolbyVision,
                 doviProfile: demuxer.doviProfile,
                 blSignalCompatibilityId: demuxer.doviBLSignalCompatibilityId,
-                hasHDR10Plus: demuxer.hasHDR10Plus
+                hasHDR10Plus: demuxer.hasHDR10Plus,
+                isHEVC10Bit: isHEVC10Bit
             )
             let strat = decideRendererStrategy(
                 stream: attrs,
@@ -224,7 +227,22 @@ public final class NativeBackend: PlayerBackend {
                 display: displayCapability
             )
             self.rendererStrategy = strat
-            logger.info("renderer strategy: \(String(describing: strat))")
+            // Verbose decision log: original container fields → resolved params →
+            // final strategy. Makes "why did this stream pick SDR?" answerable
+            // from a single log line at open time. See Docs/hdr-rendering.md.
+            let codecName = cp.codec_id != AV_CODEC_ID_NONE
+                ? String(cString: avcodec_get_name(cp.codec_id)) : "?"
+            logger.info("""
+            strategy decision: codec=\(codecName) \(cp.width)x\(cp.height) \
+            bits_per_raw=\(cp.bits_per_raw_sample) \
+            trc=\(cp.color_trc.rawValue) matrix=\(cp.color_space.rawValue) range=\(cp.color_range.rawValue) \
+            → resolved(transfer=\(String(describing: cpParams.transfer)) matrix=\(String(describing: cpParams.matrix)) range=\(String(describing: cpParams.range))) \
+            isHEVC10Bit=\(isHEVC10Bit) \
+            isDoVi=\(demuxer.isDolbyVision) profile=\(demuxer.doviProfile) \
+            hasHDR10Plus=\(demuxer.hasHDR10Plus) \
+            displayEDR=\(self.displayCapability.supportsEDR) renderer10bit=\(self._renderer.prefersTenBit) \
+            → \(String(describing: strat))
+            """)
         }
 
         // Sync the display capability snapshot to the renderer. EDRRenderer

@@ -34,6 +34,14 @@ public struct VideoStreamAttributes: Sendable {
     /// Stream-level hint; per-frame bezier data arrives via `FrameMetadata.hdr10Plus`.
     public var hasHDR10Plus: Bool
 
+    /// True when the stream is HEVC (H.265) and the codec reports 10-bit
+    /// samples. Used by `decideRendererStrategy` to detect unmarked HDR10:
+    /// many Blu-ray remuxes ship HEVC 10-bit PQ content without writing the
+    /// `color_trc` tag into the MKV container, so FFmpeg reads transfer=SDR
+    /// even though the pixels are PQ. See "未标记 HDR10 的判定" in
+    /// `Docs/hdr-rendering.md`.
+    public var isHEVC10Bit: Bool
+
     public init(width: Int,
                 height: Int,
                 codecID: UInt32,
@@ -43,7 +51,8 @@ public struct VideoStreamAttributes: Sendable {
                 isDolbyVision: Bool = false,
                 doviProfile: UInt8 = 0,
                 blSignalCompatibilityId: UInt8 = 0,
-                hasHDR10Plus: Bool = false) {
+                hasHDR10Plus: Bool = false,
+                isHEVC10Bit: Bool = false) {
         self.width = width
         self.height = height
         self.codecID = codecID
@@ -54,6 +63,16 @@ public struct VideoStreamAttributes: Sendable {
         self.doviProfile = doviProfile
         self.blSignalCompatibilityId = blSignalCompatibilityId
         self.hasHDR10Plus = hasHDR10Plus
+        self.isHEVC10Bit = isHEVC10Bit
+    }
+
+    /// Heuristic: HEVC + 10-bit + transfer=SDR is almost certainly an unmarked
+    /// HDR10 stream (PQ pixels with a missing `color_trc` tag), not a genuine
+    /// 10-bit SDR upload. Broadcast SDR is 8-bit H.264 or 10-bit H.265 with
+    /// an explicit transfer tag; 10-bit HEVC SDR is essentially nonexistent in
+    /// real sources. See "未标记 HDR10 的判定" in `Docs/hdr-rendering.md`.
+    public var isHEVC10BitSDRHint: Bool {
+        isHEVC10Bit && transfer == .sdr
     }
 }
 
@@ -238,6 +257,20 @@ public func decideRendererStrategy(
         // HEVC Main 10 is 10-bit even for SDR content.
         // For simplicity (and since MetalRenderer handles both) we always pick
         // sdr8Bit; refine later if a 10-bit SDR stream shows up.
+        //
+        // Unmarked-HDR10 fallback: many older Blu-ray remuxes ship HEVC 10-bit
+        // PQ content but omit the color_trc tag in the MKV container. FFmpeg
+        // then reports transfer=SDR, which would misroute the stream to the
+        // SDR 8-bit pipeline and render PQ pixels as sRGB → red/clipped faces.
+        // 10-bit HEVC SDR is almost nonexistent in real sources (broadcast SDR
+        // is 8-bit H.264 or 10-bit H.265 with an explicit transfer tag), so we
+        // treat HEVC + 10-bit + SDR as unmarked HDR10 and route through the
+        // HDR10 static path (FFmpeg hwaccel + BT.2390). H.264 has no HDR10
+        // profile in the wild, so it stays on the SDR path regardless of depth.
+        if stream.isHEVC10BitSDRHint,
+           edrCapable || display.supportsEDR {
+            return .hdr10Static(peakNits: 1000)
+        }
         _ = prefersTenBit  // currently unused on SDR path
         return .sdr8Bit(matrix: stream.colorMatrix)
     }
