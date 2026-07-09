@@ -67,6 +67,10 @@ public final class NativeBackend: PlayerBackend {
     // A/V sync modules
     private let audioClock = AudioClock()
     private var audioUnitOutput: AudioUnitOutput?
+    /// True only when compressed audio passthrough is actually in use (macOS
+    /// with HDMI/SPDIF). On iOS/tvOS passthrough is disabled and PCM decode
+    /// via AudioUnitOutput drives the audioClock normally.
+    private var isPassthroughActive = false
     private let jitterBuffer = VideoJitterBuffer()
     private let syncController = SyncController()
     // Set after play() or seek(); cleared by displayNextFrame on first frame.
@@ -431,6 +435,7 @@ public final class NativeBackend: PlayerBackend {
             audioDecoder = dec
             let out = AudioUnitOutput(clock: audioClock)
             audioUnitOutput = out
+            isPassthroughActive = false
             logger.info("audio: \(dec.outputSampleRate)Hz \(dec.outputChannels)ch")
         }
 
@@ -617,6 +622,7 @@ public final class NativeBackend: PlayerBackend {
                     }
 
                     if usePassthrough {
+                        isPassthroughActive = true
                         // Passthrough path: route compressed packets directly to
                         // AVSampleBufferAudioRenderer (PRO backend).
                         let pkt = packet.pointee
@@ -682,8 +688,10 @@ public final class NativeBackend: PlayerBackend {
 
         // In passthrough mode AudioUnitOutput never runs so audioClock stays at 0.
         // Use video PTS as master clock so A/V sync still advances frames.
+        // On iOS/tvOS passthrough is disabled (PCM decode), so audioClock is
+        // driven by AudioUnitOutput even when PassthroughOutput is injected.
         let audioTime: Double
-        if _injectedAudioOutput != nil {
+        if _injectedAudioOutput != nil && isPassthroughActive {
             audioTime = jitterBuffer.peek(at: 0)?.pts ?? audioClock.audioTime
         } else {
             audioTime = audioClock.audioTime
