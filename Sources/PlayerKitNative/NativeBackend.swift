@@ -105,17 +105,17 @@ public final class NativeBackend: PlayerBackend {
     private nonisolated(unsafe) var lastBytesLogged: Int64 = 0
     private nonisolated(unsafe) var lastThroughputTime: Double = 0
 
-    /// Default init: SDR MetalRenderer + AudioUnitOutput (PCM).
+    /// Default init: ASBDLRenderer + AudioUnitOutput (PCM).
     public convenience init() throws {
         try self.init(renderer: nil, audioOutput: nil)
     }
 
     /// PRO injection init: accepts custom renderer and audio output.
     /// - Parameters:
-    ///   - renderer: Custom VideoRenderer. nil defaults to MetalRenderer (SDR).
+    ///   - renderer: Custom VideoRenderer. nil defaults to ASBDLRenderer.
     ///   - audioOutput: Custom AudioOutputBackend. nil defaults to AudioUnitOutput.
     public init(renderer: (any VideoRenderer)?, audioOutput: (any AudioOutputBackend)?) throws {
-        self._renderer = try renderer ?? MetalRenderer()
+        self._renderer = try renderer ?? ASBDLRenderer()
         self._injectedAudioOutput = audioOutput
         #if canImport(UIKit)
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
