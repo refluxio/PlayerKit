@@ -1,6 +1,15 @@
 import AVFoundation
 import CoreVideo
 
+/// A processor that applies custom tone-mapping to a pixel buffer before
+/// display. Implemented by PlayerKitPro's ToneMapProcessor for Pro users.
+public protocol ToneMapping: AnyObject {
+    func process(pixelBuffer: CVPixelBuffer,
+                 colorParams: VideoColorParams,
+                 metadata: FrameMetadata,
+                 strategy: RendererStrategy?) -> CVPixelBuffer
+}
+
 /// Video renderer wrapping `AVSampleBufferDisplayLayer`.
 ///
 /// `AVSampleBufferDisplayLayer` is a Core Animation layer that handles
@@ -24,6 +33,10 @@ public class ASBDLRenderer: VideoRenderer {
 
     public var displayCapability: DisplayCapability
 
+    /// Optional tone-mapping processor (injected by PlayerKitPro for Pro users).
+    /// When non-nil, pixel buffers are processed before enqueuing to the display layer.
+    public var toneMapper: (any ToneMapping)?
+
     private let serialQueue = DispatchQueue(label: "io.reflux.asbdl-renderer")
 
     public init(displayCapability: DisplayCapability = .macSDR) {
@@ -39,10 +52,11 @@ public class ASBDLRenderer: VideoRenderer {
         metadata: FrameMetadata,
         strategy: RendererStrategy?
     ) {
+        let pb = toneMapper?.process(pixelBuffer: pixelBuffer, colorParams: colorParams, metadata: metadata, strategy: strategy) ?? pixelBuffer
         serialQueue.async { [weak self] in
             guard let self = self else { return }
             let cmPts = CMTime(seconds: pts, preferredTimescale: 90000)
-            guard let sbuf = self.makeSampleBuffer(pixelBuffer: pixelBuffer, pts: cmPts) else {
+            guard let sbuf = self.makeSampleBuffer(pixelBuffer: pb, pts: cmPts) else {
                 return
             }
             self.displayLayer.enqueue(sbuf)
