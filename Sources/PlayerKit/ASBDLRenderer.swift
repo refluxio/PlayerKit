@@ -4,13 +4,27 @@ import os
 
 private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "asbdl")
 
+/// Result of tone-mapping processing: the processed pixel buffer and the
+/// color params that describe it. When tone mapping converts HDR → SDR,
+/// the color params are updated to reflect the output (SDR transfer,
+/// BT.709 matrix, full range) so ASBDL attaches the correct color tags.
+public struct ProcessedFrame {
+    public let pixelBuffer: CVPixelBuffer
+    public let colorParams: VideoColorParams
+
+    public init(pixelBuffer: CVPixelBuffer, colorParams: VideoColorParams) {
+        self.pixelBuffer = pixelBuffer
+        self.colorParams = colorParams
+    }
+}
+
 /// A processor that applies custom tone-mapping to a pixel buffer before
 /// display. Implemented by PlayerKitPro's ToneMapProcessor for Pro users.
 public protocol ToneMapping: AnyObject {
     func process(pixelBuffer: CVPixelBuffer,
                  colorParams: VideoColorParams,
                  metadata: FrameMetadata,
-                 strategy: RendererStrategy?) -> CVPixelBuffer
+                 strategy: RendererStrategy?) -> ProcessedFrame
 }
 
 /// Video renderer wrapping `AVSampleBufferDisplayLayer`.
@@ -53,13 +67,25 @@ public class ASBDLRenderer: VideoRenderer {
         metadata: FrameMetadata,
         strategy: RendererStrategy?
     ) {
-        let pb = toneMapper?.process(pixelBuffer: pixelBuffer, colorParams: colorParams, metadata: metadata, strategy: strategy) ?? pixelBuffer
-        attachColorParams(pb, colorParams: colorParams)
+        let pb: CVPixelBuffer
+        let cp: VideoColorParams
+        if let toneMapper {
+            let result = toneMapper.process(
+                pixelBuffer: pixelBuffer, colorParams: colorParams,
+                metadata: metadata, strategy: strategy)
+            pb = result.pixelBuffer
+            cp = result.colorParams
+        } else {
+            pb = pixelBuffer
+            cp = colorParams
+        }
+        attachColorParams(pb, colorParams: cp)
         let cmPts = CMTime(seconds: pts, preferredTimescale: 90000)
         guard let sbuf = makeSampleBuffer(pixelBuffer: pb, pts: cmPts) else {
             logger.info("ASBDL: makeSampleBuffer failed at pts=\(pts)")
             return
         }
+        displayLayer.isHidden = false
         displayLayer.enqueue(sbuf)
     }
 
