@@ -23,6 +23,7 @@ final class VTVideoDecoder {
     private let isH264: Bool
     let is10Bit: Bool
     private let needsHDRTag: Bool
+    private let colorParams: VideoColorParams
     private var needsParamSetInit: Bool
     private var pendingSPS: [UInt8]?
     private var pendingPPS: [UInt8]?
@@ -48,7 +49,8 @@ final class VTVideoDecoder {
 
     /// - Parameter prefer10Bit: When true, requests 10-bit VT output for HDR renderers
     ///   (EDRRenderer). MetalRenderer passes false and uses fake-PQ 8-bit + CIToneCurve.
-    init?(stream: UnsafeMutablePointer<AVStream>, prefer10Bit: Bool = false) {
+    init?(stream: UnsafeMutablePointer<AVStream>, prefer10Bit: Bool = false,
+          colorParams: VideoColorParams = VideoColorParams()) {
         let cp = stream.pointee.codecpar.pointee
         self.isH264 = (cp.codec_id == AV_CODEC_ID_H264)
         // MKV containers often leave bits_per_raw_sample = 0 even for HEVC Main10.
@@ -62,6 +64,7 @@ final class VTVideoDecoder {
         // MetalRenderer uses 8-bit + needsHDRTag + CIToneCurve instead.
         self.is10Bit     = prefer10Bit && isHDR10
         self.needsHDRTag = !self.is10Bit && isHDR10
+        self.colorParams = colorParams
 
         // Try to build format description from parameter sets in codecpar.
         // FFmpeg 8.x may store them in coded_side_data with a sentinel in extradata.
@@ -236,9 +239,12 @@ final class VTVideoDecoder {
         }
         lastVTError = decodeError
 
-        // Tag HEVC Main 10 output with BT.2020/PQ colour metadata to HDR buffers
-        // so the renderer can apply the correct EOTF.
-        if let buf = result, needsHDRTag || is10Bit {
+        // Tag HEVC Main 10 output with BT.2020/PQ colour metadata only when the
+        // stream is actually HDR (PQ or HLG). 10-bit SDR streams (HEVC Main 10
+        // with no color_trc tag) must NOT receive BT.2020/PQ attachments, or
+        // CIImage(cvPixelBuffer:) will apply a PQ→sRGB transfer that shifts
+        // SDR BT.709 colours toward red.
+        if let buf = result, colorParams.transfer == .pq || colorParams.transfer == .hlg {
             CVBufferSetAttachment(buf, kCVImageBufferColorPrimariesKey,
                                   kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
             CVBufferSetAttachment(buf, kCVImageBufferTransferFunctionKey,

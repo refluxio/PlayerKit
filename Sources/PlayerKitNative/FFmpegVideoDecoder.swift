@@ -9,6 +9,7 @@ import os
 private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "decoder.video.sw")
 
 final class FFmpegVideoDecoder {
+    private let colorParams: VideoColorParams
     private var codecCtx: UnsafeMutablePointer<AVCodecContext>?
     private var hwDeviceCtx: UnsafeMutablePointer<AVBufferRef>?
     let isHardware: Bool
@@ -22,8 +23,10 @@ final class FFmpegVideoDecoder {
     var width:  Int { Int(codecCtx?.pointee.width  ?? 0) }
     var height: Int { Int(codecCtx?.pointee.height ?? 0) }
 
-    init?(stream: UnsafeMutablePointer<AVStream>, forceSoftware: Bool = false) {
+    init?(stream: UnsafeMutablePointer<AVStream>, forceSoftware: Bool = false,
+          colorParams: VideoColorParams = VideoColorParams()) {
         let codecpar = stream.pointee.codecpar.pointee
+        self.colorParams = colorParams
 
         // Extract stream-level DoVi configuration record (profile + bl_signal_compat_id).
         // This is constant per stream; attach to every emitted DolbyVisionFrameMetadata.
@@ -237,12 +240,17 @@ final class FFmpegVideoDecoder {
                                    attrs as CFDictionary, &pb) == kCVReturnSuccess,
               let pb else { return nil }
 
-        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
-                              kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
-        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
-                              kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
-        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
-                              kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
+        // Only tag as BT.2020/PQ when the stream is actually HDR. 10-bit SDR
+        // streams must not receive PQ attachments, or CIImage will misconvert
+        // BT.709 SDR content through a PQ→sRGB transfer → red-shifted faces.
+        if colorParams.transfer == .pq || colorParams.transfer == .hlg {
+            CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
+                                  kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+            CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
+                                  kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
+            CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
+                                  kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
+        }
 
         CVPixelBufferLockBaseAddress(pb, [])
         defer { CVPixelBufferUnlockBaseAddress(pb, []) }

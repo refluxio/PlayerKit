@@ -265,10 +265,14 @@ public func decideRendererStrategy(
         // 10-bit HEVC SDR is almost nonexistent in real sources (broadcast SDR
         // is 8-bit H.264 or 10-bit H.265 with an explicit transfer tag), so we
         // treat HEVC + 10-bit + SDR as unmarked HDR10 and route through the
-        // HDR10 static path (FFmpeg hwaccel + BT.2390). H.264 has no HDR10
-        // profile in the wild, so it stays on the SDR path regardless of depth.
-        if stream.isHEVC10BitSDRHint,
-           edrCapable || display.supportsEDR {
+        // HDR10 static path. H.264 has no HDR10 profile in the wild, so it stays
+        // on the SDR path regardless of depth.
+        //
+        // This applies regardless of display EDR capability: on a non-EDR display
+        // `rendererEntry` downgrades to `.ciEDRFallback` (8-bit CI + CIToneCurve
+        // fake-PQ), which still compresses PQ into sRGB range — far better than
+        // the `.ciSDR` path that would interpret PQ pixels as sRGB and clip.
+        if stream.isHEVC10BitSDRHint {
             return .hdr10Static(peakNits: 1000)
         }
         _ = prefersTenBit  // currently unused on SDR path
