@@ -8,6 +8,7 @@ import os
 
 private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "renderer")
 
+/// Deprecated in favor of ASBDLRenderer. Kept for reference and fallback.
 final class MetalRenderer: VideoRenderer {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
