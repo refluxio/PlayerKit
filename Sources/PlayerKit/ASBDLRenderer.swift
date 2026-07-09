@@ -56,9 +56,29 @@ public class ASBDLRenderer: VideoRenderer {
         strategy: RendererStrategy?
     ) {
         let pb = toneMapper?.process(pixelBuffer: pixelBuffer, colorParams: colorParams, metadata: metadata, strategy: strategy) ?? pixelBuffer
+        attachColorParams(pb, colorParams: colorParams)
         let cmPts = CMTime(seconds: pts, preferredTimescale: 90000)
         guard let sbuf = makeSampleBuffer(pixelBuffer: pb, pts: cmPts) else { return }
         displayLayer.enqueue(sbuf)
+    }
+
+    private func attachColorParams(_ pb: CVPixelBuffer, colorParams: VideoColorParams) {
+        let transfer: CFString
+        let primaries: CFString
+        let matrix: CFString
+        switch colorParams.transfer {
+        case .pq:  transfer = kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+        case .hlg: transfer = kCVImageBufferTransferFunction_ITU_R_2100_HLG
+        case .sdr: transfer = kCVImageBufferTransferFunction_ITU_R_709_2
+        }
+        switch colorParams.matrix {
+        case .bt709:  primaries = kCVImageBufferColorPrimaries_ITU_R_709_2; matrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2
+        case .bt2020: primaries = kCVImageBufferColorPrimaries_ITU_R_2020; matrix = kCVImageBufferYCbCrMatrix_ITU_R_2020
+        case .bt601:  primaries = kCVImageBufferColorPrimaries_SMPTE_C; matrix = kCVImageBufferYCbCrMatrix_ITU_R_601_4
+        }
+        CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, transfer, .shouldNotPropagate)
+        CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, primaries, .shouldNotPropagate)
+        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, matrix, .shouldNotPropagate)
     }
 
     public func flush() {

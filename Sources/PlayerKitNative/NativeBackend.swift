@@ -110,6 +110,12 @@ public final class NativeBackend: PlayerBackend {
         try self.init(renderer: nil, audioOutput: nil)
     }
 
+    /// Default init with custom audio output (renderer uses ASBDLRenderer).
+    /// - Parameter audioOutput: Custom AudioOutputBackend. nil defaults to AudioUnitOutput.
+    public convenience init(audioOutput: (any AudioOutputBackend)?) throws {
+        try self.init(renderer: nil, audioOutput: audioOutput)
+    }
+
     /// PRO injection init: accepts custom renderer and audio output.
     /// - Parameters:
     ///   - renderer: Custom VideoRenderer. nil defaults to ASBDLRenderer.
