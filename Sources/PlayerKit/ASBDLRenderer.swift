@@ -1,5 +1,8 @@
 import AVFoundation
 import CoreVideo
+import os
+
+private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "asbdl")
 
 /// A processor that applies custom tone-mapping to a pixel buffer before
 /// display. Implemented by PlayerKitPro's ToneMapProcessor for Pro users.
@@ -41,11 +44,6 @@ public class ASBDLRenderer: VideoRenderer {
         self.displayCapability = displayCapability
         displayLayer = AVSampleBufferDisplayLayer()
         displayLayer.videoGravity = .resizeAspect
-        displayLayer.requestMediaDataWhenReady(on: .main) { [weak self] in
-            // ASBDL will pull sample buffers via this callback when ready.
-            // We push via enqueue instead, so this is a no-op stub to
-            // activate the layer's display pipeline.
-        }
     }
 
     public func render(
@@ -58,7 +56,10 @@ public class ASBDLRenderer: VideoRenderer {
         let pb = toneMapper?.process(pixelBuffer: pixelBuffer, colorParams: colorParams, metadata: metadata, strategy: strategy) ?? pixelBuffer
         attachColorParams(pb, colorParams: colorParams)
         let cmPts = CMTime(seconds: pts, preferredTimescale: 90000)
-        guard let sbuf = makeSampleBuffer(pixelBuffer: pb, pts: cmPts) else { return }
+        guard let sbuf = makeSampleBuffer(pixelBuffer: pb, pts: cmPts) else {
+            logger.info("ASBDL: makeSampleBuffer failed at pts=\(pts)")
+            return
+        }
         displayLayer.enqueue(sbuf)
     }
 
