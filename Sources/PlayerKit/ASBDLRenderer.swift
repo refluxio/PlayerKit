@@ -37,8 +37,6 @@ public class ASBDLRenderer: VideoRenderer {
     /// When non-nil, pixel buffers are processed before enqueuing to the display layer.
     public var toneMapper: (any ToneMapping)?
 
-    private let serialQueue = DispatchQueue(label: "io.reflux.asbdl-renderer")
-
     public init(displayCapability: DisplayCapability = .macSDR) {
         self.displayCapability = displayCapability
         displayLayer = AVSampleBufferDisplayLayer()
@@ -53,14 +51,9 @@ public class ASBDLRenderer: VideoRenderer {
         strategy: RendererStrategy?
     ) {
         let pb = toneMapper?.process(pixelBuffer: pixelBuffer, colorParams: colorParams, metadata: metadata, strategy: strategy) ?? pixelBuffer
-        serialQueue.async { [weak self] in
-            guard let self = self else { return }
-            let cmPts = CMTime(seconds: pts, preferredTimescale: 90000)
-            guard let sbuf = self.makeSampleBuffer(pixelBuffer: pb, pts: cmPts) else {
-                return
-            }
-            self.displayLayer.enqueue(sbuf)
-        }
+        let cmPts = CMTime(seconds: pts, preferredTimescale: 90000)
+        guard let sbuf = makeSampleBuffer(pixelBuffer: pb, pts: cmPts) else { return }
+        displayLayer.enqueue(sbuf)
     }
 
     public func flush() {
