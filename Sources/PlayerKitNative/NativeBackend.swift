@@ -517,8 +517,12 @@ public final class NativeBackend: PlayerBackend {
             while true {
                 guard let self, !self.demuxCancelled else { break }
 
+                // Backpressure: when jitter buffer is full, sleep briefly to let
+                // the display loop consume frames. But don't hold the demux lock
+                // — audio packets interleaved in the stream still need to be read
+                // and fed to AudioUnitOutput, otherwise audio runs dry.
                 if jitter.duration >= jitter.maxDuration {
-                    Thread.sleep(forTimeInterval: 0.01)
+                    Thread.sleep(forTimeInterval: 0.005)
                     continue
                 }
 
