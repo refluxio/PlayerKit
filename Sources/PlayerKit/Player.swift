@@ -16,6 +16,7 @@ public final class Player {
     public init(backend: any Playable) {
         self.backend = backend
         backend.onStateChange = { [weak self] s in self?.state = s }
+        setUpPiPController()
     }
 
     // MARK: - Playable forwarding
@@ -74,10 +75,15 @@ public final class Player {
 
     /// A controller for Picture in Picture playback.
     /// Requires an ASBDLRenderer-based backend; nil otherwise.
+    /// Created once and cached for the player's lifetime.
     @available(iOS 15.0, macOS 12.0, *)
-    public var pipController: PiPController? {
-        guard let asbdlRenderer = (backend as? any PlayerBackend)?.renderer as? ASBDLRenderer else { return nil }
-        return PiPController(displayLayer: asbdlRenderer.displayLayer)
+    public private(set) var pipController: PiPController?
+
+    private func setUpPiPController() {
+        guard #available(iOS 15.0, macOS 12.0, *),
+              let asbdlRenderer = (backend as? any PlayerBackend)?.renderer as? ASBDLRenderer
+        else { return }
+        pipController = PiPController(displayLayer: asbdlRenderer.displayLayer)
     }
 
     // MARK: - Frame sinks (requires PlayerBackend)
