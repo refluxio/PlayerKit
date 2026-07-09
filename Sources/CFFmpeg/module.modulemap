@@ -18,6 +18,8 @@ module CFFmpeg {
     header "libavutil/pixdesc.h"
     header "libavutil/samplefmt.h"
     header "libavutil/time.h"
+    header "libavutil/dovi_meta.h"
+    header "libavutil/mastering_display_metadata.h"
     header "libswresample/swresample.h"
     header "libswscale/swscale.h"
     link "avformat"

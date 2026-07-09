@@ -1,6 +1,65 @@
 import CoreVideo
 import QuartzCore
 
+// MARK: - DolbyVisionFrameMetadata
+
+/// Per-frame Dolby Vision dynamic metadata extracted from the decoded `AVFrame`.
+///
+/// This is a pure Swift value type — no CFFmpeg dependency — so it can flow
+/// through `VideoJitterBuffer` and `VideoColorParams` without leaking FFmpeg
+/// types into the open-source PlayerKit surface.
+public struct DolbyVisionFrameMetadata: Equatable, Sendable {
+
+    /// DoVi DM Level 1 — per-frame dynamic brightness, PQ-encoded 16-bit.
+    public struct Level1: Equatable, Sendable {
+        /// Minimum PQ luminance in the frame (0..65535 → 0..1 PQ).
+        public var minPq: UInt16
+        /// Maximum PQ luminance in the frame.
+        public var maxPq: UInt16
+        /// Average PQ luminance in the frame.
+        public var avgPq: UInt16
+
+        public init(minPq: UInt16, maxPq: UInt16, avgPq: UInt16) {
+            self.minPq = minPq
+            self.maxPq = maxPq
+            self.avgPq = avgPq
+        }
+    }
+
+    /// DoVi DM Level 6 — static HDR10-like info, typically constant per stream.
+    public struct Level6: Equatable, Sendable {
+        /// Peak mastering display luminance, cd/m² (0..10000).
+        public var maxLuminance: UInt16
+        /// Minimum mastering display luminance, 0.0001 cd/m² steps.
+        public var minLuminance: UInt16
+        /// MaxCLL (maximum content light level), cd/m².
+        public var maxCll: UInt16
+        /// MaxFALL (maximum frame-average light level), cd/m².
+        public var maxFall: UInt16
+
+        public init(maxLuminance: UInt16, minLuminance: UInt16, maxCll: UInt16, maxFall: UInt16) {
+            self.maxLuminance = maxLuminance
+            self.minLuminance = minLuminance
+            self.maxCll = maxCll
+            self.maxFall = maxFall
+        }
+    }
+
+    /// Per-frame dynamic Level 1 metadata. nil if the RPU carried none.
+    public var level1: Level1?
+    /// Static Level 6 metadata. nil if the RPU carried none.
+    public var level6: Level6?
+    /// Dolby Vision profile (4/5/7/8). Sourced from stream-level DOVI_CONF.
+    public var profile: UInt8
+    /// BL signal compatibility id (e.g. 0 = DV-CT, 1 = DV-Mel, 4 = HDR10 fallback).
+    public var blSignalCompatibilityId: UInt8
+
+    public init(profile: UInt8 = 0, blSignalCompatibilityId: UInt8 = 0) {
+        self.profile = profile
+        self.blSignalCompatibilityId = blSignalCompatibilityId
+    }
+}
+
 // MARK: - VideoColorParams
 
 /// Color space parameters for video rendering.
@@ -19,6 +78,11 @@ public struct VideoColorParams: Equatable, Sendable {
     public var transfer: TransferFunc = .sdr
     /// Pixel range (limited for broadcast, full for PC).
     public var range:    ColorRange   = .limited
+
+    /// Per-frame Dolby Vision metadata. nil for non-DV streams (HDR10 / SDR).
+    /// Populated by `FFmpegVideoDecoder` when the decoded frame carries
+    /// `AV_FRAME_DATA_DOVI_METADATA` side data.
+    public var dovi: DolbyVisionFrameMetadata?
 
     /// Create default SDR BT.709 color params.
     public init() {}

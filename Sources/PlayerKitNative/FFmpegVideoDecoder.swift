@@ -2,6 +2,7 @@ import Foundation
 import CoreMedia
 import CoreVideo
 import VideoToolbox
+import PlayerKit
 import CFFmpeg
 import os
 
@@ -13,11 +14,20 @@ final class FFmpegVideoDecoder {
     let isHardware: Bool
     private var decodedFrames = 0
 
+    /// Stream-level DoVi config (profile + BL signal compatibility id),
+    /// read once from `AV_PKT_DATA_DOVI_CONF` in codecpar coded_side_data.
+    /// Per-frame Level 1 / Level 6 come from `AV_FRAME_DATA_DOVI_METADATA`.
+    private let doviConfig: DolbyVisionFrameMetadata?
+
     var width:  Int { Int(codecCtx?.pointee.width  ?? 0) }
     var height: Int { Int(codecCtx?.pointee.height ?? 0) }
 
     init?(stream: UnsafeMutablePointer<AVStream>, forceSoftware: Bool = false) {
         let codecpar = stream.pointee.codecpar.pointee
+
+        // Extract stream-level DoVi configuration record (profile + bl_signal_compat_id).
+        // This is constant per stream; attach to every emitted DolbyVisionFrameMetadata.
+        self.doviConfig = Self.extractDoviConfig(from: stream.pointee.codecpar)
 
         // HEVC and H.264 are handled by VTVideoDecoder — its VT session
         // explicitly requests Metal-compatible IOSurface-backed pixel buffers
@@ -118,7 +128,7 @@ final class FFmpegVideoDecoder {
         }
     }
 
-    func decode(packet: UnsafeMutablePointer<AVPacket>) -> CVPixelBuffer? {
+    func decode(packet: UnsafeMutablePointer<AVPacket>) -> DecodedVideoFrame? {
         guard let ctx = codecCtx else { return nil }
         guard avcodec_send_packet(ctx, packet) == 0 else { return nil }
         var frame = av_frame_alloc()
@@ -128,12 +138,30 @@ final class FFmpegVideoDecoder {
         if decodedFrames <= 3 {
             logger.info("frame #\(self.decodedFrames): \(f.pointee.width)x\(f.pointee.height) fmt=\(f.pointee.format)")
         }
-        if f.pointee.format == Int32(AV_PIX_FMT_VIDEOTOOLBOX.rawValue) {
-            return extractHWPixelBuffer(from: f)
-        } else if Self.is10BitPlanar(f.pointee.format) {
-            return create10BitBiplanarBuffer(from: f)
+
+        // Per-frame Level 1 / Level 6 come from AV_FRAME_DATA_DOVI_METADATA.
+        // Stream-level profile / bl_signal_compatibility_id are in self.doviConfig.
+        // If neither is present (non-DV stream), dovi == nil → HDR10/SDR path.
+        let perFrame = extractDoviMetadata(from: f)
+        let dovi: DolbyVisionFrameMetadata?
+        if let cfg = doviConfig {
+            var m = cfg
+            m.level1 = perFrame?.level1
+            m.level6 = perFrame?.level6
+            dovi = m
         } else {
-            return convertSWFrame(f)
+            dovi = nil
+        }
+
+        if f.pointee.format == Int32(AV_PIX_FMT_VIDEOTOOLBOX.rawValue) {
+            guard let pb = extractHWPixelBuffer(from: f) else { return nil }
+            return DecodedVideoFrame(pixelBuffer: pb, dovi: dovi)
+        } else if Self.is10BitPlanar(f.pointee.format) {
+            guard let pb = create10BitBiplanarBuffer(from: f) else { return nil }
+            return DecodedVideoFrame(pixelBuffer: pb, dovi: dovi)
+        } else {
+            guard let pb = convertSWFrame(f) else { return nil }
+            return DecodedVideoFrame(pixelBuffer: pb, dovi: dovi)
         }
     }
 
@@ -312,6 +340,69 @@ final class FFmpegVideoDecoder {
 
     func flush() {
         if let ctx = codecCtx { avcodec_flush_buffers(ctx) }
+    }
+
+    // MARK: - Dolby Vision metadata extraction
+
+    /// Read stream-level `AVDOVIDecoderConfigurationRecord` from codecpar
+    /// `coded_side_data`. This carries `dv_profile` and
+    /// `dv_bl_signal_compatibility_id`, both constant per stream. Returns nil
+    /// for non-Dolby-Vision streams (no DOVI_CONF side data).
+    private static func extractDoviConfig(from codecpar: UnsafeMutablePointer<AVCodecParameters>?) -> DolbyVisionFrameMetadata? {
+        guard let cp = codecpar else { return nil }
+        let nb = Int(cp.pointee.nb_coded_side_data)
+        guard nb > 0, let sideData = cp.pointee.coded_side_data else { return nil }
+        for i in 0..<nb {
+            let sd = sideData[i]
+            if sd.type == AV_PKT_DATA_DOVI_CONF, let data = sd.data {
+                let cfg = data.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { $0.pointee }
+                var m = DolbyVisionFrameMetadata()
+                m.profile = cfg.dv_profile
+                m.blSignalCompatibilityId = cfg.dv_bl_signal_compatibility_id
+                logger.info("DV stream config: profile=\(cfg.dv_profile) bl_compat_id=\(cfg.dv_bl_signal_compatibility_id) el=\(cfg.el_present_flag)")
+                return m
+            }
+        }
+        return nil
+    }
+
+    /// Extract per-frame Level 1 (dynamic brightness) and Level 6 (static HDR10)
+    /// from `AV_FRAME_DATA_DOVI_METADATA` side data attached to the decoded
+    /// AVFrame. Profile and bl_signal_compatibility_id are stream-level and
+    /// already set in `doviConfig`; this returns a struct carrying only L1/L6.
+    /// Must be called before `av_frame_free`.
+    private func extractDoviMetadata(from frame: UnsafeMutablePointer<AVFrame>) -> DolbyVisionFrameMetadata? {
+        guard let sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA),
+              let data = sd.pointee.data else { return nil }
+        let meta = UnsafeRawPointer(data).assumingMemoryBound(to: AVDOVIMetadata.self)
+
+        var l1: DolbyVisionFrameMetadata.Level1?
+        if let dm = av_dovi_find_level(meta, 1), dm.pointee.level == 1 {
+            l1 = DolbyVisionFrameMetadata.Level1(
+                minPq: dm.pointee.l1.min_pq,
+                maxPq: dm.pointee.l1.max_pq,
+                avgPq: dm.pointee.l1.avg_pq
+            )
+        }
+
+        var l6: DolbyVisionFrameMetadata.Level6?
+        if let dm = av_dovi_find_level(meta, 6), dm.pointee.level == 6 {
+            l6 = DolbyVisionFrameMetadata.Level6(
+                maxLuminance: dm.pointee.l6.max_luminance,
+                minLuminance: dm.pointee.l6.min_luminance,
+                maxCll:       dm.pointee.l6.max_cll,
+                maxFall:      dm.pointee.l6.max_fall
+            )
+        }
+
+        if decodedFrames <= 3 {
+            logger.info("DV frame L1: \(l1.map { "min=\($0.minPq) max=\($0.maxPq) avg=\($0.avgPq)" } ?? "nil") L6: \(l6.map { "maxLum=\($0.maxLuminance) cll=\($0.maxCll)" } ?? "nil")")
+        }
+
+        var m = DolbyVisionFrameMetadata()
+        m.level1 = l1
+        m.level6 = l6
+        return m
     }
 
     deinit {

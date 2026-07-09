@@ -83,6 +83,11 @@ public final class NativeBackend: PlayerBackend {
     private var lastLogTime: Double = 0
     private var lastNotifiedPos: Duration = .zero
 
+    // Throughput tracking. Written from demux queue, read on main actor.
+    private nonisolated(unsafe) var totalBytesRead: Int64 = 0
+    private nonisolated(unsafe) var lastBytesLogged: Int64 = 0
+    private nonisolated(unsafe) var lastThroughputTime: Double = 0
+
     /// Default init: SDR MetalRenderer + AudioUnitOutput (PCM).
     public convenience init() throws {
         try self.init(renderer: nil, audioOutput: nil)
@@ -162,7 +167,21 @@ public final class NativeBackend: PlayerBackend {
 
         if let vs = demuxer.videoStream {
             let sar = demuxer.sampleAspectRatio
-            if let dec = FFmpegVideoDecoder(stream: vs) {
+            // DoVi streams: VT cannot extract the RPU (Dolby Vision metadata
+            // is stripped by VideoToolbox), so for Profile 5/8 we force FFmpeg
+            // software decoding to preserve per-frame DM Level 1/6 metadata.
+            // Profile 7 (BL+EL dual-layer) is left to VT as HDR10 — software
+            // dual-layer decode is out of scope here.
+            let isDoVi = demuxer.isDolbyVision
+            let doViSW = isDoVi && _renderer.prefersTenBit
+            if doViSW, let dec = FFmpegVideoDecoder(stream: vs, forceSoftware: true) {
+                videoDecoder = dec
+                codedVideoWidth  = dec.width; codedVideoHeight = dec.height
+                videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
+                videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
+                let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
+                logger.info("video: DoVi SW \(dec.width)x\(dec.height)\(sarStr) display=\(self.videoWidth)x\(self.videoHeight) (profile gated by renderer.prefersTenBit)")
+            } else if !isDoVi, let dec = FFmpegVideoDecoder(stream: vs) {
                 videoDecoder = dec
                 codedVideoWidth  = dec.width; codedVideoHeight = dec.height
                 videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
@@ -175,7 +194,7 @@ public final class NativeBackend: PlayerBackend {
                 videoWidth  = sar > 1.0 ? Int(Double(dec.width) * sar) : dec.width
                 videoHeight = sar < 1.0 ? Int(Double(dec.height) / sar) : dec.height
                 let sarStr = sar != 1.0 ? " sar=\(String(format:"%.3f",sar))" : ""
-                logger.info("video: VT \(dec.width)x\(dec.height)\(sarStr) display=\(self.videoWidth)x\(self.videoHeight) 10bit=\(dec.is10Bit)")
+                logger.info("video: VT \(dec.width)x\(dec.height)\(sarStr) display=\(self.videoWidth)x\(self.videoHeight) 10bit=\(dec.is10Bit)\(isDoVi ? " (DoVi fallback as HDR10)" : "")")
             }
         }
 
@@ -424,6 +443,8 @@ public final class NativeBackend: PlayerBackend {
                 }
 
                 packetCount += 1
+                let pktSize = Int(result.packet.pointee.size)
+                if pktSize > 0 { totalBytesRead += Int64(pktSize) }
                 let streamIndex = result.streamIndex
                 let packet = result.packet
 
@@ -452,12 +473,12 @@ public final class NativeBackend: PlayerBackend {
                         self.videoDecoder = sw
                     }
 
-                    let pixelBuffer = self.videoDecoder?.decode(packet: packet)
+                    let decoded = self.videoDecoder?.decode(packet: packet)
                     dLock.unlock()
 
-                    if let buf = pixelBuffer,
+                    if let frame = decoded,
                        sLock.withLock({ self.seekSerial }) == currentSerial {
-                        jitter.append(.init(pixelBuffer: buf, pts: pts))
+                        jitter.append(.init(pixelBuffer: frame.pixelBuffer, pts: pts, dovi: frame.dovi))
                         let ptsCopy = pts
                         DispatchQueue.main.async { [weak self] in
                             guard let self else { return }
@@ -612,7 +633,9 @@ public final class NativeBackend: PlayerBackend {
         guard let popped = jitterBuffer.pop() else { return }
         syncController.advance(delay: delay, pts: popped.pts,
                                followingPTS: followingPTS, audioTime: audioTime, now: now)
-        _renderer.render(pixelBuffer: popped.pixelBuffer, pts: popped.pts, colorParams: colorParams)
+        var cp = colorParams
+        cp.dovi = popped.dovi
+        _renderer.render(pixelBuffer: popped.pixelBuffer, pts: popped.pts, colorParams: cp)
         let ptsCopy = popped.pts
         let sinks = self._frameSinks.compactMap { $0.sink }
         for sink in sinks {
@@ -642,6 +665,16 @@ public final class NativeBackend: PlayerBackend {
         let fps = Double(framesSinceLastLog) / elapsed
         let diff = Int((pts - audioTime) * 1000)
         logger.info("q=\(self.jitterBuffer.count) dur=\(Int(self.jitterBuffer.duration*1000))ms fps=\(String(format:"%.1f",fps)) diff=\(diff)ms a=\(String(format:"%.2f",audioTime))s v=\(String(format:"%.2f",pts))s buf=\(self.state.isBuffering)")
+
+        // Throughput: bytes read since last sample / elapsed.
+        let bytesDelta = totalBytesRead - lastBytesLogged
+        let tpElapsed = now - lastThroughputTime
+        if tpElapsed > 1.0 {
+            state.cacheSpeed = Int64(Double(bytesDelta) / tpElapsed)
+            lastBytesLogged = totalBytesRead
+            lastThroughputTime = now
+        }
+
         lastLogTime = now; framesSinceLastLog = 0; ticksSinceLastLog = 0
     }
 
@@ -725,6 +758,7 @@ public final class NativeBackend: PlayerBackend {
                            // video renders its first frame (MetalRenderer.display
                            // flips opacity back to 1 on first frame)
         displayedVideoFrames = 0
+        totalBytesRead = 0; lastBytesLogged = 0; lastThroughputTime = 0
         state = PlayerState()
     }
 

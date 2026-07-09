@@ -1,11 +1,13 @@
 import Foundation
 import CoreVideo
+import PlayerKit
 
 final class VideoJitterBuffer: @unchecked Sendable {
 
     struct Frame {
         let pixelBuffer: CVPixelBuffer
         let pts: Double
+        let dovi: DolbyVisionFrameMetadata?
     }
 
     enum State: Equatable { case playing, buffering }

@@ -2,6 +2,7 @@ import Foundation
 import CoreMedia
 import CoreVideo
 import VideoToolbox
+import PlayerKit
 import CFFmpeg
 import os
 
@@ -84,7 +85,7 @@ final class VTVideoDecoder {
 
     // MARK: - decode
 
-    func decode(packet: UnsafeMutablePointer<AVPacket>) -> CVPixelBuffer? {
+    func decode(packet: UnsafeMutablePointer<AVPacket>) -> DecodedVideoFrame? {
         guard let dataPtr = packet.pointee.data else { return nil }
         let dataSize = Int(packet.pointee.size)
         guard dataSize > 4, !initFailed else { return nil }
@@ -144,12 +145,21 @@ final class VTVideoDecoder {
         }
         guard !lpData.isEmpty else { return nil }
 
-        let result = vtDecode(lpData: lpData, session: session, formatDesc: formatDesc)
+        guard let pb = vtDecode(lpData: lpData, session: session, formatDesc: formatDesc) else {
+            // VT decode failure path — still count attempts for fallback heuristics.
+            if !needsParamSetInit {
+                totalAttempts += 1
+                if lastVTError { failedAttempts += 1 }
+            }
+            return nil
+        }
         if !needsParamSetInit {
             totalAttempts += 1
             if lastVTError { failedAttempts += 1 }
         }
-        return result
+        // VT strips Dolby Vision RPU side data, so dovi is always nil here.
+        // DoVi streams forced to FFmpeg SW in NativeBackend carry per-frame DM.
+        return DecodedVideoFrame(pixelBuffer: pb, dovi: nil)
     }
 
     // MARK: - flush / deinit
