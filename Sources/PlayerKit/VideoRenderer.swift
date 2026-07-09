@@ -67,8 +67,17 @@ public protocol VideoRenderer: AnyObject {
 
     /// Clear the renderer surface and show black.
     func clear()
+
+    /// Configure renderer with stream-level parameters.
+    /// Called once after demuxer open, before the first frame.
+    /// - Parameters:
+    ///   - codedSize: Bitstream dimensions (may differ from CVPixelBuffer if VT pads).
+    ///   - sampleAspectRatio: SAR from the container (1.0 = square pixels).
+    func configure(codedSize: CGSize, sampleAspectRatio: Double)
 }
 
 public extension VideoRenderer {
     var prefersTenBit: Bool { false }
+
+    func configure(codedSize: CGSize, sampleAspectRatio: Double) {}
 }

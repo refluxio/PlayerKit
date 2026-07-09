@@ -29,14 +29,18 @@ final class VTVideoDecoder {
     private var initFailed = false
     private var totalAttempts = 0
     private var failedAttempts = 0
+    // Set by vtDecode when VT returns a non-zero status (real decode error).
+    private var lastVTError = false
 
-    /// True when HW decoder's failure rate exceeds 80% over 50+ frames.
-    /// Rate-based (not consecutive) so occasional VT successes at high FPS
-    /// don't prevent fallback — e.g. 120fps stream where VT decodes 1 frame
-    /// every 50ms (20fps effective) would reset a consecutive counter.
+    /// True when VT decoder is genuinely broken (real errors, not just idle packets).
+    /// Only counts frames where VT returned a non-zero error status. Packets that
+    /// produce no output because they contain only non-decodable NALs (AUD, SEI etc.)
+    /// are NOT counted as failures — VT correctly ignores those.
     var needsSoftwareFallback: Bool {
         if initFailed { return true }
-        return totalAttempts >= 50 && Double(failedAttempts) / Double(totalAttempts) > 0.8
+        // Must have meaningful sample size AND >90% real error rate.
+        return totalAttempts >= 200
+            && Double(failedAttempts) / Double(totalAttempts) > 0.9
     }
 
     // MARK: - init
@@ -143,7 +147,7 @@ final class VTVideoDecoder {
         let result = vtDecode(lpData: lpData, session: session, formatDesc: formatDesc)
         if !needsParamSetInit {
             totalAttempts += 1
-            if result == nil { failedAttempts += 1 }
+            if lastVTError { failedAttempts += 1 }
         }
         return result
     }
@@ -215,12 +219,16 @@ final class VTVideoDecoder {
         ) == noErr, let sb else { return nil }
 
         var result: CVPixelBuffer?
-        VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb, flags: [], infoFlagsOut: nil) { _, _, buf, _, _ in
+        var decodeError = false
+        VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb, flags: [], infoFlagsOut: nil) { status, _, buf, _, _ in
+            if status != noErr { decodeError = true }
             result = buf
         }
-        // Tag HEVC Main 10 output with BT.2020/PQ colour metadata so the
-        // renderer can apply the correct EOTF.
-        if let buf = result, needsHDRTag {
+        lastVTError = decodeError
+
+        // Tag HEVC Main 10 output with BT.2020/PQ colour metadata to HDR buffers
+        // so the renderer can apply the correct EOTF.
+        if let buf = result, needsHDRTag || is10Bit {
             CVBufferSetAttachment(buf, kCVImageBufferColorPrimariesKey,
                                   kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
             CVBufferSetAttachment(buf, kCVImageBufferTransferFunctionKey,

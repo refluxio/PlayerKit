@@ -16,15 +16,8 @@ final class MetalRenderer: VideoRenderer {
     private var displayedFrames = 0
     private var lastVideoSize: CGSize = .zero
 
-    /// Sample (pixel) aspect ratio from the video stream.  Default 1.0 = square
-    /// pixels.  Non-square pixels (common in H.264 SD) require horizontal or
-    /// vertical scaling so the displayed frame has the correct DAR.
-    var sampleAspectRatio: Double = 1.0
-
-    /// Coded (bitstream) dimensions from the decoder.  Hardware decoders may
-    /// return alignment-padded CVPixelBuffers (e.g. 736×576 for 720×576); we
-    /// use the codec-level dimensions to crop and compute the correct DAR.
-    var codedSize: CGSize = .zero
+    private var codedSize: CGSize = .zero
+    private var sampleAspectRatio: Double = 1.0
 
     var layer: CALayer { metalLayer }
 
@@ -142,6 +135,11 @@ final class MetalRenderer: VideoRenderer {
         if metalLayer.opacity == 0 {
             metalLayer.opacity = 1
         }
+    }
+
+    func configure(codedSize: CGSize, sampleAspectRatio: Double) {
+        self.codedSize = codedSize
+        self.sampleAspectRatio = sampleAspectRatio
     }
 
     func render(pixelBuffer: CVPixelBuffer, pts: Double, colorParams: VideoColorParams) {

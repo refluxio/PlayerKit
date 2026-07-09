@@ -311,10 +311,9 @@ public final class NativeBackend: PlayerBackend {
         // Forward coded dimensions and SAR to the renderer for correct DAR.
         // Hardware decoders may return alignment-padded CVPixelBuffers;
         // the codec-level pixel dimensions are the ground truth.
-        if let mr = _renderer as? MetalRenderer {
-            mr.codedSize = CGSize(width: codedVideoWidth, height: codedVideoHeight)
-            mr.sampleAspectRatio = demuxer.sampleAspectRatio
-        }
+        _renderer.configure(
+            codedSize: CGSize(width: codedVideoWidth, height: codedVideoHeight),
+            sampleAspectRatio: demuxer.sampleAspectRatio)
 
         wireJitterBuffer()
         startDemuxLoop()
@@ -468,12 +467,31 @@ public final class NativeBackend: PlayerBackend {
                     }
 
                 } else if streamIndex == demuxer.audioStreamIndex {
-                    // Passthrough path: if PRO backend is injected and codec supports it,
-                    // route compressed packets directly without decoding.
+                    let codecName = String(cString: avcodec_get_name(
+                        demuxer.audioStream!.pointee.codecpar.pointee.codec_id))
+                    let usePassthrough: Bool
                     if let injected = _injectedAudioOutput,
                        injected.supportsPassthrough,
                        demuxer.isPassthroughCodec {
+                        // TrueHD passthrough silently drops on non-digital outputs
+                        // (built-in speakers / headphones). On iOS/tvOS there is no
+                        // HDMI ARC or SPDIF — always route through PCM decode.
+                        if codecName == "truehd" {
+                            #if os(iOS) || os(tvOS)
+                            usePassthrough = false
+                            #else
+                            usePassthrough = true
+                            #endif
+                        } else {
+                            usePassthrough = true
+                        }
+                    } else {
+                        usePassthrough = false
+                    }
 
+                    if usePassthrough {
+                        // Passthrough path: route compressed packets directly to
+                        // AVSampleBufferAudioRenderer (PRO backend).
                         let pkt = packet.pointee
                         let size = Int(pkt.size)
                         let pts = NativeBackend.ptsFromPacket(packet, demuxer: demuxer)
@@ -484,11 +502,9 @@ public final class NativeBackend: PlayerBackend {
                             }
                         }
                         dLock.unlock()
-                        let codecName = String(cString: avcodec_get_name(
-                            demuxer.audioStream!.pointee.codecpar.pointee.codec_id))
-                        injected.outputCompressed(data, pts: pts, codec: codecName)
+                        _injectedAudioOutput?.outputCompressed(data, pts: pts, codec: codecName)
                     } else {
-                        // PCM path (existing behavior): decode and enqueue
+                        // PCM path: decode with FFmpeg and enqueue to AudioUnit.
                         let pcm = audioDec?.decode(packet: packet)
                         dLock.unlock()
                         if let pcm { audioOut?.enqueue(pcm) }
