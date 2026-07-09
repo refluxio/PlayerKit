@@ -41,6 +41,11 @@ public class ASBDLRenderer: VideoRenderer {
         self.displayCapability = displayCapability
         displayLayer = AVSampleBufferDisplayLayer()
         displayLayer.videoGravity = .resizeAspect
+        displayLayer.requestMediaDataWhenReady(on: .main) { [weak self] in
+            // ASBDL will pull sample buffers via this callback when ready.
+            // We push via enqueue instead, so this is a no-op stub to
+            // activate the layer's display pipeline.
+        }
     }
 
     public func render(
