@@ -207,10 +207,14 @@ public enum RendererStrategy: Sendable, Equatable {
 /// When `prefersTenBit` is false (MetalRenderer / SDR-only renderer), all HDR
 /// strategies fall back to `sdr8Bit` since the Metal HDR pipeline requires
 /// 10-bit VT output. The caller is expected to keep the SDR path active.
+///
+/// When `doviEnabled` is false (free tier), Dolby Vision streams are treated as
+/// HDR10 base layer — content still plays, but without DoVi L1 dynamic tone-map.
 public func decideRendererStrategy(
     stream: VideoStreamAttributes,
     prefersTenBit: Bool,
-    display: DisplayCapability
+    display: DisplayCapability,
+    doviEnabled: Bool = true
 ) -> RendererStrategy {
     // Non-EDR display + non-10-bit renderer → always SDR path.
     // (Even HDR content on MetalRenderer / SDR-only renderer renders as SDR
@@ -219,6 +223,13 @@ public func decideRendererStrategy(
 
     // 1. Dolby Vision
     if stream.isDolbyVision {
+        // Free tier: fall back to HDR10 base layer.
+        // Profile 8 carries a full HDR10 base layer — plays correctly as HDR10.
+        // Profile 5 has no HDR10 compat layer but degrades to hdr10Static
+        // (picture is visible, tone mapping less precise without RPU).
+        guard doviEnabled else {
+            return edrCapable ? .hdr10Static(peakNits: 1000) : .sdr8Bit(matrix: .bt2020)
+        }
         switch stream.doviProfile {
         case 5:
             return edrCapable ? .doviProfile5 : .degradedHDR10

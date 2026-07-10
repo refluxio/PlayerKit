@@ -38,6 +38,10 @@ public final class NativeBackend: PlayerBackend {
             _renderer.displayCapability = displayCapability
         }
     }
+    /// When false, Dolby Vision streams fall back to HDR10 base layer.
+    /// Set by the app layer based on Pro subscription status.
+    public var doviEnabled: Bool = true
+
     /// Strategy resolved once at open time from stream attributes + display
     /// capability + renderer's `prefersTenBit`. Drives decoder selection and
     /// is forwarded to `VideoRenderer.render` every frame so EDRRenderer can
@@ -243,7 +247,8 @@ public final class NativeBackend: PlayerBackend {
             let strat = decideRendererStrategy(
                 stream: attrs,
                 prefersTenBit: _renderer.prefersTenBit,
-                display: displayCapability
+                display: displayCapability,
+                doviEnabled: doviEnabled
             )
             self.rendererStrategy = strat
             // Verbose decision log: original container fields → resolved params →
