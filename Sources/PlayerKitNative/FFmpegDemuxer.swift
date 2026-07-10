@@ -156,15 +156,20 @@ final class FFmpegDemuxer: @unchecked Sendable {
         return Double(sar.num) / Double(sar.den)
     }
 
-    func open(url: URL, headers: [String: String] = [:]) throws {
+    func open(url: URL, headers: [String: String] = [:], skipDurationProbe: Bool = false) throws {
         close()
         formatCtx = avformat_alloc_context()
         guard formatCtx != nil else { throw DemuxerError.openFailed(-1) }
 
         // Set probe options via AVDictionary (must be before avformat_open_input)
+        // analyzeduration/probesize control how much data avformat_find_stream_info
+        // reads to estimate framerate and refine codec parameters. Color metadata
+        // (color_trc, color_space, bits_per_raw_sample, profile) comes from the
+        // container header (CodecPrivate/SPS), not from probing packets — so
+        // reducing these only affects framerate accuracy, not HDR detection.
         var opts: OpaquePointer?
-        av_dict_set(&opts, "analyzeduration", "60000000", 0)  // 60s
-        av_dict_set(&opts, "probesize", "100000000", 0)        // 100MB
+        av_dict_set(&opts, "analyzeduration", "5000000", 0)  // 5s
+        av_dict_set(&opts, "probesize", "5000000", 0)         // 5MB
 
         if !headers.isEmpty {
             let dict = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n")
@@ -254,9 +259,17 @@ final class FFmpegDemuxer: @unchecked Sendable {
         // libmpv uses internally.  open() already runs on a background thread, so
         // this does not block the UI.  Uses a single Range request on the existing
         // HTTP connection; no second 115 session is opened.
-        duration = seekRefine(ctx: ctx, hint: duration)
-        if duration != containerDur {
-            logger.info("duration refined: \(String(format: "%.1f", containerDur))s → \(String(format: "%.1f", self.duration))s")
+        //
+        // Skipped when the caller already has a known duration (from Jellyfin API
+        // metadata) — saves 2-3 HTTP round-trips to the CDN (seek-to-end → read
+        // packets → seek-back), which can add seconds on high-latency 115 links.
+        if !skipDurationProbe {
+            duration = seekRefine(ctx: ctx, hint: duration)
+            if duration != containerDur {
+                logger.info("duration refined: \(String(format: "%.1f", containerDur))s → \(String(format: "%.1f", self.duration))s")
+            }
+        } else {
+            logger.info("duration probe skipped (knownDuration provided)")
         }
         logger.info("videoIdx=\(self.videoStreamIndex) audioIdx=\(self.audioStreamIndex) duration=\(String(format: "%.1f", self.duration))s")
     }

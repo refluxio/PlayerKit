@@ -157,7 +157,8 @@ public final class NativeBackend: PlayerBackend {
         Task.detached(priority: .userInitiated) { [weak self] in
             let demuxer = FFmpegDemuxer()
             do {
-                try demuxer.open(url: url, headers: headers)
+                try demuxer.open(url: url, headers: headers,
+                                 skipDurationProbe: knownDuration != nil)
             } catch {
                 logger.error("demuxer.open FAILED: \(error)")
                 // Prefer CustomStringConvertible.description (our DemuxerError
