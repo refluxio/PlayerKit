@@ -146,6 +146,22 @@ final class FFmpegDemuxer: @unchecked Sendable {
     private(set) var audioStream: UnsafeMutablePointer<AVStream>?
     private var audioStreamScore: Int = 0
 
+    /// Switch the active audio stream by stream index. Returns true on success.
+    func selectAudioStream(by id: Int) -> Bool {
+        guard let ctx = formatCtx else { return false }
+        let nb = Int(ctx.pointee.nb_streams)
+        for i in 0..<nb {
+            guard let s = ctx.pointee.streams[i] else { continue }
+            guard s.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO else { continue }
+            if Int(s.pointee.index) == id {
+                audioStream = s
+                audioStreamScore = 0  // reset score so it won't override manual selection
+                return true
+            }
+        }
+        return false
+    }
+
     /// Video stream's sample aspect ratio (SAR). Defaults to 1:1 if not set.
     /// Non-square pixels are common in H.264 SD content — e.g. 720×576 with
     /// SAR 16:15 gives a display aspect of 768×576 (4:3).

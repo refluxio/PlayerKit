@@ -443,6 +443,9 @@ public final class NativeBackend: PlayerBackend {
             audioUnitOutput = out
             isPassthroughActive = false
             logger.info("audio: \(dec.outputSampleRate)Hz \(dec.outputChannels)ch")
+            if demuxer.audioStreamIndex >= 0 {
+                state.selectedAudioTrackId = Int(demuxer.audioStreamIndex)
+            }
         }
 
         // Forward coded dimensions and SAR to the renderer for correct DAR.
@@ -888,8 +891,102 @@ public final class NativeBackend: PlayerBackend {
 
     public func setVolume(_ volume: Double) { state.volume = volume; notifyStateChange() }
     public func setRate(_ rate: Double)     { state.rate = rate; notifyStateChange() }
-    public func selectAudioTrack(id: String) {}
-    public func selectSubtitle(id: String?) {}
+    public func selectAudioTrack(id: String) {
+        guard let demuxer else { return }
+        guard let trackId = Int(id) else { return }
+        guard trackId != demuxer.audioStreamIndex else { return }
+
+        logger.info("selectAudioTrack id=\(trackId)")
+
+        // 1. Pause audio output
+        audioUnitOutput?.stop()
+
+        // 2. Switch demuxer audio stream
+        guard demuxer.selectAudioStream(by: trackId) else {
+            logger.warning("selectAudioTrack: stream \(trackId) not found, recreating original output")
+            recreateAudioOutput()
+            return
+        }
+
+        // 3. Recreate audio decoder from new stream
+        audioDecoder = nil
+        if let stream = demuxer.audioStream {
+            audioDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2)
+        }
+
+        // 4. Recreate audio output
+        recreateAudioOutput()
+
+        // 5. Seek to current position to flush decoder buffers on both ends
+        seek(to: state.position)
+
+        // 6. Update state
+        state.selectedAudioTrackId = trackId
+        refreshAudioTracks()
+        notifyStateChange()
+
+        logger.info("selectAudioTrack done, new decoder sampleRate=\(self.audioDecoder?.outputSampleRate ?? 0)")
+    }
+
+    public func selectSubtitle(id: String?) {
+        // Subtitle rendering not yet implemented — demux loop discards subtitle packets.
+        guard let trackId = id.flatMap(Int.init) else {
+            state.selectedSubtitleTrackId = nil
+            notifyStateChange()
+            return
+        }
+        state.selectedSubtitleTrackId = trackId
+        notifyStateChange()
+    }
+
+    private func recreateAudioOutput() {
+        audioUnitOutput = AudioUnitOutput(clock: audioClock)
+        if let dec = audioDecoder {
+            audioUnitOutput?.start(sampleRate: dec.outputSampleRate, channels: dec.outputChannels)
+            audioUnitOutput?.pause()
+        }
+    }
+
+    private func refreshAudioTracks() {
+        guard let fmtCtx = demuxer?.formatContext else { return }
+        var tracks: [TrackInfo] = []
+        let nb = Int(fmtCtx.pointee.nb_streams)
+        for i in 0..<nb {
+            guard let s = fmtCtx.pointee.streams[i] else { continue }
+            let cp = s.pointee.codecpar.pointee
+            guard cp.codec_type == AVMEDIA_TYPE_AUDIO else { continue }
+
+            let codecName: String? = cp.codec_id != AV_CODEC_ID_NONE
+                ? String(cString: avcodec_get_name(cp.codec_id))
+                : nil
+
+            var title: String?
+            var lang: String?
+            if let meta = s.pointee.metadata {
+                if let e = av_dict_get(meta, "title", nil, 0), let v = e.pointee.value {
+                    title = String(cString: v)
+                }
+                if let e = av_dict_get(meta, "language", nil, 0), let v = e.pointee.value {
+                    lang = String(cString: v)
+                }
+            }
+
+            let isDefault = (s.pointee.disposition & Int32(AV_DISPOSITION_DEFAULT)) != 0
+            let isAtmos = (s.pointee.index == demuxer?.audioStreamIndex)
+                ? (demuxer?.audioIsAtmos ?? false)
+                : false
+
+            tracks.append(TrackInfo(
+                id: Int(s.pointee.index),
+                title: title,
+                lang: lang,
+                codec: codecName,
+                isDefault: isDefault,
+                isAtmos: isAtmos
+            ))
+        }
+        state.audioTracks = tracks
+    }
     public func prepareForReuse() { stop() }
 
     public func addFrameSink(_ sink: any FrameSink) {

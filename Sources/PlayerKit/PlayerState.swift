@@ -23,6 +23,10 @@ public struct PlayerState: Sendable {
     public var audioTracks:    [TrackInfo] = []
     /// Available subtitle tracks.
     public var subtitleTracks: [TrackInfo] = []
+    /// Currently selected audio track ID, nil if default/auto.
+    public var selectedAudioTrackId: Int? = nil
+    /// Currently selected subtitle track ID, nil if none.
+    public var selectedSubtitleTrackId: Int? = nil
     /// Current video stream info, nil until loaded.
     public var videoInfo:      VideoInfo?  = nil
     /// Cache download speed in bytes/second.
