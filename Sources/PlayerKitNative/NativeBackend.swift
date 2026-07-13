@@ -647,9 +647,13 @@ public final class NativeBackend: PlayerBackend {
                         _injectedAudioOutput?.outputCompressed(data, pts: pts, codec: codecName)
                     } else {
                         // PCM path: decode with FFmpeg and enqueue to AudioUnit.
-                        let pcm = audioDec?.decode(packet: packet)
+                        // Read decoder/output from self each iteration — selectAudioTrack
+                        // may have replaced them since the loop started.
+                        let currentDec = self.audioDecoder
+                        let currentOut = self.audioUnitOutput
+                        let pcm = currentDec?.decode(packet: packet)
                         dLock.unlock()
-                        if let pcm { audioOut?.enqueue(pcm) }
+                        if let pcm { currentOut?.enqueue(pcm) }
                     }
                 } else {
                     dLock.unlock()
@@ -901,7 +905,11 @@ public final class NativeBackend: PlayerBackend {
         // 1. Stop audio output
         audioUnitOutput?.stop()
 
-        // 2. Under lock: flush old decoder, switch stream, seek demuxer
+        // 2. Under lock: flush old decoder, switch stream, seek demuxer, create new decoder.
+        // All decoder/stream mutations must happen inside demuxLock so the demux loop
+        // (which holds demuxLock while processing audio packets) always sees a consistent
+        // pair of (audioStreamIndex, audioDecoder). Creating the decoder outside the lock
+        // caused the loop to feed new-stream packets into the stale old decoder.
         demuxLock.lock()
         audioDecoder?.flush()
         audioDecoder = nil
@@ -913,12 +921,11 @@ public final class NativeBackend: PlayerBackend {
         }
         let posSecs = Double(state.position.components.seconds)
         _ = demuxer.seek(to: posSecs)
-        demuxLock.unlock()
-
-        // 3. Create new decoder from new stream
         if let stream = demuxer.audioStream {
             audioDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2)
         }
+        seekLock.withLock { seekSerial += 1 }
+        demuxLock.unlock()
 
         // 4. Flush video pipeline
         videoDecoder?.flush()
@@ -935,10 +942,7 @@ public final class NativeBackend: PlayerBackend {
         audioUnitOutput?.pause()
         needsClockCalibration = true
 
-        // 6. Bump seek serial so demux loop discards stale packets
-        seekLock.withLock { seekSerial += 1 }
-
-        // 7. Update state
+        // 6. Update state
         state.selectedAudioTrackId = trackId
         refreshAudioTracks()
         notifyStateChange()
