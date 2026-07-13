@@ -898,29 +898,47 @@ public final class NativeBackend: PlayerBackend {
 
         logger.info("selectAudioTrack id=\(trackId)")
 
-        // 1. Pause audio output
+        // 1. Stop audio output
         audioUnitOutput?.stop()
 
-        // 2. Switch demuxer audio stream
+        // 2. Under lock: flush old decoder, switch stream, seek demuxer
+        demuxLock.lock()
+        audioDecoder?.flush()
+        audioDecoder = nil
         guard demuxer.selectAudioStream(by: trackId) else {
+            demuxLock.unlock()
             logger.warning("selectAudioTrack: stream \(trackId) not found, recreating original output")
             recreateAudioOutput()
             return
         }
+        let posSecs = Double(state.position.components.seconds)
+        _ = demuxer.seek(to: posSecs)
+        demuxLock.unlock()
 
-        // 3. Recreate audio decoder from new stream
-        audioDecoder = nil
+        // 3. Create new decoder from new stream
         if let stream = demuxer.audioStream {
             audioDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2)
         }
 
-        // 4. Recreate audio output
-        recreateAudioOutput()
+        // 4. Flush video pipeline
+        videoDecoder?.flush()
+        jitterBuffer.flush()
+        syncController.reset()
+        _renderer.flush()
 
-        // 5. Seek to current position to flush decoder buffers on both ends
-        seek(to: state.position)
+        // 5. Recreate audio output with new decoder's parameters
+        let sr = audioDecoder?.outputSampleRate ?? 44100
+        let ch = audioDecoder?.outputChannels ?? 2
+        audioClock.reset(to: posSecs, sampleRate: sr)
+        audioUnitOutput = AudioUnitOutput(clock: audioClock)
+        audioUnitOutput?.start(sampleRate: sr, channels: ch)
+        audioUnitOutput?.pause()
+        needsClockCalibration = true
 
-        // 6. Update state
+        // 6. Bump seek serial so demux loop discards stale packets
+        seekLock.withLock { seekSerial += 1 }
+
+        // 7. Update state
         state.selectedAudioTrackId = trackId
         refreshAudioTracks()
         notifyStateChange()
