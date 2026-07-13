@@ -951,14 +951,12 @@ public final class NativeBackend: PlayerBackend {
     }
 
     public func selectSubtitle(id: String?) {
-        // Subtitle rendering not yet implemented — demux loop discards subtitle packets.
-        guard let trackId = id.flatMap(Int.init) else {
-            state.selectedSubtitleTrackId = nil
-            notifyStateChange()
-            return
-        }
-        state.selectedSubtitleTrackId = trackId
-        notifyStateChange()
+        // Track the selected subtitle stream index for future rendering.
+        // Do NOT call notifyStateChange() here — subtitle selection has no visible
+        // effect yet (rendering not implemented), so firing player.state updates
+        // would invalidate observer views for no reason and cause UI jitter.
+        // The UI tracks selection via PlayerController.currentSubtitleTrackId instead.
+        state.selectedSubtitleTrackId = id.flatMap(Int.init)
     }
 
     private func recreateAudioOutput() {
