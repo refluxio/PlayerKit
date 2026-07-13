@@ -145,6 +145,22 @@ final class FFmpegDemuxer: @unchecked Sendable {
     private(set) var videoStream: UnsafeMutablePointer<AVStream>?
     private(set) var audioStream: UnsafeMutablePointer<AVStream>?
     private var audioStreamScore: Int = 0
+    private(set) var subtitleStream: UnsafeMutablePointer<AVStream>?
+
+    var subtitleStreamIndex: Int32 { subtitleStream.map { $0.pointee.index } ?? -1 }
+
+    /// Select (or deselect) the active subtitle stream by stream index.
+    /// Pass nil to disable subtitle decoding.
+    func selectSubtitleStream(by id: Int?) {
+        guard let id else { subtitleStream = nil; return }
+        guard let ctx = formatCtx else { return }
+        let nb = Int(ctx.pointee.nb_streams)
+        for i in 0..<nb {
+            guard let s = ctx.pointee.streams[i] else { continue }
+            guard s.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { continue }
+            if Int(s.pointee.index) == id { subtitleStream = s; return }
+        }
+    }
 
     /// Switch the active audio stream by stream index. Returns true on success.
     func selectAudioStream(by id: Int) -> Bool {
@@ -399,6 +415,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
         videoStream = nil
         audioStream = nil
         audioStreamScore = 0
+        subtitleStream = nil
         duration = 0
     }
 

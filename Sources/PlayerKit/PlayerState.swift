@@ -27,6 +27,8 @@ public struct PlayerState: Sendable {
     public var selectedAudioTrackId: Int? = nil
     /// Currently selected subtitle track ID, nil if none.
     public var selectedSubtitleTrackId: Int? = nil
+    /// Text of the currently active subtitle cue, nil when no subtitle is showing.
+    public var currentSubtitleText: String? = nil
     /// Current video stream info, nil until loaded.
     public var videoInfo:      VideoInfo?  = nil
     /// Cache download speed in bytes/second.

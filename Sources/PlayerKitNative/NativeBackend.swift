@@ -83,6 +83,16 @@ public final class NativeBackend: PlayerBackend {
     // not start at 0 (e.g. B-frame reorder delays).
     private var needsClockCalibration: Bool = false
 
+    // Subtitle cue buffer — written from demux loop, read from display loop.
+    private struct SubtitleCue {
+        let startPts: Double
+        let endPts: Double
+        let text: String
+    }
+    private let subtitleLock = NSLock()
+    private nonisolated(unsafe) var subtitleCues: [SubtitleCue] = []
+    private nonisolated(unsafe) var lastSubtitleText: String? = nil
+
     // Pipeline control
     private let demuxLock = NSLock()
     private let seekLock = NSLock()
@@ -655,6 +665,13 @@ public final class NativeBackend: PlayerBackend {
                         dLock.unlock()
                         if let pcm { currentOut?.enqueue(pcm) }
                     }
+                } else if streamIndex == demuxer.subtitleStreamIndex,
+                          demuxer.subtitleStreamIndex >= 0 {
+                    let cue = Self.parseASSCue(packet: packet, stream: demuxer.subtitleStream)
+                    dLock.unlock()
+                    if let cue {
+                        self.subtitleLock.withLock { self.subtitleCues.append(cue) }
+                    }
                 } else {
                     dLock.unlock()
                 }
@@ -672,6 +689,54 @@ public final class NativeBackend: PlayerBackend {
         let nopts = Int64(bitPattern: 0x8000000000000000)
         guard tb.den > 0, packet.pointee.pts != nopts else { return .nan }
         return Double(packet.pointee.pts) * Double(tb.num) / Double(tb.den)
+    }
+
+    /// Parse an ASS/SSA subtitle packet from MKV into a SubtitleCue.
+    ///
+    /// MKV stores each ASS dialogue line as a raw packet with this field layout:
+    ///   ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+    /// The Text field (index 8) may contain ASS override tags ({...}) and hardcoded
+    /// line-break sequences (\N / \n). We strip tags and convert breaks to newlines.
+    /// Timing comes from packet.pts/duration scaled by the subtitle stream timebase.
+    private static func parseASSCue(
+        packet: UnsafeMutablePointer<AVPacket>,
+        stream: UnsafeMutablePointer<AVStream>?
+    ) -> SubtitleCue? {
+        guard let stream,
+              packet.pointee.size > 0,
+              let rawPtr = packet.pointee.data else { return nil }
+
+        let codecId = stream.pointee.codecpar.pointee.codec_id
+        guard codecId == AV_CODEC_ID_ASS || codecId == AV_CODEC_ID_SSA else { return nil }
+
+        guard let raw = String(bytes: UnsafeBufferPointer(start: rawPtr,
+                                                           count: Int(packet.pointee.size)),
+                               encoding: .utf8) else { return nil }
+
+        // Split on the first 8 commas only; Text (field 8) may itself contain commas.
+        let parts = raw.split(separator: ",", maxSplits: 8, omittingEmptySubsequences: false)
+        guard parts.count >= 9 else { return nil }
+
+        var text = String(parts[8]).trimmingCharacters(in: .newlines)
+        // Strip ASS override tags: {\an8}, {\b1}, {\1c&Hffffff&}, etc.
+        text = text.replacingOccurrences(of: "\\{[^}]*\\}", with: "", options: .regularExpression)
+        // Hardcoded line breaks
+        text = text.replacingOccurrences(of: "\\N", with: "\n")
+        text = text.replacingOccurrences(of: "\\n", with: "\n")
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+
+        let tb = stream.pointee.time_base
+        guard tb.den > 0 else { return nil }
+        let tbSecs = Double(tb.num) / Double(tb.den)
+        let nopts = Int64(bitPattern: 0x8000000000000000)
+        guard packet.pointee.pts != nopts else { return nil }
+
+        let startPts = Double(packet.pointee.pts) * tbSecs
+        let dur = packet.pointee.duration > 0
+            ? Double(packet.pointee.duration) * tbSecs
+            : 5.0
+        return SubtitleCue(startPts: startPts, endPts: startPts + dur, text: text)
     }
 
     // MARK: - Display (CADisplayLink)
@@ -783,9 +848,20 @@ public final class NativeBackend: PlayerBackend {
         let posDur = Duration.milliseconds(Int64(popped.pts * 1000))
         state.position = posDur
         if posDur > state.duration { state.duration = posDur }
-        if (posDur - lastNotifiedPos) >= .milliseconds(500) {
-            notifyStateChange(); lastNotifiedPos = posDur
+
+        // Update active subtitle text. Only notify when the text actually changes
+        // to avoid redundant view invalidations on every frame.
+        let activeSub: String? = subtitleLock.withLock {
+            subtitleCues.first { $0.startPts <= audioTime && audioTime < $0.endPts }?.text
         }
+        if activeSub != lastSubtitleText {
+            lastSubtitleText = activeSub
+            state.currentSubtitleText = activeSub
+            notifyStateChange()
+        } else if (posDur - lastNotifiedPos) >= .milliseconds(500) {
+            notifyStateChange()
+        }
+        if (posDur - lastNotifiedPos) >= .milliseconds(500) { lastNotifiedPos = posDur }
 
         logSync(now: now, pts: popped.pts, audioTime: audioTime)
     }
@@ -841,6 +917,9 @@ public final class NativeBackend: PlayerBackend {
         _ = demuxer?.seek(to: secs)
         videoDecoder?.flush(); audioDecoder?.flush()
         demuxLock.unlock()
+
+        subtitleLock.withLock { subtitleCues.removeAll() }
+        lastSubtitleText = nil
 
         jitterBuffer.flush()
         syncController.reset()
@@ -951,12 +1030,24 @@ public final class NativeBackend: PlayerBackend {
     }
 
     public func selectSubtitle(id: String?) {
-        // Track the selected subtitle stream index for future rendering.
-        // Do NOT call notifyStateChange() here — subtitle selection has no visible
-        // effect yet (rendering not implemented), so firing player.state updates
-        // would invalidate observer views for no reason and cause UI jitter.
-        // The UI tracks selection via PlayerController.currentSubtitleTrackId instead.
-        state.selectedSubtitleTrackId = id.flatMap(Int.init)
+        guard let demuxer else { return }
+        let trackId = id.flatMap(Int.init)
+
+        // Switch subtitle stream under demuxLock so the demux loop sees the new
+        // subtitleStreamIndex atomically with the next readPacket call.
+        demuxLock.lock()
+        demuxer.selectSubtitleStream(by: trackId)
+        demuxLock.unlock()
+
+        // Discard cues from the previous track.
+        subtitleLock.withLock { subtitleCues.removeAll() }
+
+        lastSubtitleText = nil
+        state.selectedSubtitleTrackId = trackId
+        if state.currentSubtitleText != nil {
+            state.currentSubtitleText = nil
+            notifyStateChange()
+        }
     }
 
     private func recreateAudioOutput() {
