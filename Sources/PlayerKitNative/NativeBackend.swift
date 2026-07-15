@@ -575,31 +575,11 @@ public final class NativeBackend: PlayerBackend {
                 let packet = result.packet
 
                 if streamIndex == demuxer.videoStreamIndex {
-                    // Video backpressure: if jitter buffer is full, skip decoding
-                    // this video packet to let the display loop drain. Audio
-                    // packets are NOT skipped — they must be read and enqueued
-                    // to keep AudioQueue fed and audioClock advancing.
-                    if jitter.duration >= jitter.maxDuration {
-                        var pkt: UnsafeMutablePointer<AVPacket>? = packet
-                        av_packet_free(&pkt)
-                        dLock.unlock()
-                        Thread.sleep(forTimeInterval: 0.005)
-                        continue
-                    }
-
                     let rawPTS = Self.ptsFromPacket(packet, demuxer: demuxer)
                     let pts = ptsValidator.validate(rawPTS)
                     if packetCount < 5 || (packetCount % 500 == 0) {
                         logger.debug("pkt#\(packetCount) rawPTS=\(String(format:"%.3f",rawPTS)) pts=\(String(format:"%.3f",pts)) audio=\(String(format:"%.3f",clock.audioTime))")
                     }
-
-                    // Decode every video packet in stream order — no pre-decode
-                    // drop filtering.  A/V sync is enforced at render time by the
-                    // display loop's freeze-ahead / skip-behind guard (±60ms),
-                    // which is far tighter than any demux-level threshold and
-                    // cannot cause the "skip to next I-frame" cascade that
-                    // demux-level dropping produced after seek.  JitterBuffer's
-                    // maxDuration backpressure caps memory growth.
 
                     // VT→SW fallback: when VideoToolbox repeatedly fails to decode
                     // (e.g. 4K@120fps exceeds HW limits), hot-swap to FFmpeg software
@@ -611,11 +591,20 @@ public final class NativeBackend: PlayerBackend {
                         self.videoDecoder = sw
                     }
 
+                    // Always decode even under backpressure. VTVideoDecoder is stateful:
+                    // it needs every packet to maintain its Reference Picture Set (RPS).
+                    // Discarding a packet without decoding breaks the reference chain,
+                    // causing "Could not find ref with POC N" errors that trigger an
+                    // unnecessary VT→SW fallback and subsequent decode failure.
+                    // Backpressure is applied AFTER decode: drop the decoded frame and
+                    // sleep briefly so the display loop can drain the jitter buffer.
                     let decoded = self.videoDecoder?.decode(packet: packet)
                     dLock.unlock()
 
-                    if let frame = decoded,
-                       sLock.withLock({ self.seekSerial }) == currentSerial {
+                    if jitter.duration >= jitter.maxDuration {
+                        Thread.sleep(forTimeInterval: 0.005)
+                    } else if let frame = decoded,
+                              sLock.withLock({ self.seekSerial }) == currentSerial {
                         jitter.append(.init(pixelBuffer: frame.pixelBuffer, pts: pts, metadata: frame.metadata))
                         let ptsCopy = pts
                         DispatchQueue.main.async { [weak self] in
