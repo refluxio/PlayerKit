@@ -93,6 +93,18 @@ public final class NativeBackend: PlayerBackend {
     private nonisolated(unsafe) var subtitleCues: [SubtitleCue] = []
     private nonisolated(unsafe) var lastSubtitleText: String? = nil
 
+    private struct SubtitleImageCue {
+        let startPts: Double
+        let endPts: Double
+        let image: CGImage
+        let rect: CGRect
+    }
+    private let subtitleImageLock = NSLock()
+    private nonisolated(unsafe) var subtitleImageCues: [SubtitleImageCue] = []
+    private nonisolated(unsafe) var lastSubtitleImage: CGImage? = nil
+
+    private nonisolated(unsafe) var subtitleDecoder: FFmpegSubtitleDecoder?
+
     // Pipeline control
     private let demuxLock = NSLock()
     private let seekLock = NSLock()
@@ -446,6 +458,16 @@ public final class NativeBackend: PlayerBackend {
             logger.info("subtitle tracks: \(subs.count)")
         }
 
+        // Initialize graphic subtitle decoder for PGS/VOBSUB streams
+        subtitleDecoder = nil
+        if let defaultSubStream = demuxer.subtitleStream {
+            let codecId = defaultSubStream.pointee.codecpar.pointee.codec_id
+            if codecId == AV_CODEC_ID_HDMV_PGS_SUBTITLE || codecId == AV_CODEC_ID_DVD_SUBTITLE {
+                let vSize = CGSize(width: codedVideoWidth, height: codedVideoHeight)
+                subtitleDecoder = FFmpegSubtitleDecoder(stream: defaultSubStream, videoSize: vSize)
+            }
+        }
+
         if let as_ = demuxer.audioStream,
            let dec = FFmpegAudioDecoder(stream: as_, sampleRate: 44100, channels: 2) {
             audioDecoder = dec
@@ -665,10 +687,31 @@ public final class NativeBackend: PlayerBackend {
                     }
                 } else if streamIndex == demuxer.subtitleStreamIndex,
                           demuxer.subtitleStreamIndex >= 0 {
-                    let cue = Self.parseASSCue(packet: packet, stream: demuxer.subtitleStream)
-                    dLock.unlock()
-                    if let cue {
-                        self.subtitleLock.withLock { self.subtitleCues.append(cue) }
+                    let stream = demuxer.subtitleStream
+                    let codecId = stream?.pointee.codecpar.pointee.codec_id
+                    if codecId == AV_CODEC_ID_ASS || codecId == AV_CODEC_ID_SSA {
+                        let cue = Self.parseASSCue(packet: packet, stream: stream)
+                        dLock.unlock()
+                        if let cue { self.subtitleLock.withLock { self.subtitleCues.append(cue) } }
+                    } else if codecId == AV_CODEC_ID_SUBRIP || codecId == AV_CODEC_ID_TEXT {
+                        // AV_CODEC_ID_TEXT carries raw UTF-8 with no HTML tags; routing here is safe
+                        // since the HTML-strip regex is a no-op when no tags are present.
+                        let cue = Self.parseSRTCue(packet: packet, stream: stream)
+                        dLock.unlock()
+                        if let cue { self.subtitleLock.withLock { self.subtitleCues.append(cue) } }
+                    } else if codecId == AV_CODEC_ID_HDMV_PGS_SUBTITLE || codecId == AV_CODEC_ID_DVD_SUBTITLE {
+                        let dec = self.subtitleDecoder
+                        dLock.unlock()
+                        if let cue = dec?.decode(packet: packet) {
+                            self.subtitleImageLock.withLock {
+                                self.subtitleImageCues.append(
+                                    SubtitleImageCue(startPts: cue.startPts, endPts: cue.endPts,
+                                                     image: cue.image, rect: cue.rect)
+                                )
+                            }
+                        }
+                    } else {
+                        dLock.unlock()
                     }
                 } else {
                     dLock.unlock()
@@ -721,6 +764,40 @@ public final class NativeBackend: PlayerBackend {
         // Hardcoded line breaks
         text = text.replacingOccurrences(of: "\\N", with: "\n")
         text = text.replacingOccurrences(of: "\\n", with: "\n")
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+
+        let tb = stream.pointee.time_base
+        guard tb.den > 0 else { return nil }
+        let tbSecs = Double(tb.num) / Double(tb.den)
+        let nopts = Int64(bitPattern: 0x8000000000000000)
+        guard packet.pointee.pts != nopts else { return nil }
+
+        let startPts = Double(packet.pointee.pts) * tbSecs
+        let dur = packet.pointee.duration > 0
+            ? Double(packet.pointee.duration) * tbSecs
+            : 5.0
+        return SubtitleCue(startPts: startPts, endPts: startPts + dur, text: text)
+    }
+
+    /// Parse a SubRip (SRT) subtitle packet from an MKV container.
+    /// MKV stores SRT as raw text in packet data with timing from PTS/duration.
+    /// Strips HTML-like tags (<i>, <b>, <font ...>) commonly found in SRT files.
+    private static func parseSRTCue(
+        packet: UnsafeMutablePointer<AVPacket>,
+        stream: UnsafeMutablePointer<AVStream>?
+    ) -> SubtitleCue? {
+        guard let stream,
+              packet.pointee.size > 0,
+              let rawPtr = packet.pointee.data else { return nil }
+
+        let codecId = stream.pointee.codecpar.pointee.codec_id
+        guard codecId == AV_CODEC_ID_SUBRIP || codecId == AV_CODEC_ID_TEXT else { return nil }
+
+        guard var text = String(bytes: UnsafeBufferPointer(start: rawPtr,
+                                                            count: Int(packet.pointee.size)),
+                                encoding: .utf8) else { return nil }
+        text = text.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
 
@@ -861,6 +938,19 @@ public final class NativeBackend: PlayerBackend {
         }
         if (posDur - lastNotifiedPos) >= .milliseconds(500) { lastNotifiedPos = posDur }
 
+        let (newImage, newRect): (CGImage?, CGRect) = subtitleImageLock.withLock {
+            if let c = subtitleImageCues.first(where: { $0.startPts <= audioTime && audioTime < $0.endPts }) {
+                return (c.image, c.rect)
+            }
+            return (nil, .zero)
+        }
+        if newImage !== lastSubtitleImage {
+            lastSubtitleImage = newImage
+            state.currentSubtitleImage = newImage
+            state.currentSubtitleImageRect = newRect
+            notifyStateChange()
+        }
+
         logSync(now: now, pts: popped.pts, audioTime: audioTime)
     }
 
@@ -918,6 +1008,8 @@ public final class NativeBackend: PlayerBackend {
 
         subtitleLock.withLock { subtitleCues.removeAll() }
         lastSubtitleText = nil
+        subtitleImageLock.withLock { subtitleImageCues.removeAll() }
+        lastSubtitleImage = nil
 
         jitterBuffer.flush()
         syncController.reset()
@@ -967,6 +1059,11 @@ public final class NativeBackend: PlayerBackend {
                            // flips opacity back to 1 on first frame)
         displayedVideoFrames = 0
         totalBytesRead = 0; lastBytesLogged = 0; lastThroughputTime = 0
+        subtitleLock.withLock { subtitleCues.removeAll() }
+        lastSubtitleText = nil
+        subtitleImageLock.withLock { subtitleImageCues.removeAll() }
+        lastSubtitleImage = nil
+        subtitleDecoder = nil
         state = PlayerState()
     }
 
@@ -1039,12 +1136,33 @@ public final class NativeBackend: PlayerBackend {
 
         // Discard cues from the previous track.
         subtitleLock.withLock { subtitleCues.removeAll() }
+        subtitleImageLock.withLock { subtitleImageCues.removeAll() }
+        lastSubtitleImage = nil
+        state.currentSubtitleImage = nil
+        state.currentSubtitleImageRect = .zero
 
         lastSubtitleText = nil
         state.selectedSubtitleTrackId = trackId
         if state.currentSubtitleText != nil {
             state.currentSubtitleText = nil
             notifyStateChange()
+        }
+
+        subtitleDecoder = nil
+        if let resolvedTrackId = trackId {
+            let nb = Int(demuxer.formatContext?.pointee.nb_streams ?? 0)
+            for i in 0..<nb {
+                guard let s = demuxer.formatContext?.pointee.streams[i],
+                      Int(s.pointee.index) == resolvedTrackId else { continue }
+                let codecId = s.pointee.codecpar.pointee.codec_id
+                if codecId == AV_CODEC_ID_HDMV_PGS_SUBTITLE || codecId == AV_CODEC_ID_DVD_SUBTITLE {
+                    subtitleDecoder = FFmpegSubtitleDecoder(
+                        stream: s,
+                        videoSize: CGSize(width: codedVideoWidth, height: codedVideoHeight)
+                    )
+                }
+                break
+            }
         }
     }
 

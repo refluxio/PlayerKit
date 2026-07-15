@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 /// Snapshot of current player state. Emitted on every change via onStateChange.
 public struct PlayerState: Sendable {
@@ -29,6 +30,10 @@ public struct PlayerState: Sendable {
     public var selectedSubtitleTrackId: Int? = nil
     /// Text of the currently active subtitle cue, nil when no subtitle is showing.
     public var currentSubtitleText: String? = nil
+    /// CGImage of the currently active bitmap subtitle cue (PGS/VOBSUB). Nil when no graphic subtitle is showing.
+    public var currentSubtitleImage: CGImage? = nil
+    /// Normalized position of currentSubtitleImage within the video frame (0...1 per axis, origin top-left).
+    public var currentSubtitleImageRect: CGRect = .zero
     /// Current video stream info, nil until loaded.
     public var videoInfo:      VideoInfo?  = nil
     /// Cache download speed in bytes/second.
