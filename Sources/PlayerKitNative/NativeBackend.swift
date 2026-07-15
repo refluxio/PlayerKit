@@ -536,21 +536,12 @@ public final class NativeBackend: PlayerBackend {
             while true {
                 guard let self, !self.demuxCancelled else { break }
 
-                // Backpressure: when jitter buffer is full, sleep briefly to let
-                // the display loop consume frames. But don't hold the demux lock
-                // — audio packets interleaved in the stream still need to be read
-                // and fed to AudioUnitOutput, otherwise audio runs dry.
-                if jitter.duration >= jitter.maxDuration {
-                    Thread.sleep(forTimeInterval: 0.005)
-                    continue
-                }
-
                 dLock.lock()
                 if self.demuxCancelled { dLock.unlock(); break }
 
                 let currentSerial = sLock.withLock { self.seekSerial }
 
-                // Reset state on seek so stale values don't affect post-seek packets.
+                // Reset state on seek so stale packets don't affect post-seek packets.
                 if currentSerial != lastSeenSerial {
                     ptsValidator.reset()
                     lastSeenSerial = currentSerial
@@ -584,6 +575,15 @@ public final class NativeBackend: PlayerBackend {
                 let packet = result.packet
 
                 if streamIndex == demuxer.videoStreamIndex {
+                    // Video backpressure: if jitter buffer is full, skip decoding
+                    // this video packet to let the display loop drain. Audio
+                    // packets are NOT skipped — they must be read and enqueued
+                    // to keep AudioQueue fed and audioClock advancing.
+                    if jitter.duration >= jitter.maxDuration {
+                        dLock.unlock()
+                        continue
+                    }
+
                     let rawPTS = Self.ptsFromPacket(packet, demuxer: demuxer)
                     let pts = ptsValidator.validate(rawPTS)
                     if packetCount < 5 || (packetCount % 500 == 0) {
