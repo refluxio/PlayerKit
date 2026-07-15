@@ -580,7 +580,10 @@ public final class NativeBackend: PlayerBackend {
                     // packets are NOT skipped — they must be read and enqueued
                     // to keep AudioQueue fed and audioClock advancing.
                     if jitter.duration >= jitter.maxDuration {
+                        var pkt: UnsafeMutablePointer<AVPacket>? = packet
+                        av_packet_free(&pkt)
                         dLock.unlock()
+                        Thread.sleep(forTimeInterval: 0.005)
                         continue
                     }
 
