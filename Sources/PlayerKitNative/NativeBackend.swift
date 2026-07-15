@@ -605,11 +605,19 @@ public final class NativeBackend: PlayerBackend {
                             if d > self.state.duration { self.state.duration = d }
                         }
                     }
-                    // Rate-limit when the buffer is near capacity so the demux thread
-                    // doesn't spin at full CPU. Unlike duration-based backpressure,
-                    // this never discards frames and never creates PTS gaps.
-                    if jitter.count >= jitter.maxFrameCount - 5 {
-                        Thread.sleep(forTimeInterval: 0.005)
+                    // Throttle: keep video demux within 2s of the audio clock.
+                    // HW decode runs ~4× real-time; without throttling the demux
+                    // would advance 30+ seconds ahead of audio. maxFrameCount then
+                    // evicts old frames, leaving the jitter buffer with only
+                    // far-future frames — needsClockCalibration resets audioClock
+                    // to that far-future PTS, causing A/V desync / black screen.
+                    //
+                    // We sleep AT MOST 50ms per video packet so the outer loop
+                    // continues reading audio packets in between, keeping the
+                    // AudioUnit queue fed and audioClock advancing.
+                    let audioPos = clock.audioTime
+                    if pts.isFinite && pts > audioPos + 2.0 {
+                        Thread.sleep(forTimeInterval: min(pts - audioPos - 2.0, 0.050))
                     }
 
                 } else if streamIndex == demuxer.audioStreamIndex {
