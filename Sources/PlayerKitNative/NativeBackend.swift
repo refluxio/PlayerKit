@@ -591,20 +591,12 @@ public final class NativeBackend: PlayerBackend {
                         self.videoDecoder = sw
                     }
 
-                    // Always decode even under backpressure. VTVideoDecoder is stateful:
-                    // it needs every packet to maintain its Reference Picture Set (RPS).
-                    // Discarding a packet without decoding breaks the reference chain,
-                    // causing "Could not find ref with POC N" errors that trigger an
-                    // unnecessary VT→SW fallback and subsequent decode failure.
-                    // Backpressure is applied AFTER decode: drop the decoded frame and
-                    // sleep briefly so the display loop can drain the jitter buffer.
+                    // Always decode — VTVideoDecoder needs every packet for its RPS.
                     let decoded = self.videoDecoder?.decode(packet: packet)
                     dLock.unlock()
 
-                    if jitter.duration >= jitter.maxDuration {
-                        Thread.sleep(forTimeInterval: 0.005)
-                    } else if let frame = decoded,
-                              sLock.withLock({ self.seekSerial }) == currentSerial {
+                    if let frame = decoded,
+                       sLock.withLock({ self.seekSerial }) == currentSerial {
                         jitter.append(.init(pixelBuffer: frame.pixelBuffer, pts: pts, metadata: frame.metadata))
                         let ptsCopy = pts
                         DispatchQueue.main.async { [weak self] in
@@ -612,6 +604,12 @@ public final class NativeBackend: PlayerBackend {
                             let d = Duration.milliseconds(Int64(ptsCopy * 1000))
                             if d > self.state.duration { self.state.duration = d }
                         }
+                    }
+                    // Rate-limit when the buffer is near capacity so the demux thread
+                    // doesn't spin at full CPU. Unlike duration-based backpressure,
+                    // this never discards frames and never creates PTS gaps.
+                    if jitter.count >= jitter.maxFrameCount - 5 {
+                        Thread.sleep(forTimeInterval: 0.005)
                     }
 
                 } else if streamIndex == demuxer.audioStreamIndex {

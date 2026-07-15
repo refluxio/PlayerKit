@@ -18,7 +18,7 @@ final class VideoJitterBuffer: @unchecked Sendable {
     let minDuration: Double = 0.5     // 低于此值 → buffering
     let resumeDuration: Double = 1.0  // 达到此值 → playing
     let maxDuration: Double = 2.0     // demux 背压阈值（不丢帧，只是限速）
-    let maxFrameCount: Int = 200      // 安全上限，防内存无限增长
+    let maxFrameCount: Int = 60       // ≈2.5s at 24fps; hard cap to bound memory
 
     private var frames: [Frame] = []
     private let lock = NSLock()
