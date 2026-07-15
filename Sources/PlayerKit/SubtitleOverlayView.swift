@@ -20,12 +20,14 @@ public struct SubtitleOverlayView: View {
                         .transition(.opacity)
                 }
                 if let image = player.state.currentSubtitleImage {
-                    bitmapSubtitle(image, in: geo)
+                    bitmapSubtitle(image, rect: player.state.currentSubtitleImageRect, in: geo)
+                        .transition(.opacity)
                 }
             }
         }
         .allowsHitTesting(false)
         .animation(.easeInOut(duration: 0.12), value: player.state.currentSubtitleText)
+        .animation(.easeInOut(duration: 0.12), value: player.state.currentSubtitleImage != nil)
     }
 
     private func textSubtitle(_ text: String) -> some View {
@@ -43,8 +45,8 @@ public struct SubtitleOverlayView: View {
             .padding(.bottom, 60)
     }
 
-    private func bitmapSubtitle(_ image: CGImage, in geo: GeometryProxy) -> some View {
-        let r = player.state.currentSubtitleImageRect
+    private func bitmapSubtitle(_ image: CGImage, rect: CGRect, in geo: GeometryProxy) -> some View {
+        let r = rect
         let frame = CGRect(
             x: r.origin.x * geo.size.width,
             y: r.origin.y * geo.size.height,
