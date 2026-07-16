@@ -134,6 +134,8 @@ public final class NativeBackend: PlayerBackend {
     private nonisolated(unsafe) var totalBytesRead: Int64 = 0
     private nonisolated(unsafe) var lastBytesLogged: Int64 = 0
     private nonisolated(unsafe) var lastThroughputTime: Double = 0
+    /// Highest PTS (seconds) of packets read by the demux loop — used to compute bufferedDuration.
+    private nonisolated(unsafe) var maxDownloadedPts: Double = 0
 
     /// Default init: ASBDLRenderer + AudioUnitOutput (PCM).
     public convenience init() throws {
@@ -599,6 +601,8 @@ public final class NativeBackend: PlayerBackend {
                 if streamIndex == demuxer.videoStreamIndex {
                     let rawPTS = Self.ptsFromPacket(packet, demuxer: demuxer)
                     let pts = ptsValidator.validate(rawPTS)
+                    // Track download progress (highest video PTS read so far)
+                    if rawPTS.isFinite && rawPTS > maxDownloadedPts { maxDownloadedPts = rawPTS }
                     if packetCount < 5 || (packetCount % 500 == 0) {
                         logger.debug("pkt#\(packetCount) rawPTS=\(String(format:"%.3f",rawPTS)) pts=\(String(format:"%.3f",pts)) audio=\(String(format:"%.3f",clock.audioTime))")
                     }
@@ -924,6 +928,15 @@ public final class NativeBackend: PlayerBackend {
         state.position = posDur
         if posDur > state.duration { state.duration = posDur }
 
+        // Update bufferedDuration: how far ahead the demux has read vs current position
+        let downloaded = maxDownloadedPts
+        if downloaded > Double(posDur.components.seconds) {
+            let bufferedSecs = downloaded - Double(posDur.components.seconds)
+            state.bufferedDuration = .milliseconds(Int64(bufferedSecs * 1000))
+        } else {
+            state.bufferedDuration = .zero
+        }
+
         // Update active subtitle text. Only notify when the text actually changes
         // to avoid redundant view invalidations on every frame.
         let activeSub: String? = subtitleLock.withLock {
@@ -1028,6 +1041,8 @@ public final class NativeBackend: PlayerBackend {
         audioUnitOutput?.start(sampleRate: sr, channels: ch)
         // Pause until jitterBuffer has enough video — same as initial play().
         audioUnitOutput?.pause()
+        // Reset download tracking for the new seek position
+        maxDownloadedPts = secs
         // Signal displayNextFrame to calibrate audioClock to actual I-frame PTS.
         // FFmpeg seek lands on the GOP boundary before secs, so audioClock(=secs)
         // would be ahead of the first decoded frame; without re-calibration the
@@ -1059,6 +1074,7 @@ public final class NativeBackend: PlayerBackend {
                            // flips opacity back to 1 on first frame)
         displayedVideoFrames = 0
         totalBytesRead = 0; lastBytesLogged = 0; lastThroughputTime = 0
+        maxDownloadedPts = 0
         subtitleLock.withLock { subtitleCues.removeAll() }
         lastSubtitleText = nil
         subtitleImageLock.withLock { subtitleImageCues.removeAll() }
