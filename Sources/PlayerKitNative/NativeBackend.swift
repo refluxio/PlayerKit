@@ -1135,6 +1135,8 @@ public final class NativeBackend: PlayerBackend {
         demuxLock.unlock()
 
         // Discard cues from the previous track.
+        let hadText = state.currentSubtitleText != nil
+        let hadImage = state.currentSubtitleImage != nil
         subtitleLock.withLock { subtitleCues.removeAll() }
         subtitleImageLock.withLock { subtitleImageCues.removeAll() }
         lastSubtitleImage = nil
@@ -1142,9 +1144,9 @@ public final class NativeBackend: PlayerBackend {
         state.currentSubtitleImageRect = .zero
 
         lastSubtitleText = nil
+        state.currentSubtitleText = nil
         state.selectedSubtitleTrackId = trackId
-        if state.currentSubtitleText != nil {
-            state.currentSubtitleText = nil
+        if hadText || hadImage {
             notifyStateChange()
         }
 

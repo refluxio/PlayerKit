@@ -91,7 +91,8 @@ final class FFmpegSubtitleDecoder: @unchecked Sendable {
         let nopts = Int64(bitPattern: 0x8000000000000000)
         guard packet.pointee.pts != nopts else { return nil }
 
-        let startPts = Double(packet.pointee.pts) * tbSecs
+        let packetPts = Double(packet.pointee.pts) * tbSecs
+        let startPts = packetPts + Double(sub.start_display_time) / 1000.0
         let endDisplayMs = Double(sub.end_display_time)
         let endPts: Double
         if endDisplayMs > 0 {

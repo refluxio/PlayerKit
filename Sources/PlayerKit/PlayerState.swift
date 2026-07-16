@@ -2,7 +2,9 @@ import Foundation
 import CoreGraphics
 
 /// Snapshot of current player state. Emitted on every change via onStateChange.
-public struct PlayerState: Sendable {
+// @unchecked Sendable: currentSubtitleImage (CGImage) is only written on the main actor
+// via NativeBackend.displayNextFrame / selectSubtitle, and read from SwiftUI body evaluation.
+public struct PlayerState: @unchecked Sendable {
     /// Whether media is actively playing (not paused).
     public var isPlaying:   Bool     = false
     /// Whether the player is currently buffering.

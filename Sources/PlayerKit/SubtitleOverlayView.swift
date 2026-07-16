@@ -46,12 +46,11 @@ public struct SubtitleOverlayView: View {
     }
 
     private func bitmapSubtitle(_ image: CGImage, rect: CGRect, in geo: GeometryProxy) -> some View {
-        let r = rect
         let frame = CGRect(
-            x: r.origin.x * geo.size.width,
-            y: r.origin.y * geo.size.height,
-            width: r.width * geo.size.width,
-            height: r.height * geo.size.height
+            x: rect.origin.x * geo.size.width,
+            y: rect.origin.y * geo.size.height,
+            width: rect.width * geo.size.width,
+            height: rect.height * geo.size.height
         )
         return Image(decorative: image, scale: 1)
             .resizable()
