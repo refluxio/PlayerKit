@@ -200,8 +200,22 @@ final class FFmpegDemuxer: @unchecked Sendable {
         // container header (CodecPrivate/SPS), not from probing packets — so
         // reducing these only affects framerate accuracy, not HDR detection.
         var opts: OpaquePointer?
-        av_dict_set(&opts, "analyzeduration", "5000000", 0)  // 5s
-        av_dict_set(&opts, "probesize", "5000000", 0)         // 5MB
+        // Reduce probe size for faster startup. Color metadata (color_trc,
+        // color_space, bits_per_raw_sample, profile) comes from the container
+        // header (CodecPrivate/SPS), not from probing packets. 1MB is enough
+        // to parse the first keyframe's SPS and estimate framerate.
+        av_dict_set(&opts, "analyzeduration", "1000000", 0)  // 1s
+        av_dict_set(&opts, "probesize", "1000000", 0)         // 1MB
+
+        // HTTP protocol options for network streams.
+        // seekable=1: force seekable connection so ffmpeg uses Range requests
+        // to find moov atom at file end instead of downloading the entire file.
+        // Without this, some CDN responses cause ffmpeg to fall back to linear
+        // read, which for moov-at-end MP4s means downloading gigabytes before
+        // the container can be parsed.
+        if !url.isFileURL {
+            av_dict_set(&opts, "seekable", "1", 0)
+        }
 
         if !headers.isEmpty {
             let dict = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
