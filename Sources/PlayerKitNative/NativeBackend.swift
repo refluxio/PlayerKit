@@ -217,7 +217,7 @@ public final class NativeBackend: PlayerBackend {
         notifyStateChange()
 
         let t0 = Date()
-        logger.notice("play (custom I/O reader) at \(t0.timeIntervalSince1970, privacy: .public)")
+        logger.notice("play (custom I/O reader)")
 
         playGeneration += 1
         let gen = playGeneration
@@ -229,7 +229,7 @@ public final class NativeBackend: PlayerBackend {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let t1 = Date()
-            logger.notice("GCD block started, delay=\(String(format: "%.0f", t1.timeIntervalSince(t0) * 1000))ms")
+            logger.info("GCD block started, delay=\(String(format: "%.0f", t1.timeIntervalSince(t0) * 1000))ms")
 
             let demuxer = FFmpegDemuxer()
             do {
@@ -247,15 +247,13 @@ public final class NativeBackend: PlayerBackend {
                 return
             }
             let t2 = Date()
-            logger.notice("demuxer.open done in \(String(format: "%.0f", t2.timeIntervalSince(t1) * 1000))ms")
+            logger.info("demuxer.open done in \(String(format: "%.0f", t2.timeIntervalSince(t1) * 1000))ms")
 
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.playGeneration == gen else {
                     demuxer.close()
                     return
                 }
-                let t3 = Date()
-                logger.notice("main.async delay=\(String(format: "%.0f", t3.timeIntervalSince(t2) * 1000))ms")
                 self._finishOpen(demuxer: demuxer, url: URL(string: "custom-io://reader")!,
                                  headers: [:], seekTo: seekTo, knownDuration: knownDuration)
             }
