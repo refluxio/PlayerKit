@@ -204,10 +204,10 @@ final class FFmpegDemuxer: @unchecked Sendable {
         var opts: OpaquePointer?
         // Reduce probe size for faster startup. Color metadata (color_trc,
         // color_space, bits_per_raw_sample, profile) comes from the container
-        // header (CodecPrivate/SPS), not from probing packets. 1MB is enough
+        // header (CodecPrivate/SPS), not from probing packets. 256KB is enough
         // to parse the first keyframe's SPS and estimate framerate.
-        av_dict_set(&opts, "analyzeduration", "1000000", 0)  // 1s
-        av_dict_set(&opts, "probesize", "1000000", 0)         // 1MB
+        av_dict_set(&opts, "analyzeduration", "500000", 0)   // 0.5s
+        av_dict_set(&opts, "probesize", "262144", 0)          // 256KB
 
         // HTTP protocol options for network streams.
         // seekable=1: force seekable connection so ffmpeg uses Range requests
@@ -270,8 +270,8 @@ final class FFmpegDemuxer: @unchecked Sendable {
         ctx.pointee.flags |= 0x0080  // AVFMT_FLAG_CUSTOM_IO
 
         var opts: OpaquePointer?
-        av_dict_set(&opts, "analyzeduration", "1000000", 0)
-        av_dict_set(&opts, "probesize", "1000000", 0)
+        av_dict_set(&opts, "analyzeduration", "500000", 0)
+        av_dict_set(&opts, "probesize", "262144", 0)
 
         logger.info("opening via custom I/O reader")
 
