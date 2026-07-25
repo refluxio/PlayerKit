@@ -204,7 +204,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
         av_dict_set(&opts, "probesize", "5000000", 0)         // 5MB
 
         if !headers.isEmpty {
-            let dict = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n")
+            let dict = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
             av_dict_set(&opts, "headers", dict, 0)
         }
 
@@ -292,16 +292,26 @@ final class FFmpegDemuxer: @unchecked Sendable {
         // this does not block the UI.  Uses a single Range request on the existing
         // HTTP connection; no second 115 session is opened.
         //
-        // Skipped when the caller already has a known duration (from Jellyfin API
-        // metadata) — saves 2-3 HTTP round-trips to the CDN (seek-to-end → read
-        // packets → seek-back), which can add seconds on high-latency 115 links.
-        if !skipDurationProbe {
+        // Skipped when:
+        // - The caller already has a known duration (from Jellyfin API metadata)
+        // - The URL is a network stream AND the container already reports a valid
+        //   duration. For remote files (especially 4K HEVC on CDNs with moov at
+        //   the end), seekRefine requires 2-3 extra HTTP round-trips (seek-to-end
+        //   → read packets → seek-back) that can add 5-15s of latency. The container
+        //   duration from the moov atom is accurate enough for playback; the small
+        //   refinement (fixing placeholder durations) is not worth the wait.
+        let isNetwork = !url.isFileURL
+        if !skipDurationProbe && !(isNetwork && containerDur > 0) {
             duration = seekRefine(ctx: ctx, hint: duration)
             if duration != containerDur {
                 logger.info("duration refined: \(String(format: "%.1f", containerDur))s → \(String(format: "%.1f", self.duration))s")
             }
         } else {
-            logger.info("duration probe skipped (knownDuration provided)")
+            if skipDurationProbe {
+                logger.info("duration probe skipped (knownDuration provided)")
+            } else {
+                logger.info("duration probe skipped (network stream with container duration=\(String(format: "%.1f", containerDur))s)")
+            }
         }
         logger.info("videoIdx=\(self.videoStreamIndex) audioIdx=\(self.audioStreamIndex) duration=\(String(format: "%.1f", self.duration))s")
     }
@@ -363,7 +373,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
         av_dict_set(&opts, "analyzeduration", "0", 0)
         av_dict_set(&opts, "probesize", "65536", 0) // 64KB — enough to parse container header
         if !headers.isEmpty {
-            let dict = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n")
+            let dict = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
             av_dict_set(&opts, "headers", dict, 0)
         }
         guard avformat_open_input(&probeCtx, url.isFileURL ? url.path : url.absoluteString, nil, &opts) == 0 else {
