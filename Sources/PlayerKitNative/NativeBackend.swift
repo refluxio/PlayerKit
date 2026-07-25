@@ -208,6 +208,46 @@ public final class NativeBackend: PlayerBackend {
         }
     }
 
+    public func play(reader: any MediaRandomAccessReader,
+                     seekTo: Duration?,
+                     knownDuration: Duration? = nil) {
+        stop()
+        state = PlayerState()
+        state.isBuffering = true
+        notifyStateChange()
+
+        logger.notice("play (custom I/O reader)")
+
+        playGeneration += 1
+        let gen = playGeneration
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let demuxer = FFmpegDemuxer()
+            do {
+                try demuxer.open(reader: reader,
+                                 skipDurationProbe: knownDuration != nil)
+            } catch {
+                logger.error("demuxer.open (reader) FAILED: \(error)")
+                let msg = (error as? CustomStringConvertible)?.description
+                    ?? String(describing: error)
+                await MainActor.run { [weak self] in
+                    guard let self, self.playGeneration == gen else { return }
+                    self.state.error = msg
+                    self.notifyStateChange()
+                }
+                return
+            }
+            await MainActor.run { [weak self] in
+                guard let self, self.playGeneration == gen else {
+                    demuxer.close()
+                    return
+                }
+                self._finishOpen(demuxer: demuxer, url: URL(string: "custom-io://reader")!,
+                                 headers: [:], seekTo: seekTo, knownDuration: knownDuration)
+            }
+        }
+    }
+
     private func _finishOpen(demuxer: FFmpegDemuxer, url: URL, headers: [String: String],
                               seekTo: Duration?, knownDuration: Duration?) {
         self.demuxer = demuxer

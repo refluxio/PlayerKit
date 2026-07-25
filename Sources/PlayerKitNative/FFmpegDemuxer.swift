@@ -1,6 +1,7 @@
 import Foundation
 import CoreMedia
 import CFFmpeg
+import PlayerKit
 import os
 
 private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "demuxer")
@@ -33,6 +34,7 @@ enum DemuxerError: Error, CustomStringConvertible {
 final class FFmpegDemuxer: @unchecked Sendable {
     private var formatCtx: UnsafeMutablePointer<AVFormatContext>?
     var formatContext: UnsafeMutablePointer<AVFormatContext>? { formatCtx }
+    private var avioBridge: AVIOBridge?
     private(set) var duration: Double = 0
 
     var videoStreamIndex: Int32 { videoStream.map { $0.pointee.index } ?? -1 }
@@ -249,6 +251,45 @@ final class FFmpegDemuxer: @unchecked Sendable {
         }
         logger.info("avformat_open_input OK")
 
+        try finishOpen(skipDurationProbe: skipDurationProbe, isNetwork: !url.isFileURL)
+    }
+
+    func open(reader: any MediaRandomAccessReader, skipDurationProbe: Bool = false) throws {
+        close()
+        formatCtx = avformat_alloc_context()
+        guard formatCtx != nil else { throw DemuxerError.openFailed(-1) }
+
+        let bridge = AVIOBridge(reader: reader)
+        guard let pb = bridge.createAVIOContext() else {
+            throw DemuxerError.openFailed(-1)
+        }
+        avioBridge = bridge
+
+        guard let ctx = formatCtx else { throw DemuxerError.openFailed(-1) }
+        ctx.pointee.pb = pb
+        ctx.pointee.flags |= 0x0080  // AVFMT_FLAG_CUSTOM_IO
+
+        var opts: OpaquePointer?
+        av_dict_set(&opts, "analyzeduration", "1000000", 0)
+        av_dict_set(&opts, "probesize", "1000000", 0)
+
+        logger.info("opening via custom I/O reader")
+
+        var localCtx = formatCtx
+        let ret = avformat_open_input(&localCtx, nil, nil, &opts)
+        formatCtx = localCtx
+        av_dict_free(&opts)
+
+        guard ret == 0 else {
+            logger.error("avformat_open_input (custom IO) FAILED, ret=\(ret)")
+            throw DemuxerError.openFailed(ret)
+        }
+        logger.info("avformat_open_input OK (custom IO)")
+
+        try finishOpen(skipDurationProbe: skipDurationProbe, isNetwork: true)
+    }
+
+    private func finishOpen(skipDurationProbe: Bool, isNetwork: Bool) throws {
         let infoRet = avformat_find_stream_info(formatCtx, nil)
         guard infoRet >= 0 else {
             logger.error("avformat_find_stream_info FAILED, ret=\(infoRet)")
@@ -314,7 +355,6 @@ final class FFmpegDemuxer: @unchecked Sendable {
         //   → read packets → seek-back) that can add 5-15s of latency. The container
         //   duration from the moov atom is accurate enough for playback; the small
         //   refinement (fixing placeholder durations) is not worth the wait.
-        let isNetwork = !url.isFileURL
         if !skipDurationProbe && !(isNetwork && containerDur > 0) {
             duration = seekRefine(ctx: ctx, hint: duration)
             if duration != containerDur {
@@ -436,6 +476,8 @@ final class FFmpegDemuxer: @unchecked Sendable {
             avformat_close_input(&formatCtx)
             formatCtx = nil
         }
+        avioBridge?.free()
+        avioBridge = nil
         videoStream = nil
         audioStream = nil
         audioStreamScore = 0
