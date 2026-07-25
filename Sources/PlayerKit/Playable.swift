@@ -17,6 +17,17 @@ public protocol Playable: AnyObject {
     ///   - knownDuration: Pre-known duration, skips probe if non-nil.
     func play(url: URL, headers: [String: String], seekTo: Duration?, knownDuration: Duration?)
 
+    /// Start playback using a custom I/O reader instead of a URL.
+    /// The reader feeds bytes to ffmpeg via avio_alloc_context,
+    /// bypassing ffmpeg's built-in HTTP protocol layer.
+    /// - Parameters:
+    ///   - reader: Random-access byte stream reader.
+    ///   - seekTo: Optional start position.
+    ///   - knownDuration: Pre-known duration, skips probe if non-nil.
+    func play(reader: any MediaRandomAccessReader,
+              seekTo: Duration?,
+              knownDuration: Duration?)
+
     /// Pause playback. Call `resume()` to continue.
     func pause()
 

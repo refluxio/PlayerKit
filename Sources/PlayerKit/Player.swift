@@ -32,6 +32,13 @@ public final class Player {
         backend.play(url: url, headers: headers, seekTo: seekTo, knownDuration: knownDuration)
     }
 
+    /// Start playback using a custom I/O reader.
+    public func play(reader: any MediaRandomAccessReader,
+                     seekTo: Duration? = nil,
+                     knownDuration: Duration? = nil) {
+        backend.play(reader: reader, seekTo: seekTo, knownDuration: knownDuration)
+    }
+
     /// Pause playback. Call `resume()` to continue.
     public func pause()                        { backend.pause() }
 
