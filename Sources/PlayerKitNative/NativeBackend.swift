@@ -221,7 +221,12 @@ public final class NativeBackend: PlayerBackend {
         playGeneration += 1
         let gen = playGeneration
 
-        Task.detached(priority: .userInitiated) { [weak self] in
+        // Use GCD instead of Task.detached — Swift Concurrency's cooperative
+        // thread pool can be starved by other async work (auto-scan, keepalive),
+        // causing the demuxer open to be delayed 10-15s. GCD's dedicated thread
+        // pool is not affected by cooperative scheduling.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
             let demuxer = FFmpegDemuxer()
             do {
                 try demuxer.open(reader: reader,
@@ -230,14 +235,14 @@ public final class NativeBackend: PlayerBackend {
                 logger.error("demuxer.open (reader) FAILED: \(error)")
                 let msg = (error as? CustomStringConvertible)?.description
                     ?? String(describing: error)
-                await MainActor.run { [weak self] in
+                DispatchQueue.main.async { [weak self] in
                     guard let self, self.playGeneration == gen else { return }
                     self.state.error = msg
                     self.notifyStateChange()
                 }
                 return
             }
-            await MainActor.run { [weak self] in
+            DispatchQueue.main.async { [weak self] in
                 guard let self, self.playGeneration == gen else {
                     demuxer.close()
                     return
