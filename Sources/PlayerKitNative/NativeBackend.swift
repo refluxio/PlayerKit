@@ -262,6 +262,7 @@ public final class NativeBackend: PlayerBackend {
 
     private func _finishOpen(demuxer: FFmpegDemuxer, url: URL, headers: [String: String],
                               seekTo: Duration?, knownDuration: Duration?) {
+        let t0 = Date()
         self.demuxer = demuxer
         let demuxDur = demuxer.duration
         if let kd = knownDuration, kd > .zero {
@@ -360,6 +361,7 @@ public final class NativeBackend: PlayerBackend {
             let sar = demuxer.sampleAspectRatio
             let preference = rendererStrategy?.decoderPreference ?? .vtHW
             let isDoVi = demuxer.isDolbyVision
+            let tVDec = Date()
             switch preference {
             case .ffmpegSW:
                 if let dec = FFmpegVideoDecoder(stream: vs, forceSoftware: true, colorParams: colorParams) {
@@ -410,6 +412,7 @@ public final class NativeBackend: PlayerBackend {
                     logger.info("video: VT failed, FFmpeg fallback \(dec.width)x\(dec.height)\(sarStr) hw=\(dec.isHardware)")
                 }
             }
+            logger.info("video decoder init took \(String(format: "%.0f", Date().timeIntervalSince(tVDec) * 1000))ms")
         }
 
         // Populate state.videoInfo
@@ -561,6 +564,8 @@ public final class NativeBackend: PlayerBackend {
 
         state.isPlaying = true
         notifyStateChange()
+        let t1 = Date()
+        logger.info("_finishOpen done in \(String(format: "%.0f", t1.timeIntervalSince(t0) * 1000))ms")
 
         if let seekTo { seek(to: seekTo) }
     }
