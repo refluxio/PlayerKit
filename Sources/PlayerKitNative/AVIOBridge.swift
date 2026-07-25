@@ -28,12 +28,6 @@ final class AVIOBridge: @unchecked Sendable {
     /// Cached file size. Fetched on first AVSEEK_SIZE query.
     private var cachedSize: Int64 = -1
 
-    /// Semaphore for sync↔async bridge. C callback waits on this while
-    /// the detached Task runs the async reader method.
-    private let semaphore = DispatchSemaphore(value: 0)
-    private var asyncReadResult: Int = 0
-    private var asyncError: Error?
-
     init(reader: any MediaRandomAccessReader) {
         self.reader = reader
     }
@@ -105,49 +99,30 @@ final class AVIOBridge: @unchecked Sendable {
         return bridge.doSeek(offset: offset, whence: whence)
     }
 
-    // MARK: - Sync→Async Bridge
+    // MARK: - Sync calls (reader is synchronous, called directly from C callbacks)
 
     private func doRead(into buf: UnsafeMutablePointer<UInt8>, length: Int) -> Int32 {
-        asyncReadResult = 0
-        asyncError = nil
-
         let offset = currentOffset
         let bufferPtr = UnsafeMutableRawBufferPointer(start: buf, count: length)
-        let reader = self.reader
 
-        Task.detached { [weak self] in
-            do {
-                let n = try await reader.read(offset: offset, length: length, into: bufferPtr)
-                self?.asyncReadResult = n
-            } catch {
-                self?.asyncError = error
-            }
-            self?.semaphore.signal()
-        }
-        semaphore.wait()
-
-        if asyncError != nil {
+        do {
+            let n = try reader.read(offset: offset, length: length, into: bufferPtr)
+            currentOffset += Int64(n)
+            return Int32(n)
+        } catch {
             return -1  // AVERROR
         }
-        let n = asyncReadResult
-        currentOffset += Int64(n)
-        return Int32(n)
     }
 
     private func doSeek(offset: Int64, whence: Int32) -> Int64 {
         // AVSEEK_SIZE (0x10000): return total file size
         if whence == 0x10000 {
             if cachedSize < 0 {
-                let reader = self.reader
-                Task.detached { [weak self] in
-                    do {
-                        self?.cachedSize = try await reader.totalSize
-                    } catch {
-                        self?.cachedSize = -1
-                    }
-                    self?.semaphore.signal()
+                do {
+                    cachedSize = try reader.totalSize
+                } catch {
+                    cachedSize = -1
                 }
-                semaphore.wait()
             }
             return cachedSize
         }
