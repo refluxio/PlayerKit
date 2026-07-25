@@ -52,7 +52,6 @@ final class AVIOBridge: @unchecked Sendable {
         ) else {
             buf.deallocate()
             buffer = nil
-            selfPointer?.release()
             selfPointer = nil
             return nil
         }
@@ -72,7 +71,10 @@ final class AVIOBridge: @unchecked Sendable {
             ioContext = nil
             buffer = nil  // freed by avio_context_free
         }
-        selfPointer?.release()
+        // passUnretained does NOT increment the retain count, so we must NOT
+        // call release() here — doing so would over-release the AVIOBridge and
+        // cause EXC_BAD_ACCESS when the owning FFmpegDemuxer releases its strong
+        // reference. Just clear the pointer so no dangling C callback can fire.
         selfPointer = nil
         reader.close()
     }
