@@ -790,7 +790,15 @@ public final class NativeBackend: PlayerBackend {
         let tb = vs.pointee.time_base
         let nopts = Int64(bitPattern: 0x8000000000000000)
         guard tb.den > 0, packet.pointee.pts != nopts else { return .nan }
-        return Double(packet.pointee.pts) * Double(tb.num) / Double(tb.den)
+        let pts = Double(packet.pointee.pts) * Double(tb.num) / Double(tb.den)
+        // Subtract the stream's start_time so video PTS is relative to t=0.
+        // HEVC/MP4 often has a non-zero video start_time (e.g. 4096 ticks at 90000 Hz ≈ 46ms)
+        // while the audio stream starts at 0, causing persistent audio-ahead if uncorrected.
+        if vs.pointee.start_time != nopts {
+            let startOffset = Double(vs.pointee.start_time) * Double(tb.num) / Double(tb.den)
+            return pts - startOffset
+        }
+        return pts
     }
 
     /// Parse an ASS/SSA subtitle packet from MKV into a SubtitleCue.
