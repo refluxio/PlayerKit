@@ -28,6 +28,10 @@ final class AVIOBridge: @unchecked Sendable {
     /// Cached file size. Fetched on first AVSEEK_SIZE query.
     private var cachedSize: Int64 = -1
 
+    /// Highest byte offset available in the reader's internal buffer (for buffer bar).
+    var downloadedUpToOffset: Int64 { reader.downloadedUpToOffset }
+    var totalBytes: Int64 { cachedSize }
+
     init(reader: any MediaRandomAccessReader) {
         self.reader = reader
     }

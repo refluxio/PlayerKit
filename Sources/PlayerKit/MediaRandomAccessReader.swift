@@ -27,4 +27,13 @@ public protocol MediaRandomAccessReader: AnyObject, Sendable {
     /// Release resources (close connections, invalidate sessions).
     /// Called by the player when playback stops.
     func close()
+
+    /// Highest byte offset that has been downloaded and is available in the reader's
+    /// internal buffer. Used to compute the seek-bar buffer indicator.
+    /// Return -1 if unknown (default).
+    var downloadedUpToOffset: Int64 { get }
+}
+
+public extension MediaRandomAccessReader {
+    var downloadedUpToOffset: Int64 { -1 }
 }

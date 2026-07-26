@@ -39,6 +39,10 @@ final class FFmpegDemuxer: @unchecked Sendable {
 
     var videoStreamIndex: Int32 { videoStream.map { $0.pointee.index } ?? -1 }
     var audioStreamIndex: Int32 { audioStream.map { $0.pointee.index } ?? -1 }
+    /// Highest byte offset available in the reader's buffer. -1 if unknown (URL-based stream).
+    var downloadedUpToOffset: Int64 { avioBridge?.downloadedUpToOffset ?? -1 }
+    /// Total file size in bytes. -1 if unknown.
+    var totalFileBytes: Int64 { avioBridge?.totalBytes ?? -1 }
 
     /// Returns true if the current audio stream carries a passthrough-capable codec
     /// (AC3, E-AC3, DTS, TrueHD).

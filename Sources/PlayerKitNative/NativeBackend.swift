@@ -985,13 +985,25 @@ public final class NativeBackend: PlayerBackend {
         state.position = posDur
         if posDur > state.duration { state.duration = posDur }
 
-        // Update bufferedDuration: how far ahead the demux has read vs current position
-        let downloaded = maxDownloadedPts
-        if downloaded > Double(posDur.components.seconds) {
-            let bufferedSecs = downloaded - Double(posDur.components.seconds)
+        // Update bufferedDuration.
+        // Prefer reader-level download offset (reflects actual pre-fetched bytes, not just
+        // the demux-loop's throttled read position which is capped at ~2s).
+        let currentSecs = Double(posDur.components.seconds)
+        let dlOffset = demuxer?.downloadedUpToOffset ?? -1
+        let fileBytes = demuxer?.totalFileBytes ?? -1
+        if dlOffset > 0, fileBytes > 0, state.duration > .zero {
+            let dlFraction = min(1.0, Double(dlOffset) / Double(fileBytes))
+            let dlSecs = dlFraction * Double(state.duration.components.seconds)
+            let bufferedSecs = max(0, dlSecs - currentSecs)
             state.bufferedDuration = .milliseconds(Int64(bufferedSecs * 1000))
         } else {
-            state.bufferedDuration = .zero
+            // Fallback for URL-based streams without a custom reader.
+            let downloaded = maxDownloadedPts
+            if downloaded > currentSecs {
+                state.bufferedDuration = .milliseconds(Int64((downloaded - currentSecs) * 1000))
+            } else {
+                state.bufferedDuration = .zero
+            }
         }
 
         // Update active subtitle text. Only notify when the text actually changes
