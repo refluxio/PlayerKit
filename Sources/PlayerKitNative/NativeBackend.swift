@@ -579,7 +579,22 @@ public final class NativeBackend: PlayerBackend {
                 self._injectedAudioOutput?.pause()
                 self.state.isBuffering = true
             case .playing:
-                self.audioUnitOutput?.resume()
+                // Flush audio that accumulated during buffering. Without this, audio frames
+                // pile up in the paused AudioQueue (demux has no audio throttle and reads
+                // from cache at many ×real-time). On resume the accumulated frames drain
+                // immediately, advancing the audio clock far ahead of video — the skip-behind
+                // guard then dumps all video frames from the jitter buffer → stuck.
+                // Fix: stop (flush) the queue, reset the clock to the first buffered video
+                // frame, and start fresh with no accumulated debt.
+                if let dec = self.audioDecoder, let out = self.audioUnitOutput {
+                    let firstPts = self.jitterBuffer.peek(at: 0)?.pts ?? self.audioClock.audioTime
+                    out.stop()
+                    self.audioClock.reset(to: firstPts, sampleRate: dec.outputSampleRate)
+                    out.start(sampleRate: dec.outputSampleRate, channels: dec.outputChannels)
+                    self.needsClockCalibration = true
+                } else {
+                    self.audioUnitOutput?.resume()
+                }
                 self._injectedAudioOutput?.resume()
                 self.state.isBuffering = false
             }
