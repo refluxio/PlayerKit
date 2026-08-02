@@ -1258,6 +1258,11 @@ public final class NativeBackend: PlayerBackend {
                 }
                 break
             }
+            // Seek to current position so the demux loop re-reads subtitle packets
+            // from the current timestamp. Without this, packets read while no
+            // subtitle decoder was active are lost and the first cue after
+            // selection may not appear until the next subtitle event in the stream.
+            seek(to: state.position)
         }
     }
 
