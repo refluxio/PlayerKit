@@ -905,7 +905,7 @@ public final class NativeBackend: PlayerBackend {
         // would already be ahead and trigger skip-behind, dropping 5-10 frames
         // → the user-visible "1s 花屏/卡顿" right after seek.
         if needsClockCalibration, let firstFrame = jitterBuffer.peek(at: 0) {
-            audioClock.reset(to: firstFrame.pts, sampleRate: audioDecoder?.outputSampleRate ?? 44100)
+            audioClock.calibrate(to: firstFrame.pts, sampleRate: audioDecoder?.outputSampleRate ?? 44100)
         }
 
         // In passthrough mode AudioUnitOutput never runs so audioClock stays at 0.

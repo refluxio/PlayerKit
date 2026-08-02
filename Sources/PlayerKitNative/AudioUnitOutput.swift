@@ -23,6 +23,10 @@ public final class AudioUnitOutput: AudioOutputBackend {
     var bufferedFrameCount = 0
     private var running = false
     private var paused = false
+    /// How many primer-buffer callbacks have not yet fired. Guarded by lock.
+    /// Decremented in _callbackConsumed; used to route primer callbacks to
+    /// clock.advancePrimer() so _primerPendingSamples stays accurate.
+    private var pendingPrimerCallbacks: Int = 0
 
     public let supportsPassthrough: Bool = false
 
@@ -102,10 +106,12 @@ public final class AudioUnitOutput: AudioOutputBackend {
         }
 
         // Primer: 3 silence buffers to prevent initial underrun.
-        // primeDebt() cancels the clock offset they would otherwise introduce.
+        // startPrimer() creates a negative debt and records the pending count so
+        // AudioClock.calibrate() can re-apply the exact remaining debt after a
+        // position reset without losing the primer cancellation.
         let primerCount = 3
         let primerBytes = 4096
-        clock.primeDebt(bufferCount: primerCount, bytesPerBuffer: primerBytes, channels: ch)
+        clock.startPrimer(bufferCount: primerCount, bytesPerBuffer: primerBytes, channels: ch)
         for _ in 0..<primerCount {
             var buffer: AudioQueueBufferRef?
             AudioQueueAllocateBuffer(queue, UInt32(primerBytes), &buffer)
@@ -126,6 +132,7 @@ public final class AudioUnitOutput: AudioOutputBackend {
         paused = false
         enqueuedFrames = 0
         bufferedFrameCount = 0
+        pendingPrimerCallbacks = primerCount
         lock.unlock()
 
         logger.info("started: \(sr)Hz \(ch)ch")
@@ -146,6 +153,7 @@ public final class AudioUnitOutput: AudioOutputBackend {
         paused = false
         bufferedFrameCount = 0
         enqueuedFrames = 0
+        pendingPrimerCallbacks = 0
         lock.unlock()
         return (old, finalEnqueued)
     }
@@ -228,8 +236,16 @@ public final class AudioUnitOutput: AudioOutputBackend {
         lock.lock()
         if bufferedFrameCount > 0 { bufferedFrameCount &-= 1 }
         let ch = _channels
+        let isPrimer = pendingPrimerCallbacks > 0
+        if isPrimer { pendingPrimerCallbacks -= 1 }
         lock.unlock()
-        clock.advance(byteCount: byteCount, channels: ch)
+        // Route primer callbacks to advancePrimer() so _primerPendingSamples in
+        // AudioClock stays accurate for calibrate() after a position reset.
+        if isPrimer {
+            clock.advancePrimer(byteCount: byteCount, channels: ch)
+        } else {
+            clock.advance(byteCount: byteCount, channels: ch)
+        }
     }
 
     /// Proxy for clock.audioTime.
