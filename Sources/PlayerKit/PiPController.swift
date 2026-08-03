@@ -76,9 +76,7 @@ public class PiPController: NSObject {
     public var isActive: Bool { pipController.isPictureInPictureActive }
     public var isPossible: Bool { pipController.isPictureInPicturePossible }
 
-    public init?() {
-        guard AVPictureInPictureController.isPictureInPictureSupported() else { return nil }
-
+    public override init() {
         let layer = AVSampleBufferDisplayLayer()
         layer.videoGravity = .resizeAspect
         // Default 16:9; resized to actual video aspect ratio on first received frame.

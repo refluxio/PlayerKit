@@ -87,8 +87,10 @@ public final class Player {
     public private(set) var pipController: PiPController?
 
     private func setUpPiPController() {
-        guard #available(iOS 15.0, macOS 12.0, *) else { return }
-        guard let ctrl = PiPController() else { return }
+        guard #available(iOS 15.0, macOS 12.0, *),
+              AVPictureInPictureController.isPictureInPictureSupported()
+        else { return }
+        let ctrl = PiPController()
         pipController = ctrl
         // Register as frame sink so the PiP layer receives the same frames as the
         // main renderer.  The PiP layer is sized to the video's aspect ratio, which
