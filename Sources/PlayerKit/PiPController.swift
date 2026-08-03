@@ -80,6 +80,13 @@ public class PiPController: NSObject {
             playbackDelegate: delegate
         )
         pipController = AVPictureInPictureController(contentSource: source)
+        // Let the system decide when to start PiP (after the app is fully
+        // backgrounded and any rotation animation has settled). This is the
+        // standard approach — no need to call startPictureInPicture() manually
+        // from willResignActive, which races with orientation transitions.
+        if #available(iOS 14.2, macOS 11.0, *) {
+            pipController.canStartPictureInPictureAutomaticallyFromInline = true
+        }
         self.displayLayer = displayLayer
         super.init()
         let obs = PiPDelegateObserver(owner: self)
