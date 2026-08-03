@@ -91,15 +91,13 @@ public final class Player {
 
     private func setUpPiPController() {
         guard #available(iOS 15.0, macOS 12.0, *),
-              AVPictureInPictureController.isPictureInPictureSupported()
+              let asbdlRenderer = (backend as? any PlayerBackend)?.renderer as? ASBDLRenderer
         else { return }
-        let ctrl = PiPController()
-        pipController = ctrl
-        // Register as frame sink so the PiP layer receives the same frames as the
-        // main renderer.  The PiP layer is sized to the video's aspect ratio, which
-        // determines the PiP window size (the system uses layer bounds, not pixel
-        // buffer dimensions, to size the window).
-        addFrameSink(ctrl)
+        // Use the main display layer as the PiP content source.  It must be in the
+        // view hierarchy for pip.start() to succeed.  PlayerNativeView sizes the
+        // layer to the video's actual aspect-ratio rect (not full-screen), so the
+        // PiP window reflects the correct video proportions.
+        pipController = PiPController(displayLayer: asbdlRenderer.displayLayer)
     }
 
     // MARK: - Frame sinks (requires PlayerBackend)

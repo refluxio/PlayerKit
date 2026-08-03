@@ -96,13 +96,37 @@ public final class PlayerNativeViewiOS: UIView {
             layer.sublayers?.forEach { $0.removeFromSuperlayer() }
             layer.addSublayer(target)
         }
-        // Only set frame here; drawableSize is owned by MetalRenderer.display()
-        // (it syncs to the video source dimensions). contentsScale is owned by
-        // didMoveToWindow() — see comment there.
+        // Size the display layer to the video's actual aspect-ratio rect within the
+        // view bounds.  The parent view (black background) provides the letterbox/
+        // pillarbox bars.  This is essential for PiP: the PiP window size is
+        // determined by the content source layer's bounds, not the pixel buffer
+        // dimensions — using a full-screen layer causes the PiP window to appear
+        // the same size as the portrait device screen.
+        let frame = videoLayerFrame(in: bounds, videoInfo: player.state.videoInfo)
+        if let dl = target as? AVSampleBufferDisplayLayer {
+            // .resize fills the layer exactly when sized to the video rect;
+            // .resizeAspect is used as fallback (before video info is known).
+            dl.videoGravity = (frame == bounds) ? .resizeAspect : .resize
+        }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        target.frame = bounds
+        target.frame = frame
         CATransaction.commit()
+    }
+
+    private func videoLayerFrame(in bounds: CGRect, videoInfo: VideoInfo?) -> CGRect {
+        guard let info = videoInfo, info.width > 0, info.height > 0 else { return bounds }
+        let aspect = CGFloat(info.width) / CGFloat(info.height)
+        let boundsAspect = bounds.width / bounds.height
+        if aspect > boundsAspect {
+            // Letterbox: black bars top and bottom
+            let h = bounds.width / aspect
+            return CGRect(x: 0, y: (bounds.height - h) / 2, width: bounds.width, height: h)
+        } else {
+            // Pillarbox: black bars left and right
+            let w = bounds.height * aspect
+            return CGRect(x: (bounds.width - w) / 2, y: 0, width: w, height: bounds.height)
+        }
     }
 }
 
@@ -115,6 +139,13 @@ public struct PlayerNativeView: UIViewRepresentable {
         PlayerNativeViewiOS(player: player)
     }
 
-    public func updateUIView(_ uiView: PlayerNativeViewiOS, context: Context) {}
+    public func updateUIView(_ uiView: PlayerNativeViewiOS, context: Context) {
+        // Reading videoInfo here registers SwiftUI observation tracking.
+        // When videoInfo changes (video opens), SwiftUI re-calls updateUIView,
+        // which triggers setNeedsLayout so the display layer is resized to the
+        // correct video aspect ratio for PiP.
+        _ = player.state.videoInfo
+        uiView.setNeedsLayout()
+    }
 }
 #endif
