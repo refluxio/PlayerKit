@@ -34,6 +34,11 @@ final class AVIOBridge: @unchecked Sendable {
 
     init(reader: any MediaRandomAccessReader) {
         self.reader = reader
+        // Pre-populate from reader's known size so the buffer-progress indicator
+        // works when FFmpeg never issues AVSEEK_SIZE (common for MKV/MP4 streams
+        // that embed duration in container headers — FFmpeg skips the size query).
+        let known = reader.knownTotalBytes
+        if known > 0 { cachedSize = known }
     }
 
     /// Allocate an AVIOContext with read/seek callbacks.

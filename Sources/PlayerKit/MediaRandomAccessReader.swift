@@ -32,8 +32,16 @@ public protocol MediaRandomAccessReader: AnyObject, Sendable {
     /// internal buffer. Used to compute the seek-bar buffer indicator.
     /// Return -1 if unknown (default).
     var downloadedUpToOffset: Int64 { get }
+
+    /// Total byte count if already known at reader construction time (e.g. from
+    /// cloud-file metadata).  AVIOBridge uses this to pre-populate cachedSize so
+    /// the buffer-progress indicator works even when FFmpeg never issues AVSEEK_SIZE
+    /// (which happens for container formats that embed duration in their headers).
+    /// Return -1 if unknown (default).
+    var knownTotalBytes: Int64 { get }
 }
 
 public extension MediaRandomAccessReader {
     var downloadedUpToOffset: Int64 { -1 }
+    var knownTotalBytes: Int64 { -1 }
 }
