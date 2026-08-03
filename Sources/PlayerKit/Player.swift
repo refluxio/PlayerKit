@@ -87,10 +87,14 @@ public final class Player {
     public private(set) var pipController: PiPController?
 
     private func setUpPiPController() {
-        guard #available(iOS 15.0, macOS 12.0, *),
-              let asbdlRenderer = (backend as? any PlayerBackend)?.renderer as? ASBDLRenderer
-        else { return }
-        pipController = PiPController(displayLayer: asbdlRenderer.displayLayer)
+        guard #available(iOS 15.0, macOS 12.0, *) else { return }
+        guard let ctrl = PiPController() else { return }
+        pipController = ctrl
+        // Register as frame sink so the PiP layer receives the same frames as the
+        // main renderer.  The PiP layer is sized to the video's aspect ratio, which
+        // determines the PiP window size (the system uses layer bounds, not pixel
+        // buffer dimensions, to size the window).
+        addFrameSink(ctrl)
     }
 
     // MARK: - Frame sinks (requires PlayerBackend)
