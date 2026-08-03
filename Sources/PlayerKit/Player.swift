@@ -18,7 +18,15 @@ public final class Player {
     /// - Parameter backend: A Playable-compliant backend (NativeBackend or MPVBackend).
     public init(backend: any Playable) {
         self.backend = backend
-        backend.onStateChange = { [weak self] s in self?.state = s }
+        backend.onStateChange = { [weak self] s in
+            self?.state = s
+            if #available(iOS 15.0, macOS 12.0, *) {
+                if let info = s.videoInfo, info.width > 0, info.height > 0 {
+                    self?.pipController?.videoSize = CGSize(width: Double(info.width),
+                                                           height: Double(info.height))
+                }
+            }
+        }
         setUpPiPController()
     }
 

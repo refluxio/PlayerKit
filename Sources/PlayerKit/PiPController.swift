@@ -3,6 +3,7 @@ import AVKit
 #endif
 import AVFoundation
 import Foundation
+import QuartzCore
 
 /// A minimal playback delegate that keeps PiP from asking for playback control.
 @available(iOS 15.0, macOS 12.0, *)
@@ -64,6 +65,11 @@ public class PiPController: NSObject {
     /// Fired when PiP fails to start. Called on the main thread.
     public var onFailedToStart: ((Error) -> Void)?
 
+    /// Video's native dimensions. Set by Player when videoInfo becomes available.
+    /// Used to resize the display layer to the correct aspect ratio before starting PiP,
+    /// ensuring the PiP window reflects the video shape rather than the full-screen layer.
+    public var videoSize: CGSize?
+
     public var isActive: Bool { pipController.isPictureInPictureActive }
     public var isPossible: Bool { pipController.isPictureInPicturePossible }
 
@@ -83,7 +89,33 @@ public class PiPController: NSObject {
 
     public func start() {
         guard !isActive else { return }
+        resizeDisplayLayerForPiP()
         pipController.startPictureInPicture()
+    }
+
+    /// Resize the display layer to the video's actual aspect-ratio rect within its
+    /// superlayer. Called right before startPictureInPicture() so the PiP window
+    /// reads the correct bounds regardless of whether layoutSubviews() has run.
+    private func resizeDisplayLayerForPiP() {
+        guard let size = videoSize, size.width > 0, size.height > 0 else { return }
+        guard let superlayer = displayLayer.superlayer else { return }
+        let container = superlayer.bounds.size
+        guard container.width > 0, container.height > 0 else { return }
+        let aspect = size.width / size.height
+        let containerAspect = container.width / container.height
+        let frame: CGRect
+        if aspect > containerAspect {
+            let h = container.width / aspect
+            frame = CGRect(x: 0, y: (container.height - h) / 2, width: container.width, height: h)
+        } else {
+            let w = container.height * aspect
+            frame = CGRect(x: (container.width - w) / 2, y: 0, width: w, height: container.height)
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        displayLayer.frame = frame
+        displayLayer.videoGravity = .resize
+        CATransaction.commit()
     }
 
     public func stop() {
