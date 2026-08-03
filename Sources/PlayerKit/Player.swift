@@ -1,5 +1,8 @@
 import Foundation
 import QuartzCore
+#if canImport(AVKit)
+import AVKit
+#endif
 
 /// High-level player facade. Wraps a backend and exposes its state via @Observable.
 @Observable
