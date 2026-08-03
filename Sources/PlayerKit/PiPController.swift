@@ -75,14 +75,6 @@ public class PiPController: NSObject {
         delegateObserver = obs
     }
 
-    /// Set the video's native dimensions so the PiP window uses the correct
-    /// aspect ratio.  For sampleBufferDisplayLayer-based PiP the system cannot
-    /// derive this automatically — without it, the system falls back to the
-    /// display layer's full-screen bounds, producing an incorrectly sized window.
-    public func setPreferredContentSize(_ size: CGSize) {
-        pipController.preferredContentSize = size
-    }
-
     public func start() {
         guard !isActive else { return }
         pipController.startPictureInPicture()
