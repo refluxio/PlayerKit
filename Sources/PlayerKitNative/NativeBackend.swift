@@ -1095,7 +1095,16 @@ public final class NativeBackend: PlayerBackend {
         #if canImport(UIKit)
         try? AVAudioSession.sharedInstance().setActive(true)
         #endif
-        if jitterBuffer.state == .playing { audioUnitOutput?.resume() }
+        // Always resume audio output regardless of jitter buffer state.
+        // If the player was paused while the jitter buffer was in .buffering state,
+        // the conditional guard (state == .playing) would leave audio silently stopped.
+        // audioClock would stay frozen → demux backpressure (pts > audioPos+2.0) would
+        // never release → no new frames appended → no .buffering→.playing transition
+        // possible → permanent deadlock.  Resuming audio unconditionally lets audioClock
+        // advance, which unblocks the demux loop.  onStateChange(.buffering) will pause
+        // audio again if the buffer drains below minDuration, and onStateChange(.playing)
+        // will resume it; those two form the normal steady-state feedback loop.
+        audioUnitOutput?.resume()
         // Invalidate any existing display link before creating a new one.
         // Without this, calling resume() on an already-playing player (e.g. when
         // pip.start() was attempted but PiP never fully activated) would leave
