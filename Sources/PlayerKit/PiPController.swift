@@ -24,10 +24,31 @@ private class PiPPlaybackDelegate: NSObject, AVPictureInPictureSampleBufferPlayb
 }
 
 @available(iOS 15.0, macOS 12.0, *)
+private class PiPDelegateObserver: NSObject, AVPictureInPictureControllerDelegate {
+    weak var owner: PiPController?
+    init(owner: PiPController) { self.owner = owner }
+
+    func pictureInPictureControllerWillStartPictureInPicture(_ controller: AVPictureInPictureController) {
+        owner?.onStart?()
+    }
+
+    func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
+        owner?.onStop?()
+    }
+}
+
+@available(iOS 15.0, macOS 12.0, *)
 public class PiPController: NSObject {
     private let pipController: AVPictureInPictureController
     private let displayLayer: AVSampleBufferDisplayLayer
     private let delegate = PiPPlaybackDelegate()
+    private var delegateObserver: PiPDelegateObserver?
+
+    /// Fired when PiP stops (user dismisses PiP or system stops it).
+    /// Called on the main thread.
+    public var onStop: (() -> Void)?
+    /// Fired when PiP starts. Called on the main thread.
+    public var onStart: (() -> Void)?
 
     public var isActive: Bool { pipController.isPictureInPictureActive }
     public var isPossible: Bool { pipController.isPictureInPicturePossible }
@@ -40,6 +61,10 @@ public class PiPController: NSObject {
         )
         pipController = AVPictureInPictureController(contentSource: source)
         self.displayLayer = displayLayer
+        super.init()
+        let obs = PiPDelegateObserver(owner: self)
+        pipController.delegate = obs
+        delegateObserver = obs
     }
 
     public func start() {

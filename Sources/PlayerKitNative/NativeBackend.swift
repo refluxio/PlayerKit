@@ -577,13 +577,20 @@ public final class NativeBackend: PlayerBackend {
             case .buffering:
                 self.audioUnitOutput?.pause()
                 self._injectedAudioOutput?.pause()
-                self.state.isBuffering = true
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.state.isBuffering = true
+                    self.notifyStateChange()
+                }
             case .playing:
                 self.audioUnitOutput?.resume()
                 self._injectedAudioOutput?.resume()
-                self.state.isBuffering = false
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.state.isBuffering = false
+                    self.notifyStateChange()
+                }
             }
-            self.notifyStateChange()
         }
     }
 

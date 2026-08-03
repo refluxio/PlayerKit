@@ -12,7 +12,12 @@ final class VideoJitterBuffer: @unchecked Sendable {
 
     enum State: Equatable { case playing, buffering }
 
-    /// Called on the main thread when state transitions between .playing and .buffering.
+    /// Called synchronously when state transitions between .playing and
+    /// .buffering. Fires on the demux thread (append) or main thread (pop),
+    /// so the handler must be thread-safe. This is intentional: audio
+    /// pause/resume must happen synchronously to avoid races where the
+    /// AudioQueue keeps consuming buffers between the state flip and an
+    /// async dispatch.
     var onStateChange: ((State) -> Void)?
 
     let minDuration: Double = 0.5     // 低于此值 → buffering
@@ -66,7 +71,7 @@ final class VideoJitterBuffer: @unchecked Sendable {
         lock.unlock()
 
         if let s = newState {
-            DispatchQueue.main.async { [weak self] in self?.onStateChange?(s) }
+            onStateChange?(s)
         }
     }
 
@@ -92,7 +97,7 @@ final class VideoJitterBuffer: @unchecked Sendable {
         lock.unlock()
 
         if let s = newState {
-            DispatchQueue.main.async { [weak self] in self?.onStateChange?(s) }
+            onStateChange?(s)
         }
         return popped
     }
