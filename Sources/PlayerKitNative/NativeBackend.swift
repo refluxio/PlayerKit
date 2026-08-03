@@ -1083,6 +1083,16 @@ public final class NativeBackend: PlayerBackend {
     public func resume() {
         logger.info("resume")
         if jitterBuffer.state == .playing { audioUnitOutput?.resume() }
+        // Invalidate any existing display link before creating a new one.
+        // Without this, calling resume() on an already-playing player (e.g. when
+        // pip.start() was attempted but PiP never fully activated) would leave
+        // the old link running and add a second one — both pop frames, draining
+        // the jitter buffer at 2× speed → stuck.
+        displayLink?.invalidate()
+        displayLink = nil
+        #if os(iOS)
+        displayLinkProxy = nil
+        #endif
         startDisplayLink()
         state.isPlaying = true; notifyStateChange()
     }
