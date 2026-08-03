@@ -1089,6 +1089,12 @@ public final class NativeBackend: PlayerBackend {
 
     public func resume() {
         logger.info("resume")
+        // Re-activate the AudioSession.  After a background/PiP transition iOS may
+        // deactivate the session, which silently prevents AudioQueue callbacks
+        // from firing — the audio clock freezes and A/V sync stalls.
+        #if canImport(UIKit)
+        try? AVAudioSession.sharedInstance().setActive(true)
+        #endif
         if jitterBuffer.state == .playing { audioUnitOutput?.resume() }
         // Invalidate any existing display link before creating a new one.
         // Without this, calling resume() on an already-playing player (e.g. when
