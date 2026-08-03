@@ -32,8 +32,16 @@ private class PiPDelegateObserver: NSObject, AVPictureInPictureControllerDelegat
         owner?.onStart?()
     }
 
+    func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
+        owner?.onStart?()
+    }
+
     func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
         owner?.onStop?()
+    }
+
+    func pictureInPictureController(_ controller: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
+        owner?.onFailedToStart?(error)
     }
 }
 
@@ -49,6 +57,8 @@ public class PiPController: NSObject {
     public var onStop: (() -> Void)?
     /// Fired when PiP starts. Called on the main thread.
     public var onStart: (() -> Void)?
+    /// Fired when PiP fails to start. Called on the main thread.
+    public var onFailedToStart: ((Error) -> Void)?
 
     public var isActive: Bool { pipController.isPictureInPictureActive }
     public var isPossible: Bool { pipController.isPictureInPicturePossible }
