@@ -211,6 +211,18 @@ public final class AudioUnitOutput: AudioOutputBackend {
             lock.unlock()
             return
         }
+        // Drop frames when the queue is paused and has accumulated too much audio.
+        // The demux has no audio throttle and reads from cache at many ×real-time,
+        // so without this cap the AudioQueue accumulates minutes of audio while
+        // buffering. When resume() is called, all frames drain at real-time,
+        // advancing the audio clock far ahead of video — the skip-behind guard
+        // then dumps all video frames from the jitter buffer → stuck.
+        // 60 frames ≈ 2s matches the demux's 2s video read-ahead throttle, so
+        // the clock jump on resume is within the range the demux can cover.
+        if paused, bufferedFrameCount >= 60 {
+            lock.unlock()
+            return
+        }
         var buffer: AudioQueueBufferRef?
         let rc = AudioQueueAllocateBuffer(queue, UInt32(frame.data.count), &buffer)
         guard rc == noErr, let buf = buffer else {
