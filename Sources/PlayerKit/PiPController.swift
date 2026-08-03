@@ -28,9 +28,7 @@ private class PiPDelegateObserver: NSObject, AVPictureInPictureControllerDelegat
     weak var owner: PiPController?
     init(owner: PiPController) { self.owner = owner }
 
-    func pictureInPictureControllerWillStartPictureInPicture(_ controller: AVPictureInPictureController) {
-        owner?.onStart?()
-    }
+    func pictureInPictureControllerWillStartPictureInPicture(_ controller: AVPictureInPictureController) {}
 
     func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
         owner?.onStart?()
@@ -75,6 +73,14 @@ public class PiPController: NSObject {
         let obs = PiPDelegateObserver(owner: self)
         pipController.delegate = obs
         delegateObserver = obs
+    }
+
+    /// Set the video's native dimensions so the PiP window uses the correct
+    /// aspect ratio.  For sampleBufferDisplayLayer-based PiP the system cannot
+    /// derive this automatically — without it, the system falls back to the
+    /// display layer's full-screen bounds, producing an incorrectly sized window.
+    public func setPreferredContentSize(_ size: CGSize) {
+        pipController.preferredContentSize = size
     }
 
     public func start() {
