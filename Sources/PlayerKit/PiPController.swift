@@ -70,6 +70,14 @@ public class PiPController: NSObject {
         pipController = AVPictureInPictureController(contentSource: source)
         self.displayLayer = displayLayer
         super.init()
+        // Let the system start PiP automatically when the app backgrounds,
+        // instead of calling startPictureInPicture() manually from lifecycle
+        // notifications.  This gives the system-standard shrink animation from
+        // the view's actual on-screen position rather than from the full-screen
+        // layer bounds, which was causing the PiP window to appear too large.
+        #if os(iOS)
+        pipController.canStartPictureInPictureAutomaticallyFromInline = true
+        #endif
         let obs = PiPDelegateObserver(owner: self)
         pipController.delegate = obs
         delegateObserver = obs
