@@ -899,7 +899,7 @@ public final class NativeBackend: PlayerBackend {
     /// The Text field (index 8) may contain ASS override tags ({...}) and hardcoded
     /// line-break sequences (\N / \n). We strip tags and convert breaks to newlines.
     /// Timing comes from packet.pts/duration scaled by the subtitle stream timebase.
-    private static func parseASSCue(
+    private nonisolated static func parseASSCue(
         packet: UnsafeMutablePointer<AVPacket>,
         stream: UnsafeMutablePointer<AVStream>?
     ) -> SubtitleCue? {
@@ -943,7 +943,7 @@ public final class NativeBackend: PlayerBackend {
     /// Parse a SubRip (SRT) subtitle packet from an MKV container.
     /// MKV stores SRT as raw text in packet data with timing from PTS/duration.
     /// Strips HTML-like tags (<i>, <b>, <font ...>) commonly found in SRT files.
-    private static func parseSRTCue(
+    private nonisolated static func parseSRTCue(
         packet: UnsafeMutablePointer<AVPacket>,
         stream: UnsafeMutablePointer<AVStream>?
     ) -> SubtitleCue? {
@@ -976,7 +976,7 @@ public final class NativeBackend: PlayerBackend {
 
     /// Parse a WebVTT subtitle packet (AV_CODEC_ID_WEBVTT) from an MKV container.
     /// The cue body may contain WebVTT inline tags (<b>, <i>, <c.class>, etc.); we strip them.
-    private static func parseWebVTTCue(
+    private nonisolated static func parseWebVTTCue(
         packet: UnsafeMutablePointer<AVPacket>,
         stream: UnsafeMutablePointer<AVStream>?
     ) -> SubtitleCue? {
@@ -1006,7 +1006,7 @@ public final class NativeBackend: PlayerBackend {
 
     /// Parse a QuickTime/MP4 timed-text packet (AV_CODEC_ID_MOV_TEXT).
     /// Packet layout: 2-byte big-endian text length, then UTF-8 text, then optional style boxes.
-    private static func parseMOVTextCue(
+    private nonisolated static func parseMOVTextCue(
         packet: UnsafeMutablePointer<AVPacket>,
         stream: UnsafeMutablePointer<AVStream>?
     ) -> SubtitleCue? {
