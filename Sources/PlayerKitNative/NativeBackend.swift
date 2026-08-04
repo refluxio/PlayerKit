@@ -110,6 +110,11 @@ public final class NativeBackend: PlayerBackend {
     private let seekLock = NSLock()
     // Guarded by seekLock — safe to access from any thread holding the lock.
     private nonisolated(unsafe) var seekSerial: Int64 = 0
+    /// Set true after seek()/play(), cleared on first frame render + audioClock advance.
+    /// While true, freeze-ahead guard is bypassed so primer callbacks have time to
+    /// fire and advance audioClock past 0 — without this, seek-to-0 freezes because
+    /// primer debt keeps audioClock at 0 while video PTS advances past the 60ms threshold.
+    private nonisolated(unsafe) var audioClockReady: Bool = false
     // demuxCancelled is read from DispatchQueue.global() under demuxLock.
     // Bool reads/writes are atomic on ARM64 in practice; nonisolated(unsafe) makes
     // that contract explicit for the compiler's concurrency checker.
@@ -637,6 +642,7 @@ public final class NativeBackend: PlayerBackend {
         // tick — same as post-seek calibration. Required for H.264 B-frame streams
         // whose PTS does not start at 0 (priming delay).
         needsClockCalibration = true
+        audioClockReady = false
 
         state.isPlaying = true
         notifyStateChange()
@@ -833,16 +839,27 @@ public final class NativeBackend: PlayerBackend {
                           demuxer.subtitleStreamIndex >= 0 {
                     let stream = demuxer.subtitleStream
                     let codecId = stream?.pointee.codecpar.pointee.codec_id
+                    let codecName = codecId.map { String(cString: avcodec_get_name($0)) } ?? "nil"
                     if codecId == AV_CODEC_ID_ASS || codecId == AV_CODEC_ID_SSA {
                         let cue = Self.parseASSCue(packet: packet, stream: stream)
                         dLock.unlock()
-                        if let cue { self.subtitleLock.withLock { self.subtitleCues.append(cue) } }
+                        if let cue {
+                            self.subtitleLock.withLock { self.subtitleCues.append(cue) }
+                            logger.debug("[sub] ASS cue appended: pts=\(String(format:"%.2f",cue.startPts))-\(String(format:"%.2f",cue.endPts)) text=\(cue.text.prefix(30))")
+                        } else {
+                            logger.warning("[sub] ASS parseASSCue returned nil (streamIdx=\(streamIndex))")
+                        }
                     } else if codecId == AV_CODEC_ID_SUBRIP || codecId == AV_CODEC_ID_TEXT {
                         // AV_CODEC_ID_TEXT carries raw UTF-8 with no HTML tags; routing here is safe
                         // since the HTML-strip regex is a no-op when no tags are present.
                         let cue = Self.parseSRTCue(packet: packet, stream: stream)
                         dLock.unlock()
-                        if let cue { self.subtitleLock.withLock { self.subtitleCues.append(cue) } }
+                        if let cue {
+                            self.subtitleLock.withLock { self.subtitleCues.append(cue) }
+                            logger.debug("[sub] SRT cue appended: pts=\(String(format:"%.2f",cue.startPts))-\(String(format:"%.2f",cue.endPts))")
+                        } else {
+                            logger.warning("[sub] SRT parseSRTCue returned nil")
+                        }
                     } else if codecId == AV_CODEC_ID_HDMV_PGS_SUBTITLE || codecId == AV_CODEC_ID_DVD_SUBTITLE {
                         let dec = self.subtitleDecoder
                         dLock.unlock()
@@ -853,16 +870,30 @@ public final class NativeBackend: PlayerBackend {
                                                      image: cue.image, rect: cue.rect)
                                 )
                             }
+                            logger.debug("[sub] PGS cue appended: pts=\(String(format:"%.2f",cue.startPts))-\(String(format:"%.2f",cue.endPts))")
+                        } else if dec == nil {
+                            logger.warning("[sub] PGS packet received but subtitleDecoder is nil")
                         }
                     } else if codecId == AV_CODEC_ID_WEBVTT {
                         let cue = Self.parseWebVTTCue(packet: packet, stream: stream)
                         dLock.unlock()
-                        if let cue { self.subtitleLock.withLock { self.subtitleCues.append(cue) } }
+                        if let cue {
+                            self.subtitleLock.withLock { self.subtitleCues.append(cue) }
+                            logger.debug("[sub] WebVTT cue appended: pts=\(String(format:"%.2f",cue.startPts))-\(String(format:"%.2f",cue.endPts))")
+                        } else {
+                            logger.warning("[sub] WebVTT parseWebVTTCue returned nil")
+                        }
                     } else if codecId == AV_CODEC_ID_MOV_TEXT {
                         let cue = Self.parseMOVTextCue(packet: packet, stream: stream)
                         dLock.unlock()
-                        if let cue { self.subtitleLock.withLock { self.subtitleCues.append(cue) } }
+                        if let cue {
+                            self.subtitleLock.withLock { self.subtitleCues.append(cue) }
+                            logger.debug("[sub] MOVText cue appended: pts=\(String(format:"%.2f",cue.startPts))-\(String(format:"%.2f",cue.endPts))")
+                        } else {
+                            logger.warning("[sub] MOVText parseMOVTextCue returned nil")
+                        }
                     } else {
+                        logger.warning("[sub] unsupported subtitle codec=\(codecName) streamIdx=\(streamIndex)")
                         dLock.unlock()
                     }
                 } else {
@@ -1088,7 +1119,7 @@ public final class NativeBackend: PlayerBackend {
         // until almost every frame triggers the guard → the user sees a frozen image.
         // Draining ALL stale frames in one pass keeps video locked to audio regardless
         // of the source→display ratio.
-        if syncController.hasDisplayedFrame, !needsClockCalibration {
+        if syncController.hasDisplayedFrame, !needsClockCalibration, audioClockReady {
             // Drain frames significantly behind audio
             while let lagging = jitterBuffer.peek(at: 0), lagging.pts < audioTime - 0.06 {
                 jitterBuffer.pop()
@@ -1103,17 +1134,33 @@ public final class NativeBackend: PlayerBackend {
             }
         }
 
+        // Detect when audioClock has started advancing (primer callbacks fired).
+        // Until then, bypass syncController timing and display frames as fast as
+        // they're decoded so video doesn't stall waiting for audio to catch up.
+        if !audioClockReady, audioTime > 0.001 {
+            audioClockReady = true
+        }
+
         guard let frame = jitterBuffer.peek(at: 0) else { return }
 
         let followingPTS = jitterBuffer.peek(at: 1)?.pts
 
-        let (shouldShow, delay) = syncController.check(
-            nextPTS: frame.pts,
-            followingPTS: followingPTS,
-            audioTime: audioTime,
-            now: now,
-            serial: serial
-        )
+        // Before audioClock starts advancing (primer pending), display frames
+        // at nominal rate without waiting for audio sync.  Without this the
+        // syncController sees video far ahead of audio(audio=0) and holds
+        // frames indefinitely → "首帧后不播放" bug.
+        let (shouldShow, delay): (Bool, Double)
+        if audioClockReady {
+            (shouldShow, delay) = syncController.check(
+                nextPTS: frame.pts,
+                followingPTS: followingPTS,
+                audioTime: audioTime,
+                now: now,
+                serial: serial
+            )
+        } else {
+            (shouldShow, delay) = (true, 0)
+        }
 
         guard shouldShow else {
             let pos = Duration.milliseconds(Int64(audioTime * 1000))
@@ -1204,7 +1251,9 @@ public final class NativeBackend: PlayerBackend {
         guard elapsed > 5.0 else { return }
         let fps = Double(framesSinceLastLog) / elapsed
         let diff = Int((pts - audioTime) * 1000)
-        logger.info("q=\(self.jitterBuffer.count) dur=\(Int(self.jitterBuffer.duration*1000))ms fps=\(String(format:"%.1f",fps)) diff=\(diff)ms a=\(String(format:"%.2f",audioTime))s v=\(String(format:"%.2f",pts))s buf=\(self.state.isBuffering)")
+        let subCueCount = subtitleLock.withLock { subtitleCues.count }
+        let subStreamIdx = demuxer?.subtitleStreamIndex ?? -1
+        logger.info("q=\(self.jitterBuffer.count) dur=\(Int(self.jitterBuffer.duration*1000))ms fps=\(String(format:"%.1f",fps)) diff=\(diff)ms a=\(String(format:"%.2f",audioTime))s v=\(String(format:"%.2f",pts))s buf=\(self.state.isBuffering) subStream=\(subStreamIdx) subCues=\(subCueCount)")
 
         // Throughput: bytes read since last sample / elapsed.
         let bytesDelta = totalBytesRead - lastBytesLogged
@@ -1305,6 +1354,7 @@ public final class NativeBackend: PlayerBackend {
         // would be ahead of the first decoded frame; without re-calibration the
         // display loop's skip-behind guard would drop the first few frames.
         needsClockCalibration = true
+        audioClockReady = false
     }
 
     public func stop() {
@@ -1401,11 +1451,29 @@ public final class NativeBackend: PlayerBackend {
         guard let demuxer else { return }
         let trackId = id.flatMap(Int.init)
 
+        // Log codec name of selected track for diagnostics
+        if let resolvedId = trackId, let fmtCtx = demuxer.formatContext {
+            let nb = Int(fmtCtx.pointee.nb_streams)
+            for i in 0..<nb {
+                guard let s = fmtCtx.pointee.streams[i],
+                      Int(s.pointee.index) == resolvedId else { continue }
+                let cp = s.pointee.codecpar.pointee
+                let codecName = cp.codec_id != AV_CODEC_ID_NONE
+                    ? String(cString: avcodec_get_name(cp.codec_id)) : "none"
+                logger.notice("[sub] selectSubtitle trackId=\(resolvedId) codec=\(codecName) tb=\(s.pointee.time_base.num)/\(s.pointee.time_base.den)")
+                break
+            }
+        } else {
+            logger.notice("[sub] selectSubtitle → disabled")
+        }
+
         // Switch subtitle stream under demuxLock so the demux loop sees the new
         // subtitleStreamIndex atomically with the next readPacket call.
         demuxLock.lock()
         demuxer.selectSubtitleStream(by: trackId)
+        let resolvedIdx = demuxer.subtitleStreamIndex
         demuxLock.unlock()
+        logger.notice("[sub] subtitleStreamIndex after select=\(resolvedIdx)")
 
         // Discard cues from the previous track.
         let hadText = state.currentSubtitleText != nil
@@ -1435,6 +1503,7 @@ public final class NativeBackend: PlayerBackend {
                         stream: s,
                         videoSize: CGSize(width: codedVideoWidth, height: codedVideoHeight)
                     )
+                    logger.notice("[sub] PGS/DVD decoder created: \(self.subtitleDecoder != nil ? "OK" : "FAILED")")
                 }
                 break
             }
