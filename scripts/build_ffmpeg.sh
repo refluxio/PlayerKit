@@ -94,6 +94,12 @@ CODEC_FLAGS=(
   --enable-decoder=mpeg4
   --enable-decoder=mpeg2video
 
+  # Subtitle decoders — bitmap-based (PGS/Blu-ray, VOBSUB/DVD).
+  # Text-based subtitles (ASS/SRT/WebVTT/MOV_TEXT) are parsed inline in
+  # NativeBackend without a decoder; only bitmap formats need avcodec_open2.
+  --enable-decoder=hdmv_pgs_subtitle
+  --enable-decoder=dvdsub
+
   # Demuxers
   --enable-demuxer=mov        # mp4/m4v/mov
   --enable-demuxer=matroska   # mkv/webm
