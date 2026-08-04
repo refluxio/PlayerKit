@@ -97,7 +97,8 @@ CODEC_FLAGS=(
   # Subtitle decoders — bitmap-based (PGS/Blu-ray, VOBSUB/DVD).
   # Text-based subtitles (ASS/SRT/WebVTT/MOV_TEXT) are parsed inline in
   # NativeBackend without a decoder; only bitmap formats need avcodec_open2.
-  --enable-decoder=hdmv_pgs_subtitle
+  # Note: FFmpeg configure name for HDMV PGS is "pgssub", not "hdmv_pgs_subtitle".
+  --enable-decoder=pgssub
   --enable-decoder=dvdsub
 
   # Demuxers
