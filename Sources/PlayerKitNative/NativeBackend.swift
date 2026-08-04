@@ -854,6 +854,14 @@ public final class NativeBackend: PlayerBackend {
                                 )
                             }
                         }
+                    } else if codecId == AV_CODEC_ID_WEBVTT {
+                        let cue = Self.parseWebVTTCue(packet: packet, stream: stream)
+                        dLock.unlock()
+                        if let cue { self.subtitleLock.withLock { self.subtitleCues.append(cue) } }
+                    } else if codecId == AV_CODEC_ID_MOV_TEXT {
+                        let cue = Self.parseMOVTextCue(packet: packet, stream: stream)
+                        dLock.unlock()
+                        if let cue { self.subtitleLock.withLock { self.subtitleCues.append(cue) } }
                     } else {
                         dLock.unlock()
                     }
@@ -948,6 +956,69 @@ public final class NativeBackend: PlayerBackend {
 
         guard var text = String(bytes: UnsafeBufferPointer(start: rawPtr,
                                                             count: Int(packet.pointee.size)),
+                                encoding: .utf8) else { return nil }
+        text = text.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+
+        let tb = stream.pointee.time_base
+        guard tb.den > 0 else { return nil }
+        let tbSecs = Double(tb.num) / Double(tb.den)
+        let nopts = Int64(bitPattern: 0x8000000000000000)
+        guard packet.pointee.pts != nopts else { return nil }
+
+        let startPts = Double(packet.pointee.pts) * tbSecs
+        let dur = packet.pointee.duration > 0
+            ? Double(packet.pointee.duration) * tbSecs
+            : 5.0
+        return SubtitleCue(startPts: startPts, endPts: startPts + dur, text: text)
+    }
+
+    /// Parse a WebVTT subtitle packet (AV_CODEC_ID_WEBVTT) from an MKV container.
+    /// The cue body may contain WebVTT inline tags (<b>, <i>, <c.class>, etc.); we strip them.
+    private static func parseWebVTTCue(
+        packet: UnsafeMutablePointer<AVPacket>,
+        stream: UnsafeMutablePointer<AVStream>?
+    ) -> SubtitleCue? {
+        guard let stream,
+              packet.pointee.size > 0,
+              let rawPtr = packet.pointee.data else { return nil }
+
+        guard var text = String(bytes: UnsafeBufferPointer(start: rawPtr,
+                                                            count: Int(packet.pointee.size)),
+                                encoding: .utf8) else { return nil }
+        text = text.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+
+        let tb = stream.pointee.time_base
+        guard tb.den > 0 else { return nil }
+        let tbSecs = Double(tb.num) / Double(tb.den)
+        let nopts = Int64(bitPattern: 0x8000000000000000)
+        guard packet.pointee.pts != nopts else { return nil }
+
+        let startPts = Double(packet.pointee.pts) * tbSecs
+        let dur = packet.pointee.duration > 0
+            ? Double(packet.pointee.duration) * tbSecs
+            : 5.0
+        return SubtitleCue(startPts: startPts, endPts: startPts + dur, text: text)
+    }
+
+    /// Parse a QuickTime/MP4 timed-text packet (AV_CODEC_ID_MOV_TEXT).
+    /// Packet layout: 2-byte big-endian text length, then UTF-8 text, then optional style boxes.
+    private static func parseMOVTextCue(
+        packet: UnsafeMutablePointer<AVPacket>,
+        stream: UnsafeMutablePointer<AVStream>?
+    ) -> SubtitleCue? {
+        guard let stream,
+              packet.pointee.size > 2,
+              let rawPtr = packet.pointee.data else { return nil }
+
+        let textLen = Int(rawPtr[0]) << 8 | Int(rawPtr[1])
+        guard textLen > 0, textLen <= packet.pointee.size - 2 else { return nil }
+
+        guard var text = String(bytes: UnsafeBufferPointer(start: rawPtr + 2,
+                                                            count: textLen),
                                 encoding: .utf8) else { return nil }
         text = text.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1367,11 +1438,12 @@ public final class NativeBackend: PlayerBackend {
                 }
                 break
             }
-            // Seek to current position so the demux loop re-reads subtitle packets
-            // from the current timestamp. Without this, packets read while no
-            // subtitle decoder was active are lost and the first cue after
-            // selection may not appear until the next subtitle event in the stream.
-            seek(to: state.position)
+            // No seek here: seeking would flush the video pipeline and cause 2-5s
+            // re-buffering on network streams, which users misread as "subtitle failed
+            // to load." The demux loop is already 2s ahead of playback; future subtitle
+            // packets for the newly selected stream are processed naturally. The
+            // currently-active cue (whose packet was already read) may not appear until
+            // the next subtitle event — an acceptable trade-off vs. visible re-buffering.
         }
     }
 

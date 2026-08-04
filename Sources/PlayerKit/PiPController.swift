@@ -82,9 +82,11 @@ public class PiPController: NSObject {
         // Let the system start PiP automatically when the app backgrounds
         // (after rotation animation settles, GPU safe). No manual pip.start()
         // from willResignActive needed — that path races with orientation changes.
-        if #available(iOS 14.2, macOS 11.0, *) {
+        #if !os(macOS)
+        if #available(iOS 14.2, *) {
             pipController.canStartPictureInPictureAutomaticallyFromInline = true
         }
+        #endif
         self.displayLayer = displayLayer
         super.init()
         let obs = PiPDelegateObserver(owner: self)
