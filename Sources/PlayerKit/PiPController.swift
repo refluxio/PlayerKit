@@ -46,10 +46,9 @@ private class PiPDelegateObserver: NSObject, AVPictureInPictureControllerDelegat
 
 /// PiP controller backed by the main ASBDLRenderer display layer.
 ///
-/// The PiP window size is determined by the content source layer's bounds.
-/// PlayerNativeView sizes the displayLayer to match the video's actual aspect
-/// ratio (excluding letterbox/pillarbox bars), so the PiP window gets the
-/// correct compact size rather than the full-screen portrait bounds.
+/// PiP window aspect ratio is controlled via preferredContentSize (iOS 16+).
+/// The display layer stays full-screen so the PiP expand/collapse animation
+/// is smooth — no snap from video-rect back to full-screen on return.
 @available(iOS 15.0, macOS 12.0, *)
 public class PiPController: NSObject {
     private let pipController: AVPictureInPictureController
@@ -66,9 +65,16 @@ public class PiPController: NSObject {
     public var onFailedToStart: ((Error) -> Void)?
 
     /// Video's native dimensions. Set by Player when videoInfo becomes available.
-    /// Used to resize the display layer to the correct aspect ratio before starting PiP,
-    /// ensuring the PiP window reflects the video shape rather than the full-screen layer.
-    public var videoSize: CGSize?
+    /// On iOS 16+ this feeds preferredContentSize so the PiP window has the
+    /// correct aspect ratio without needing to resize the display layer.
+    public var videoSize: CGSize? {
+        didSet {
+            guard let size = videoSize, size.width > 0, size.height > 0 else { return }
+            if #available(iOS 16.0, macOS 13.0, *) {
+                pipController.preferredContentSize = size
+            }
+        }
+    }
 
     public var isActive: Bool { pipController.isPictureInPictureActive }
     public var isPossible: Bool { pipController.isPictureInPicturePossible }
@@ -80,10 +86,9 @@ public class PiPController: NSObject {
             playbackDelegate: delegate
         )
         pipController = AVPictureInPictureController(contentSource: source)
-        // Let the system decide when to start PiP (after the app is fully
-        // backgrounded and any rotation animation has settled). This is the
-        // standard approach — no need to call startPictureInPicture() manually
-        // from willResignActive, which races with orientation transitions.
+        // Let the system start PiP automatically when the app backgrounds
+        // (after rotation animation settles, GPU safe). No manual pip.start()
+        // from willResignActive needed — that path races with orientation changes.
         if #available(iOS 14.2, macOS 11.0, *) {
             pipController.canStartPictureInPictureAutomaticallyFromInline = true
         }
@@ -96,33 +101,11 @@ public class PiPController: NSObject {
 
     public func start() {
         guard !isActive else { return }
-        resizeDisplayLayerForPiP()
+        // Do NOT resize the display layer before starting PiP.
+        // Keeping the layer full-screen ensures the expand/collapse animation
+        // is smooth — resizing to video-rect causes a visible snap on return.
+        // preferredContentSize (set via videoSize) handles the window proportion.
         pipController.startPictureInPicture()
-    }
-
-    /// Resize the display layer to the video's actual aspect-ratio rect within its
-    /// superlayer. Called right before startPictureInPicture() so the PiP window
-    /// reads the correct bounds regardless of whether layoutSubviews() has run.
-    private func resizeDisplayLayerForPiP() {
-        guard let size = videoSize, size.width > 0, size.height > 0 else { return }
-        guard let superlayer = displayLayer.superlayer else { return }
-        let container = superlayer.bounds.size
-        guard container.width > 0, container.height > 0 else { return }
-        let aspect = size.width / size.height
-        let containerAspect = container.width / container.height
-        let frame: CGRect
-        if aspect > containerAspect {
-            let h = container.width / aspect
-            frame = CGRect(x: 0, y: (container.height - h) / 2, width: container.width, height: h)
-        } else {
-            let w = container.height * aspect
-            frame = CGRect(x: (container.width - w) / 2, y: 0, width: w, height: container.height)
-        }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        displayLayer.frame = frame
-        displayLayer.videoGravity = .resize
-        CATransaction.commit()
     }
 
     public func stop() {
