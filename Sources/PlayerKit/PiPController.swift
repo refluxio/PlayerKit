@@ -65,16 +65,9 @@ public class PiPController: NSObject {
     public var onFailedToStart: ((Error) -> Void)?
 
     /// Video's native dimensions. Set by Player when videoInfo becomes available.
-    /// On iOS 16+ this feeds preferredContentSize so the PiP window has the
-    /// correct aspect ratio without needing to resize the display layer.
-    public var videoSize: CGSize? {
-        didSet {
-            guard let size = videoSize, size.width > 0, size.height > 0 else { return }
-            if #available(iOS 16.0, macOS 13.0, *) {
-                pipController.preferredContentSize = size
-            }
-        }
-    }
+    /// Retained for future use (e.g. if a supported API for hinting PiP window
+    /// size from pixel-buffer dimensions becomes available).
+    public var videoSize: CGSize?
 
     public var isActive: Bool { pipController.isPictureInPictureActive }
     public var isPossible: Bool { pipController.isPictureInPicturePossible }
