@@ -1,6 +1,7 @@
 // Sources/PlayerKitNative/FFmpegSubtitleDecoder.swift
 import Foundation
 import CoreGraphics
+import os
 import CFFmpeg
 
 /// Decodes PGS/VOBSUB bitmap subtitle packets via avcodec_decode_subtitle2.
@@ -101,13 +102,18 @@ final class FFmpegSubtitleDecoder: @unchecked Sendable {
         // Only use end_display_time when it is a plausible display duration
         // (< 24 hours = 86_400_000 ms).
         let endDisplayMs = Double(sub.end_display_time)
+        let pktDuration = packet.pointee.duration
         if endDisplayMs > 0, endDisplayMs < 86_400_000 {
             endPts = startPts + endDisplayMs / 1000.0
-        } else if packet.pointee.duration > 0 {
-            endPts = startPts + Double(packet.pointee.duration) * tbSecs
+        } else if pktDuration > 0 {
+            endPts = startPts + Double(pktDuration) * tbSecs
         } else {
             endPts = startPts + 10.0
         }
+
+        // Timing diagnostics
+        let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "subtitle")
+        logger.debug("[pgsdec] pkt.pts=\(packet.pointee.pts) packetPts=\(String(format:"%.3f",packetPts)) sub.start_display_time=\(sub.start_display_time) pkt.duration=\(pktDuration) end_display_time=\(sub.end_display_time) → startPts=\(String(format:"%.3f",startPts)) endPts=\(String(format:"%.3f",endPts))")
 
         let normRect: CGRect
         if videoSize.width > 0, videoSize.height > 0 {
