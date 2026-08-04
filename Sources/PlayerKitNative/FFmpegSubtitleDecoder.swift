@@ -93,14 +93,20 @@ final class FFmpegSubtitleDecoder: @unchecked Sendable {
 
         let packetPts = Double(packet.pointee.pts) * tbSecs
         let startPts = packetPts + Double(sub.start_display_time) / 1000.0
-        let endDisplayMs = Double(sub.end_display_time)
         let endPts: Double
-        if endDisplayMs > 0 {
+        // PGS (and some VOBSUB) decoders set end_display_time to UINT32_MAX
+        // when there is no explicit subtitle end packet — the subtitle should
+        // stay on screen until the next PGS event.  Matroska sets packet.duration
+        // to the interval between consecutive PGS events, so prefer that value.
+        // Only use end_display_time when it is a plausible display duration
+        // (< 24 hours = 86_400_000 ms).
+        let endDisplayMs = Double(sub.end_display_time)
+        if endDisplayMs > 0, endDisplayMs < 86_400_000 {
             endPts = startPts + endDisplayMs / 1000.0
         } else if packet.pointee.duration > 0 {
             endPts = startPts + Double(packet.pointee.duration) * tbSecs
         } else {
-            endPts = startPts + 5.0
+            endPts = startPts + 10.0
         }
 
         let normRect: CGRect

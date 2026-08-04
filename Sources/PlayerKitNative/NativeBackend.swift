@@ -1231,6 +1231,11 @@ public final class NativeBackend: PlayerBackend {
         if (posDur - lastNotifiedPos) >= .milliseconds(500) { lastNotifiedPos = posDur }
 
         let (newImage, newRect): (CGImage?, CGRect) = subtitleImageLock.withLock {
+            // Prune expired cues so first(where:) doesn't scan a growing list.
+            // Keep only cues whose endPts hasn't passed yet.
+            if subtitleImageCues.count > 4 {
+                subtitleImageCues.removeAll { $0.endPts < audioTime - 1.0 }
+            }
             if let c = subtitleImageCues.first(where: { $0.startPts <= audioTime && audioTime < $0.endPts }) {
                 return (c.image, c.rect)
             }
@@ -1252,8 +1257,9 @@ public final class NativeBackend: PlayerBackend {
         let fps = Double(framesSinceLastLog) / elapsed
         let diff = Int((pts - audioTime) * 1000)
         let subCueCount = subtitleLock.withLock { subtitleCues.count }
+        let subImgCount = subtitleImageLock.withLock { subtitleImageCues.count }
         let subStreamIdx = demuxer?.subtitleStreamIndex ?? -1
-        logger.info("q=\(self.jitterBuffer.count) dur=\(Int(self.jitterBuffer.duration*1000))ms fps=\(String(format:"%.1f",fps)) diff=\(diff)ms a=\(String(format:"%.2f",audioTime))s v=\(String(format:"%.2f",pts))s buf=\(self.state.isBuffering) subStream=\(subStreamIdx) subCues=\(subCueCount)")
+        logger.info("q=\(self.jitterBuffer.count) dur=\(Int(self.jitterBuffer.duration*1000))ms fps=\(String(format:"%.1f",fps)) diff=\(diff)ms a=\(String(format:"%.2f",audioTime))s v=\(String(format:"%.2f",pts))s buf=\(self.state.isBuffering) subStream=\(subStreamIdx) subCues=\(subCueCount) subImgCues=\(subImgCount)")
 
         // Throughput: bytes read since last sample / elapsed.
         let bytesDelta = totalBytesRead - lastBytesLogged
