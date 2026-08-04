@@ -980,15 +980,18 @@ public final class NativeBackend: PlayerBackend {
         // Without this, PacketDropPolicy sees "video behind audio" and drops all
         // non-keyframes up to the next I-frame, causing a 6+ second overshoot.
         //
-        // We re-calibrate on every tick until the first frame is actually rendered.
-        // This is critical: AudioQueueStop(immediate=true) and AudioQueueStart can
-        // fire callbacks asynchronously that advance the clock *after* our reset,
-        // polluting audioClock to be ahead of the first video frame PTS.  If we
-        // cleared the flag on peek (before render), the next tick's audioTime
-        // would already be ahead and trigger skip-behind, dropping 5-10 frames
-        // → the user-visible "1s 花屏/卡顿" right after seek.
+        // IMPORTANT: calibrate at most once.  Repeatedly calling calibrate() on
+        // every tick causes a primer-debt death loop when seeking to ~0: each
+        // calibrate re-subtracts _primerPendingSamples from the target, wiping out
+        // the progress made by primer callbacks that fired between ticks.  The
+        // audioClock never advances past 0, and displayNextFrame's skip-behind
+        // guard drops all frames → playback stalls permanently.
+        // AudioQueueStop/Start can fire async callbacks that advance the clock
+        // *after* our reset; by calibrating exactly once (not clearing the flag
+        // until first render), we tolerate that race without the death loop.
         if needsClockCalibration, let firstFrame = jitterBuffer.peek(at: 0) {
             audioClock.calibrate(to: firstFrame.pts, sampleRate: audioDecoder?.outputSampleRate ?? 44100)
+            needsClockCalibration = false
         }
 
         // In passthrough mode AudioUnitOutput never runs so audioClock stays at 0.
@@ -1066,11 +1069,9 @@ public final class NativeBackend: PlayerBackend {
         }
         displayedVideoFrames += 1; framesSinceLastLog += 1
 
-        // First frame rendered — calibration window is over.  Subsequent ticks
-        // let audioClock advance naturally via AudioQueue callbacks.
-        if needsClockCalibration {
-            needsClockCalibration = false
-        }
+        // needsClockCalibration is already cleared in the calibrate block above.
+        // First frame has been rendered; subsequent ticks let audioClock advance
+        // naturally via AudioQueue callbacks.
 
         let posDur = Duration.milliseconds(Int64(popped.pts * 1000))
         state.position = posDur
