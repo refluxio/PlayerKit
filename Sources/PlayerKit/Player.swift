@@ -50,6 +50,13 @@ public final class Player {
         backend.play(reader: reader, seekTo: seekTo, knownDuration: knownDuration)
     }
 
+    /// Start playback by concatenating multiple URLs (BDMV disc clips).
+    public func play(concatURLs: [URL], headers: [String: String] = [:],
+                     seekTo: Duration? = nil, knownDuration: Duration? = nil) {
+        backend.play(concatURLs: concatURLs, headers: headers,
+                     seekTo: seekTo, knownDuration: knownDuration)
+    }
+
     /// Pause playback. Call `resume()` to continue.
     public func pause()                        { backend.pause() }
 

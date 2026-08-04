@@ -260,6 +260,82 @@ public final class NativeBackend: PlayerBackend {
         }
     }
 
+    public func play(concatURLs: [URL], headers: [String: String],
+                     seekTo: Duration?, knownDuration: Duration? = nil) {
+        stop()
+        state = PlayerState()
+        state.isBuffering = true
+        notifyStateChange()
+
+        guard !concatURLs.isEmpty else {
+            state.error = "concat: no URLs"
+            notifyStateChange()
+            return
+        }
+
+        // Single URL — skip concat overhead, play directly.
+        if concatURLs.count == 1 {
+            play(url: concatURLs[0], headers: headers, seekTo: seekTo,
+                 knownDuration: knownDuration)
+            return
+        }
+
+        logger.notice("play concat \(concatURLs.count) urls")
+
+        playGeneration += 1
+        let gen = playGeneration
+
+        let urls = concatURLs  // capture
+        let hdrs = headers
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+
+            // Write concat list to a temp file.
+            let listContent = urls.map { "file '\($0.absoluteString)'" }
+                .joined(separator: "\n") + "\n"
+            let tmpDir = FileManager.default.temporaryDirectory
+            let listFile = tmpDir.appendingPathComponent("reflux-concat-\(UUID().uuidString).txt")
+            do {
+                try listContent.write(to: listFile, atomically: true, encoding: .utf8)
+            } catch {
+                let msg = "concat: failed to write list file: \(error.localizedDescription)"
+                await MainActor.run { [weak self] in
+                    guard let self, self.playGeneration == gen else { return }
+                    self.state.error = msg
+                    self.notifyStateChange()
+                }
+                return
+            }
+            defer { try? FileManager.default.removeItem(at: listFile) }
+
+            let demuxer = FFmpegDemuxer()
+            do {
+                try demuxer.openConcat(listFileURL: listFile, headers: hdrs,
+                                       skipDurationProbe: knownDuration != nil)
+            } catch {
+                logger.error("demuxer.openConcat FAILED: \(error)")
+                let msg = (error as? CustomStringConvertible)?.description
+                    ?? String(describing: error)
+                await MainActor.run { [weak self] in
+                    guard let self, self.playGeneration == gen else { return }
+                    self.state.error = msg
+                    self.notifyStateChange()
+                }
+                return
+            }
+            await MainActor.run { [weak self] in
+                guard let self, self.playGeneration == gen else {
+                    demuxer.close()
+                    return
+                }
+                self._finishOpen(demuxer: demuxer,
+                                 url: URL(string: "concat://list")!,
+                                 headers: hdrs, seekTo: seekTo,
+                                 knownDuration: knownDuration)
+            }
+        }
+    }
+
     private func _finishOpen(demuxer: FFmpegDemuxer, url: URL, headers: [String: String],
                               seekTo: Duration?, knownDuration: Duration?) {
         let t0 = Date()

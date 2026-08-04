@@ -258,6 +258,47 @@ final class FFmpegDemuxer: @unchecked Sendable {
         try finishOpen(skipDurationProbe: skipDurationProbe, isNetwork: !url.isFileURL)
     }
 
+    /// Open a concat demuxer list file for BDMV disc clip playback.
+    /// The list file contains lines like `file 'https://...'` for each clip.
+    /// ffmpeg's concat demuxer virtually stitches the clips and supports
+    /// precise time-based seek across clip boundaries.
+    func openConcat(listFileURL: URL, headers: [String: String] = [:],
+                    skipDurationProbe: Bool = false) throws {
+        close()
+        formatCtx = avformat_alloc_context()
+        guard formatCtx != nil else { throw DemuxerError.openFailed(-1) }
+
+        var opts: OpaquePointer?
+        av_dict_set(&opts, "analyzeduration", "500000", 0)
+        av_dict_set(&opts, "probesize", "262144", 0)
+        av_dict_set(&opts, "safe", "0", 0)  // allow arbitrary URLs in concat list
+
+        if !headers.isEmpty {
+            let dict = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
+            av_dict_set(&opts, "headers", dict, 0)
+        }
+
+        // Explicitly request the concat demuxer so ffmpeg doesn't auto-detect
+        // the list file as a plain text file.
+        let fmt = av_find_input_format("concat")
+        let path = listFileURL.path
+
+        logger.info("opening concat list=\(path, privacy: .public) clips headers=\(headers.count)")
+
+        var localCtx = formatCtx
+        let ret = avformat_open_input(&localCtx, path, fmt, &opts)
+        formatCtx = localCtx
+        av_dict_free(&opts)
+
+        guard ret == 0 else {
+            logger.error("avformat_open_input (concat) FAILED, ret=\(ret)")
+            throw DemuxerError.openFailed(ret)
+        }
+        logger.info("avformat_open_input (concat) OK")
+
+        try finishOpen(skipDurationProbe: skipDurationProbe, isNetwork: true)
+    }
+
     func open(reader: any MediaRandomAccessReader, skipDurationProbe: Bool = false) throws {
         close()
         formatCtx = avformat_alloc_context()

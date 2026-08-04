@@ -28,6 +28,17 @@ public protocol Playable: AnyObject {
               seekTo: Duration?,
               knownDuration: Duration?)
 
+    /// Start playback by concatenating multiple URLs into a single stream.
+    /// Uses ffmpeg's concat demuxer to virtually stitch clips together,
+    /// enabling precise seek across clip boundaries (BDMV disc playback).
+    /// - Parameters:
+    ///   - urls: Ordered list of media URLs (clip files).
+    ///   - headers: HTTP headers sent with each request.
+    ///   - seekTo: Optional start position.
+    ///   - knownDuration: Pre-known duration, skips probe if non-nil.
+    func play(concatURLs: [URL], headers: [String: String],
+              seekTo: Duration?, knownDuration: Duration?)
+
     /// Pause playback. Call `resume()` to continue.
     func pause()
 
