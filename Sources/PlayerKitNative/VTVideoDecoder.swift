@@ -52,6 +52,20 @@ final class VTVideoDecoder {
     init?(stream: UnsafeMutablePointer<AVStream>, prefer10Bit: Bool = false,
           colorParams: VideoColorParams = VideoColorParams()) {
         let cp = stream.pointee.codecpar.pointee
+        // VideoToolbox only decodes H.264 and HEVC. Without this guard, every
+        // other codec (RealVideo rv40, VP8, old MPEG-4 profiles, WMV...) falls
+        // through the `isH264 ? H.264 : HEVC` binary below and gets silently
+        // treated as HEVC: init "succeeds" (returns non-nil), but the in-band
+        // parameter-set scan below expects HEVC NAL unit framing that the
+        // actual bitstream never has, so `decode(packet:)` returns nil forever
+        // and zero frames ever reach the renderer — without ever tripping
+        // `needsSoftwareFallback` (VT is never actually invoked, so there are
+        // no counted errors) or the `NativeBackend` `.vtHW` init-failure
+        // fallback to `FFmpegVideoDecoder` (this initializer never returns nil).
+        guard cp.codec_id == AV_CODEC_ID_H264 || cp.codec_id == AV_CODEC_ID_HEVC else {
+            logger.info("codec \(String(cString: avcodec_get_name(cp.codec_id))) unsupported by VideoToolbox — deferring to FFmpeg software decode")
+            return nil
+        }
         self.isH264 = (cp.codec_id == AV_CODEC_ID_H264)
         // MKV containers often leave bits_per_raw_sample = 0 even for HEVC Main10.
         // Fall back to profile check: AV_PROFILE_HEVC_MAIN_10 = 2, REXT = 4.
