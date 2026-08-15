@@ -168,6 +168,9 @@ public final class NativeBackend: PlayerBackend {
     private var framesSinceLastLog = 0
     private var ticksSinceLastLog = 0
     private var lastLogTime: Double = 0
+    // Diagnostic: see the gap-detection note in displayNextFrame().
+    private var lastTickWallTime: Double?
+    private let tickGapWarnThreshold: Double = 0.05
     private var lastNotifiedPos: Duration = .zero
 
     // Throughput tracking. Written from demux queue, read on main actor.
@@ -703,6 +706,10 @@ public final class NativeBackend: PlayerBackend {
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.state.isBuffering = true
+                    // Drop the tick-gap baseline so the refill-triggered resume
+                    // isn't misreported as a main-thread stall by the gap
+                    // diagnostic in displayNextFrame().
+                    self.lastTickWallTime = nil
                     self.notifyStateChange()
                 }
             case .playing:
@@ -1114,6 +1121,21 @@ public final class NativeBackend: PlayerBackend {
     fileprivate func displayNextFrame() {
         let now = CACurrentMediaTime()
         ticksSinceLastLog += 1
+
+        // Diagnostic: CADisplayLink runs on the main run loop. If the main thread
+        // is busy with other work (background scan/enrich, SwiftUI updates, disk/DB
+        // I/O, ...) ticks get delayed or dropped, producing visible video judder
+        // while audio (separate real-time AudioUnit thread) stays smooth. Logging
+        // outsized tick-to-tick gaps — only while jitterBuffer actually has frames
+        // ready to show — isolates "main thread was blocked" from "video is
+        // legitimately buffering" as the stutter cause.
+        if let last = lastTickWallTime {
+            let gap = now - last
+            if gap > tickGapWarnThreshold && jitterBuffer.state == .playing {
+                logger.warning("display tick gap \(Int(gap * 1000))ms (main thread stall?)")
+            }
+        }
+        lastTickWallTime = now
 
         guard jitterBuffer.state == .playing else { return }
 
