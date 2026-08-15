@@ -273,6 +273,12 @@ final class FFmpegDemuxer: @unchecked Sendable {
         av_dict_set(&opts, "probesize", "262144", 0)
         av_dict_set(&opts, "safe", "0", 0)  // allow arbitrary URLs in concat list
 
+        // NOTE: `headers` here only applies to opening this local list file
+        // (a no-op for `file:`), NOT to the per-clip http URLs the concat
+        // demuxer opens internally — those get their own AVDictionary built
+        // solely from that clip's `option` directives in the list file (see
+        // NativeBackend.concatFileEntry, which writes `option user_agent` /
+        // `option referer` / `option headers` per file for that purpose).
         if !headers.isEmpty {
             let dict = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
             av_dict_set(&opts, "headers", dict, 0)

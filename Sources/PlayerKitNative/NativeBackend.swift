@@ -9,6 +9,41 @@ import os
 
 private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "backend")
 
+/// Builds one concat-demuxer script entry: a `file` line plus per-file `option`
+/// directives that carry `headers` to that specific clip's http open (see call
+/// site in `NativeBackend.play(concatURLs:)` for why this is necessary).
+///
+/// The concat script is read line-by-line (split on raw `\n`) before each line's
+/// arguments are tokenized, so a directive's value can never contain an embedded
+/// `\n` — ruling out a single multi-header `option headers 'A: 1\r\nB: 2\r\n'`
+/// blob. Instead this maps the two headers CDNs actually gate on (User-Agent,
+/// Referer) to ffmpeg http.c's dedicated single-value AVOptions (`user_agent`,
+/// `referer`), and falls back to the generic `headers` option for at most one
+/// other header (currently only WebDAV's `Authorization`, which drivers never
+/// combine with a second custom header).
+fileprivate func concatFileEntry(url: URL, headers: [String: String]) -> String {
+    var lines = ["file '\(concatEscape(url.absoluteString))'"]
+    var rest: [String: String] = [:]
+    for (key, value) in headers {
+        switch key.lowercased() {
+        case "user-agent": lines.append("option user_agent '\(concatEscape(value))'")
+        case "referer":    lines.append("option referer '\(concatEscape(value))'")
+        default:           rest[key] = value
+        }
+    }
+    if let (key, value) = rest.first {
+        lines.append("option headers '\(concatEscape("\(key): \(value)"))'")
+    }
+    return lines.joined(separator: "\n") + "\n"
+}
+
+/// Escapes a value for embedding in a single-quoted concat script token, using
+/// the same close-quote/escape/reopen-quote trick the format's own `av_get_token`
+/// parser expects (`it's` → `it'\''s'`).
+private func concatEscape(_ s: String) -> String {
+    s.replacingOccurrences(of: "'", with: "'\\''")
+}
+
 private final class DisplayLinkProxy: NSObject {
     weak var backend: NativeBackend?
     init(backend: NativeBackend) { self.backend = backend }
@@ -295,9 +330,15 @@ public final class NativeBackend: PlayerBackend {
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
 
-            // Write concat list to a temp file.
-            let listContent = urls.map { "file '\($0.absoluteString)'" }
-                .joined(separator: "\n") + "\n"
+            // Write concat list to a temp file. Per-file `option` directives carry
+            // auth headers to each clip's http open — the concat demuxer's own
+            // `headers` AVOption (set on the outer avformat_open_input below) only
+            // applies to opening this local list file, NOT to the nested per-clip
+            // URLs it opens internally (ffmpeg concatdec.c: each file gets its own
+            // AVDictionary built solely from that file's `option` lines). Without
+            // this, CDNs that gate on User-Agent/Referer (e.g. 115: mismatched UA
+            // → 403) reject every clip and the whole concat open fails.
+            let listContent = urls.map { concatFileEntry(url: $0, headers: hdrs) }.joined()
             let tmpDir = FileManager.default.temporaryDirectory
             let listFile = tmpDir.appendingPathComponent("reflux-concat-\(UUID().uuidString).txt")
             do {
