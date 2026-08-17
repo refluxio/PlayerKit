@@ -15,6 +15,17 @@ import CFFmpeg
 /// before `avformat_open_input`. `free()` is called in `FFmpegDemuxer.close()`.
 /// `AVFMT_FLAG_CUSTOM_IO` prevents ffmpeg from auto-closing the pb.
 final class AVIOBridge: @unchecked Sendable {
+    // AVERROR_EOF, mirrored from libavutil/error.h (FFERRTAG('E','O','F',' ')).
+    // The Swift importer can't bridge that macro (function-like macro chain),
+    // so it's reproduced here rather than hardcoding the resulting literal.
+    private static let averrorEOF: Int32 = {
+        let tag = Int32(bitPattern: UInt32(UInt8(ascii: "E"))
+            | (UInt32(UInt8(ascii: "O")) << 8)
+            | (UInt32(UInt8(ascii: "F")) << 16)
+            | (UInt32(UInt8(ascii: " ")) << 24))
+        return -tag
+    }()
+
     private let reader: any MediaRandomAccessReader
     private let bufferSize: Int = 32768  // 32KB — ffmpeg standard AVIO buffer
     private var ioContext: UnsafeMutablePointer<AVIOContext>?
@@ -118,6 +129,12 @@ final class AVIOBridge: @unchecked Sendable {
 
         do {
             let n = try reader.read(offset: offset, length: length, into: bufferPtr)
+            // avio.h: read_packet "must never return 0 but rather a proper
+            // AVERROR code" for stream protocols. A bare 0 leaves ffmpeg's
+            // fill_buffer() without a terminal signal, so it keeps
+            // re-invoking this callback at the same offset forever instead
+            // of treating the stream as ended.
+            guard n > 0 else { return AVIOBridge.averrorEOF }
             currentOffset += Int64(n)
             return Int32(n)
         } catch {
