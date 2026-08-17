@@ -158,6 +158,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
     /// Select (or deselect) the active subtitle stream by stream index.
     /// Pass nil to disable subtitle decoding.
     func selectSubtitleStream(by id: Int?) {
+        defer { applyStreamDiscard() }
         guard let id else { subtitleStream = nil; return }
         guard let ctx = formatCtx else { return }
         let nb = Int(ctx.pointee.nb_streams)
@@ -170,6 +171,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
 
     /// Switch the active audio stream by stream index. Returns true on success.
     func selectAudioStream(by id: Int) -> Bool {
+        defer { applyStreamDiscard() }
         guard let ctx = formatCtx else { return false }
         let nb = Int(ctx.pointee.nb_streams)
         for i in 0..<nb {
@@ -182,6 +184,29 @@ final class FFmpegDemuxer: @unchecked Sendable {
             }
         }
         return false
+    }
+
+    /// Tells the demuxer to skip PES reassembly/buffering entirely for every
+    /// stream except the selected video/audio/subtitle ones. Without this,
+    /// libavformat internally reassembles and tracks packets for *every* PID
+    /// in the container — for a raw BDMV STREAM clip carrying a dozen-plus
+    /// unused foreign-language audio tracks and PGS subtitle tracks alongside
+    /// the one video/audio pair actually played, that internal bookkeeping
+    /// alone was enough to make decode fall behind real-time (observed: ~0.2
+    /// display fps, seconds-long stalls) even though our own packet-routing
+    /// loop already ignored unselected streams' payloads. This mirrors how
+    /// mpv/ffplay configure demuxers via `--vid`/`--aid`/`--sid` track
+    /// selection — selecting a track sets discard on every other one, it
+    /// doesn't just ignore their packets after the fact.
+    private func applyStreamDiscard() {
+        guard let ctx = formatCtx else { return }
+        let nb = Int(ctx.pointee.nb_streams)
+        let keep: Set<Int32> = Set([videoStream, audioStream, subtitleStream]
+            .compactMap { $0?.pointee.index })
+        for i in 0..<nb {
+            guard let s = ctx.pointee.streams[i] else { continue }
+            s.pointee.discard = keep.contains(s.pointee.index) ? AVDISCARD_DEFAULT : AVDISCARD_ALL
+        }
     }
 
     /// Video stream's sample aspect ratio (SAR). Defaults to 1:1 if not set.
@@ -385,6 +410,8 @@ final class FFmpegDemuxer: @unchecked Sendable {
                 }
             }
         }
+
+        applyStreamDiscard()
 
         duration = Double(ctx.pointee.duration) / Double(AV_TIME_BASE)
         // Format-level duration may be 0 or AV_NOPTS_VALUE for HTTP/live streams.
