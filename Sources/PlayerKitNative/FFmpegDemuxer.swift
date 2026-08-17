@@ -535,9 +535,50 @@ final class FFmpegDemuxer: @unchecked Sendable {
 
     func seek(to time: Double) -> Bool {
         guard let ctx = formatCtx else { return false }
+        if isRawIndexlessStream, duration > 0, let pb = ctx.pointee.pb {
+            return seekByByteOffset(to: time, ctx: ctx, pb: pb)
+        }
         let targetTs = Int64(time * Double(AV_TIME_BASE))
         let ok = av_seek_frame(ctx, -1, targetTs, Int32(AVSEEK_FLAG_BACKWARD)) >= 0
         logger.info("seek to \(String(format: "%.1f", time))s \(ok ? "OK" : "FAILED")")
+        return ok
+    }
+
+    /// True for headerless/indexless formats (raw MPEG-TS / BDMV clip streams).
+    /// ffmpeg's generic seek estimates a byte offset by probing PTS near both
+    /// ends of the file and interpolating — for a BD ISO rip whose trailing
+    /// bytes are corrupt/truncated (the same corruption `AVIOBridge`'s EOF
+    /// handling deals with), that end-of-file probe returns a garbage PTS,
+    /// which poisons the interpolation so *every* seek converges on the
+    /// wrong end of the file regardless of target. Confirmed by tracing every
+    /// avio_seek call ffmpeg made: seeks below ~700s landed at byte 0, seeks
+    /// above landed at EOF, regardless of actual target.
+    private var isRawIndexlessStream: Bool {
+        guard let name = formatCtx?.pointee.iformat?.pointee.name else { return false }
+        return String(cString: name).contains("mpegts")
+    }
+
+    /// Seeks a raw MPEG-TS stream by computing the target byte offset
+    /// ourselves — from the caller's known-accurate content duration and the
+    /// file size — instead of trusting ffmpeg's own (unreliable here, see
+    /// `isRawIndexlessStream`) PTS-probing estimate. `avformat_flush` is
+    /// avformat.h's documented way to reset demuxer-internal buffering after
+    /// manually repositioning the AVIOContext on a headerless, resyncable
+    /// format like MPEG-TS.
+    private func seekByByteOffset(to time: Double, ctx: UnsafeMutablePointer<AVFormatContext>,
+                                  pb: UnsafeMutablePointer<AVIOContext>) -> Bool {
+        let totalBytes = avioBridge?.totalBytes ?? -1
+        guard totalBytes > 0 else { return false }
+        let ratio = min(max(time / duration, 0), 1)
+        let targetByte = Int64(Double(totalBytes) * ratio)
+        avio_flush(pb)
+        guard avio_seek(pb, targetByte, 0 /* SEEK_SET */) >= 0 else {
+            logger.error("seek to \(String(format: "%.1f", time))s FAILED (avio_seek)")
+            return false
+        }
+        let flushRet = avformat_flush(ctx)
+        let ok = flushRet >= 0
+        logger.info("seek to \(String(format: "%.1f", time))s \(ok ? "OK" : "FAILED") (byte-domain target=\(targetByte)/\(totalBytes))")
         return ok
     }
 
