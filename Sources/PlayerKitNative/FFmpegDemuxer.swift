@@ -194,7 +194,8 @@ final class FFmpegDemuxer: @unchecked Sendable {
         return Double(sar.num) / Double(sar.den)
     }
 
-    func open(url: URL, headers: [String: String] = [:], skipDurationProbe: Bool = false) throws {
+    func open(url: URL, headers: [String: String] = [:], skipDurationProbe: Bool = false,
+              knownDurationSecs: Double? = nil) throws {
         close()
         formatCtx = avformat_alloc_context()
         guard formatCtx != nil else { throw DemuxerError.openFailed(-1) }
@@ -255,7 +256,8 @@ final class FFmpegDemuxer: @unchecked Sendable {
         }
         logger.info("avformat_open_input OK")
 
-        try finishOpen(skipDurationProbe: skipDurationProbe, isNetwork: !url.isFileURL)
+        try finishOpen(skipDurationProbe: skipDurationProbe, isNetwork: !url.isFileURL,
+                       knownDurationSecs: knownDurationSecs)
     }
 
     /// Open a concat demuxer list file for BDMV disc clip playback.
@@ -263,7 +265,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
     /// ffmpeg's concat demuxer virtually stitches the clips and supports
     /// precise time-based seek across clip boundaries.
     func openConcat(listFileURL: URL, headers: [String: String] = [:],
-                    skipDurationProbe: Bool = false) throws {
+                    skipDurationProbe: Bool = false, knownDurationSecs: Double? = nil) throws {
         close()
         formatCtx = avformat_alloc_context()
         guard formatCtx != nil else { throw DemuxerError.openFailed(-1) }
@@ -302,10 +304,12 @@ final class FFmpegDemuxer: @unchecked Sendable {
         }
         logger.info("avformat_open_input (concat) OK")
 
-        try finishOpen(skipDurationProbe: skipDurationProbe, isNetwork: true)
+        try finishOpen(skipDurationProbe: skipDurationProbe, isNetwork: true,
+                       knownDurationSecs: knownDurationSecs)
     }
 
-    func open(reader: any MediaRandomAccessReader, skipDurationProbe: Bool = false) throws {
+    func open(reader: any MediaRandomAccessReader, skipDurationProbe: Bool = false,
+              knownDurationSecs: Double? = nil) throws {
         close()
         formatCtx = avformat_alloc_context()
         guard formatCtx != nil else { throw DemuxerError.openFailed(-1) }
@@ -337,10 +341,12 @@ final class FFmpegDemuxer: @unchecked Sendable {
         }
         logger.info("avformat_open_input OK (custom IO)")
 
-        try finishOpen(skipDurationProbe: skipDurationProbe, isNetwork: true)
+        try finishOpen(skipDurationProbe: skipDurationProbe, isNetwork: true,
+                       knownDurationSecs: knownDurationSecs)
     }
 
-    private func finishOpen(skipDurationProbe: Bool, isNetwork: Bool) throws {
+    private func finishOpen(skipDurationProbe: Bool, isNetwork: Bool,
+                            knownDurationSecs: Double? = nil) throws {
         let infoRet = avformat_find_stream_info(formatCtx, nil)
         guard infoRet >= 0 else {
             logger.error("avformat_find_stream_info FAILED, ret=\(infoRet)")
@@ -414,6 +420,19 @@ final class FFmpegDemuxer: @unchecked Sendable {
         } else {
             if skipDurationProbe {
                 logger.info("duration probe skipped (knownDuration provided)")
+                // av_seek_frame's generic (index-less) seek path — used by raw
+                // mpegts/BDMV streams, which have no byte index — estimates the
+                // target byte offset from ctx->duration. Skipping the probe above
+                // leaves ctx->duration at whatever avformat_find_stream_info guessed
+                // (often 0/invalid for a raw TS with no container-level duration
+                // field), so every seek's ratio-estimate collapses to byte 0 and
+                // seeking silently no-ops back to the start. Stamping the caller's
+                // already-known duration onto ctx->duration fixes the estimate
+                // without paying for a seek-to-end round trip.
+                if let known = knownDurationSecs, known > 0 {
+                    duration = known
+                    ctx.pointee.duration = Int64(known * Double(AV_TIME_BASE))
+                }
             } else {
                 logger.info("duration probe skipped (network stream with container duration=\(String(format: "%.1f", containerDur))s)")
             }

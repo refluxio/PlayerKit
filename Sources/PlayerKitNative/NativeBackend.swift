@@ -9,6 +9,12 @@ import os
 
 private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "backend")
 
+private extension Duration {
+    var secondsDouble: Double {
+        Double(components.seconds) + Double(components.attoseconds) * 1e-18
+    }
+}
+
 /// Builds one concat-demuxer script entry: a `file` line plus per-file `option`
 /// directives that carry `headers` to that specific clip's http open (see call
 /// site in `NativeBackend.play(concatURLs:)` for why this is necessary).
@@ -225,7 +231,8 @@ public final class NativeBackend: PlayerBackend {
             let demuxer = FFmpegDemuxer()
             do {
                 try demuxer.open(url: url, headers: headers,
-                                 skipDurationProbe: knownDuration != nil)
+                                 skipDurationProbe: knownDuration != nil,
+                                 knownDurationSecs: knownDuration?.secondsDouble)
             } catch {
                 logger.error("demuxer.open FAILED: \(error)")
                 // Prefer CustomStringConvertible.description (our DemuxerError
@@ -277,7 +284,8 @@ public final class NativeBackend: PlayerBackend {
             let demuxer = FFmpegDemuxer()
             do {
                 try demuxer.open(reader: reader,
-                                 skipDurationProbe: knownDuration != nil)
+                                 skipDurationProbe: knownDuration != nil,
+                                 knownDurationSecs: knownDuration?.secondsDouble)
             } catch {
                 logger.error("demuxer.open (reader) FAILED: \(error)")
                 let msg = (error as? CustomStringConvertible)?.description
@@ -360,7 +368,8 @@ public final class NativeBackend: PlayerBackend {
             let demuxer = FFmpegDemuxer()
             do {
                 try demuxer.openConcat(listFileURL: listFile, headers: hdrs,
-                                       skipDurationProbe: knownDuration != nil)
+                                       skipDurationProbe: knownDuration != nil,
+                                       knownDurationSecs: knownDuration?.secondsDouble)
             } catch {
                 logger.error("demuxer.openConcat FAILED: \(error)")
                 let msg = (error as? CustomStringConvertible)?.description
@@ -1386,7 +1395,7 @@ public final class NativeBackend: PlayerBackend {
     }
 
     public func seek(to: Duration) {
-        let secs = Double(to.components.seconds) + Double(to.components.attoseconds) * 1e-18
+        let secs = to.secondsDouble
         logger.info("seek to \(String(format:"%.1f",secs))s")
         demuxLock.lock()
         seekLock.withLock { seekSerial += 1 }
