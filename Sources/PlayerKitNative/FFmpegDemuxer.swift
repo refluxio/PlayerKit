@@ -595,18 +595,71 @@ final class FFmpegDemuxer: @unchecked Sendable {
     private func seekByByteOffset(to time: Double, ctx: UnsafeMutablePointer<AVFormatContext>,
                                   pb: UnsafeMutablePointer<AVIOContext>) -> Bool {
         let totalBytes = avioBridge?.totalBytes ?? -1
-        guard totalBytes > 0 else { return false }
-        let ratio = min(max(time / duration, 0), 1)
-        let targetByte = Int64(Double(totalBytes) * ratio)
-        avio_flush(pb)
-        guard avio_seek(pb, targetByte, 0 /* SEEK_SET */) >= 0 else {
-            logger.error("seek to \(String(format: "%.1f", time))s FAILED (avio_seek)")
-            return false
+        guard totalBytes > 0, duration > 0 else { return false }
+        let avgBytesPerSecond = Double(totalBytes) / duration
+
+        var targetByte = Int64(Double(totalBytes) * min(max(time / duration, 0), 1))
+        var landedPTS: Double?
+
+        // A single linear byte-ratio guess is unreliable on VBR content — an
+        // action-heavy stretch can run several times the average bitrate of a
+        // dialogue stretch, and BD remuxes commonly swing enough to land the
+        // guess tens of seconds from the target (observed: 21s overshoot on a
+        // GoT remux). Refine against an actually-probed video PTS instead of
+        // trusting the ratio blindly: seek, read forward for the first
+        // decodable video PTS, and if it's off from `time` by more than a
+        // small tolerance, correct the byte target using the observed error
+        // (converted via the file's average bitrate) and try again. Each
+        // round's probe reads are simply thrown away — only the final avio
+        // position matters, since the real demux loop starts fresh from
+        // wherever this function leaves pb/ctx.
+        for attempt in 0..<3 {
+            avio_flush(pb)
+            guard avio_seek(pb, targetByte, 0 /* SEEK_SET */) >= 0 else {
+                logger.error("seek to \(String(format: "%.1f", time))s FAILED (avio_seek)")
+                return false
+            }
+            guard avformat_flush(ctx) >= 0 else {
+                logger.error("seek to \(String(format: "%.1f", time))s FAILED (avformat_flush)")
+                return false
+            }
+            guard let pts = probeVideoPTSSeconds(ctx: ctx) else { break }
+            landedPTS = pts
+            let errorSecs = pts - time
+            if abs(errorSecs) < 1.5 || attempt == 2 { break }
+            targetByte = min(max(targetByte - Int64(errorSecs * avgBytesPerSecond), 0), totalBytes - 1)
         }
-        let flushRet = avformat_flush(ctx)
-        let ok = flushRet >= 0
-        logger.info("seek to \(String(format: "%.1f", time))s \(ok ? "OK" : "FAILED") (byte-domain target=\(targetByte)/\(totalBytes))")
+
+        let ok = landedPTS != nil
+        logger.info("seek to \(String(format: "%.1f", time))s \(ok ? "OK" : "FAILED") (byte-domain target=\(targetByte)/\(totalBytes)\(landedPTS.map { " landed=\(String(format: "%.1f", $0))s" } ?? ""))")
         return ok
+    }
+
+    /// Reads forward from the current position looking for the first packet
+    /// on the selected video stream that carries a valid PTS, returning it
+    /// converted to the same zero-based "seconds from playback start" domain
+    /// `seek(to:)` uses (subtracting the stream's start_time, matching
+    /// `NativeBackend.ptsFromPacket`). Bounded to 200 packets so a corrupt or
+    /// heavily-interleaved region can't spin this forever; returns nil if no
+    /// video PTS turns up in that window (e.g. probe landed at/past EOF).
+    private func probeVideoPTSSeconds(ctx: UnsafeMutablePointer<AVFormatContext>) -> Double? {
+        guard let vs = videoStream else { return nil }
+        let vIdx = vs.pointee.index
+        let nopts = Int64(bitPattern: 0x8000000000000000)
+        let startOffset: Double = vs.pointee.start_time == nopts ? 0 :
+            Double(vs.pointee.start_time) * Double(vs.pointee.time_base.num) / Double(max(vs.pointee.time_base.den, 1))
+
+        var pkt = av_packet_alloc()
+        defer { av_packet_free(&pkt) }
+        var attempts = 0
+        while attempts < 200, av_read_frame(ctx, pkt) >= 0 {
+            defer { av_packet_unref(pkt) }
+            attempts += 1
+            guard let p = pkt, p.pointee.stream_index == vIdx, p.pointee.pts != nopts else { continue }
+            let raw = Double(p.pointee.pts) * Double(vs.pointee.time_base.num) / Double(max(vs.pointee.time_base.den, 1))
+            return raw - startOffset
+        }
+        return nil
     }
 
     func close() {
