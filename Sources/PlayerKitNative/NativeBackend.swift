@@ -123,6 +123,10 @@ public final class NativeBackend: PlayerBackend {
     // start from the same position — required for H.264 streams whose PTS does
     // not start at 0 (e.g. B-frame reorder delays).
     private var needsClockCalibration: Bool = false
+    // Above this, a video/audio PTS gap at calibration time is no longer a
+    // normal "nearest keyframe was slightly before the seek target" rounding
+    // (typically well under a second for BD content) — see displayNextFrame().
+    private let maxCalibrationGap: Double = 5.0
 
     // Subtitle cue buffer — written from demux loop, read from display loop.
     private struct SubtitleCue {
@@ -1164,7 +1168,21 @@ public final class NativeBackend: PlayerBackend {
         // *after* our reset; by calibrating exactly once (not clearing the flag
         // until first render), we tolerate that race without the death loop.
         if needsClockCalibration, let firstFrame = jitterBuffer.peek(at: 0) {
-            audioClock.calibrate(to: firstFrame.pts, sampleRate: audioDecoder?.outputSampleRate ?? 44100)
+            // Only apply the small-rounding correction this was designed for.
+            // A byte-domain seek (FFmpegDemuxer.seekByByteOffset, used for raw
+            // indexless MPEG-TS) has no keyframe awareness and can land tens
+            // of seconds from the target on VBR content. Blindly relabeling
+            // audioClock to match a wildly-displaced video PTS doesn't fix
+            // that — it hides it: the audio hardware keeps playing real
+            // content from near the seek target while the clock claims to be
+            // wherever video landed, and the gap never closes (observed: a
+            // persistent, non-recovering audio-behind-video desync). For a
+            // large gap, skip calibration and let the freeze-ahead guard hold
+            // video until the real audioClock catches up instead — a one-time
+            // stall, but it converges on what's actually audible.
+            if abs(firstFrame.pts - audioClock.audioTime) < maxCalibrationGap {
+                audioClock.calibrate(to: firstFrame.pts, sampleRate: audioDecoder?.outputSampleRate ?? 44100)
+            }
             needsClockCalibration = false
         }
 
