@@ -23,11 +23,18 @@ private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "demuxer
 /// true and it still fprintf()s a shortened "Last message repeated N
 /// times\r" on *every* occurrence — same call frequency as before, just a
 /// shorter string (confirmed by device log: thousands of these lines at
-/// the same rate as the original spam). The level check in av_log() itself
-/// runs before any formatting or I/O, so cutting the level below WARNING
-/// is what actually eliminates the per-packet cost.
+/// the same rate as the original spam).
+///
+/// Cutting the level to AV_LOG_ERROR did not help either — on-device
+/// testing showed the exact same per-frame spam still coming through,
+/// which means dca's "Residual encoded channels" message is itself logged
+/// at AV_LOG_ERROR (av_log's filter is "message level <= threshold", so
+/// ERROR(16) <= ERROR(16) still passes). Rather than keep guessing at the
+/// exact level a given codec uses for a given message, go straight to
+/// AV_LOG_QUIET: nothing above PANIC gets through, so the level check
+/// short-circuits every call unconditionally.
 private let configureFFmpegLoggingOnce: Void = {
-    av_log_set_level(AV_LOG_ERROR)
+    av_log_set_level(AV_LOG_QUIET)
     av_log_set_flags(AV_LOG_SKIP_REPEATED)
 }()
 
