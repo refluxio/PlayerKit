@@ -181,6 +181,15 @@ public final class NativeBackend: PlayerBackend {
     // Diagnostic: see the gap-detection note in displayNextFrame().
     private var lastTickWallTime: Double?
     private let tickGapWarnThreshold: Double = 0.05
+    // Diagnostic: wall time startDisplayLink() was called, so the first tick
+    // can log how long it took to actually arrive — distinguishes "the link
+    // itself didn't fire for N seconds" (real main-thread/runloop stall) from
+    // "ticks were firing fine but one later tick got delayed" (the existing
+    // gap check only ever compares tick-to-tick, so a slow *first* tick was
+    // invisible: lastTickWallTime starts nil, so tick #1 never gets a gap
+    // check — it just silently sets the baseline).
+    private var displayLinkStartWallTime: Double?
+    private var firstTickLogged = false
     private var lastNotifiedPos: Duration = .zero
 
     // Throughput tracking. Written from demux queue, read on main actor.
@@ -1147,6 +1156,14 @@ public final class NativeBackend: PlayerBackend {
             if gap > tickGapWarnThreshold && jitterBuffer.state == .playing {
                 logger.warning("display tick gap \(Int(gap * 1000))ms (main thread stall?)")
             }
+        } else if !firstTickLogged, let linkStart = displayLinkStartWallTime {
+            // First-ever tick: no prior baseline to diff against, so the check
+            // above is structurally blind to this one. Log it explicitly —
+            // this is the only way to tell whether a "gap" reported once
+            // jitterBuffer flips to .playing was actually one late tick, or
+            // whether CADisplayLink genuinely never fired until now.
+            firstTickLogged = true
+            logger.info("first display tick \(Int((now - linkStart) * 1000))ms after startDisplayLink()")
         }
         lastTickWallTime = now
 
@@ -1674,6 +1691,8 @@ public final class NativeBackend: PlayerBackend {
     // MARK: - Display link
 
     private func startDisplayLink() {
+        displayLinkStartWallTime = CACurrentMediaTime()
+        firstTickLogged = false
         #if os(iOS) || os(tvOS)
         let proxy = DisplayLinkProxy(backend: self)
         displayLinkProxy = proxy
