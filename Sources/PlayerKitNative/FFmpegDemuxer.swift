@@ -6,6 +6,22 @@ import os
 
 private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "demuxer")
 
+/// FFmpeg's default av_log callback fprintf()s every message straight to
+/// stderr. Some codecs log the exact same warning once per packet — e.g.
+/// the native dca decoder on a lossless DTS-HD MA track logs "Residual
+/// encoded channels are present without core" on *every* audio frame. Over
+/// a feature-length BD remux that's tens of thousands of synchronous stderr
+/// writes; under Xcode's debug console pipe each write is slow enough that
+/// decode throughput drops well below real-time (observed: single-digit
+/// fps, multi-second hangs), even though the messages themselves are
+/// harmless. AV_LOG_SKIP_REPEATED collapses consecutive identical messages
+/// into one "Last message repeated N times" line; raising the level to
+/// WARNING also drops the high-volume per-open INFO chatter.
+private let configureFFmpegLoggingOnce: Void = {
+    av_log_set_level(AV_LOG_WARNING)
+    av_log_set_flags(AV_LOG_SKIP_REPEATED)
+}()
+
 enum DemuxerError: Error, CustomStringConvertible {
     /// avformat_open_input returned non-zero. Carries the FFmpeg error code.
     case openFailed(Int32)
@@ -221,6 +237,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
 
     func open(url: URL, headers: [String: String] = [:], skipDurationProbe: Bool = false,
               knownDurationSecs: Double? = nil) throws {
+        _ = configureFFmpegLoggingOnce
         close()
         formatCtx = avformat_alloc_context()
         guard formatCtx != nil else { throw DemuxerError.openFailed(-1) }
@@ -291,6 +308,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
     /// precise time-based seek across clip boundaries.
     func openConcat(listFileURL: URL, headers: [String: String] = [:],
                     skipDurationProbe: Bool = false, knownDurationSecs: Double? = nil) throws {
+        _ = configureFFmpegLoggingOnce
         close()
         formatCtx = avformat_alloc_context()
         guard formatCtx != nil else { throw DemuxerError.openFailed(-1) }
@@ -335,6 +353,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
 
     func open(reader: any MediaRandomAccessReader, skipDurationProbe: Bool = false,
               knownDurationSecs: Double? = nil) throws {
+        _ = configureFFmpegLoggingOnce
         close()
         formatCtx = avformat_alloc_context()
         guard formatCtx != nil else { throw DemuxerError.openFailed(-1) }
