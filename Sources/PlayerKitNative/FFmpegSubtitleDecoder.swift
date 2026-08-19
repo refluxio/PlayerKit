@@ -19,6 +19,17 @@ final class FFmpegSubtitleDecoder: @unchecked Sendable {
     private var ctx: UnsafeMutablePointer<AVCodecContext>?
     private let timeBase: AVRational
     private let videoSize: CGSize
+    // Subtracted from every packet's raw PTS, same normalization NativeBackend's
+    // video ptsFromPacket() applies via videoStream.start_time. Without this,
+    // a subtitle stream whose start_time differs from the video/audio streams'
+    // (common in MKV remuxes of BD PGS tracks — mkvmerge often preserves the
+    // original disc-absolute PGS timestamps while renormalizing video/audio to
+    // start at 0) produces cues timed hundreds of seconds away from the actual
+    // playback position: they decode fine and get appended to the cue buffer,
+    // but the display-time match in NativeBackend never finds them, so nothing
+    // ever renders. Observed: video at t=696s, subtitle cues stamped ~1296s —
+    // a ~600s constant offset consistent with the subtitle stream's start_time.
+    private let startOffsetSecs: Double
 
     init?(stream: UnsafeMutablePointer<AVStream>, videoSize: CGSize) {
         guard let par = stream.pointee.codecpar else { return nil }
@@ -31,8 +42,15 @@ final class FFmpegSubtitleDecoder: @unchecked Sendable {
             return nil
         }
         self.ctx = c
-        self.timeBase = stream.pointee.time_base
+        let tb = stream.pointee.time_base
+        self.timeBase = tb
         self.videoSize = videoSize
+        let nopts = Int64(bitPattern: 0x8000000000000000)
+        if stream.pointee.start_time != nopts, tb.den > 0 {
+            self.startOffsetSecs = Double(stream.pointee.start_time) * Double(tb.num) / Double(tb.den)
+        } else {
+            self.startOffsetSecs = 0
+        }
     }
 
     deinit {
@@ -92,7 +110,7 @@ final class FFmpegSubtitleDecoder: @unchecked Sendable {
         let nopts = Int64(bitPattern: 0x8000000000000000)
         guard packet.pointee.pts != nopts else { return nil }
 
-        let packetPts = Double(packet.pointee.pts) * tbSecs
+        let packetPts = Double(packet.pointee.pts) * tbSecs - startOffsetSecs
         let startPts = packetPts + Double(sub.start_display_time) / 1000.0
         let endPts: Double
         // PGS (and some VOBSUB) decoders set end_display_time to UINT32_MAX
