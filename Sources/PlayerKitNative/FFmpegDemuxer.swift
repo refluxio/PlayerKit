@@ -13,12 +13,21 @@ private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "demuxer
 /// a feature-length BD remux that's tens of thousands of synchronous stderr
 /// writes; under Xcode's debug console pipe each write is slow enough that
 /// decode throughput drops well below real-time (observed: single-digit
-/// fps, multi-second hangs), even though the messages themselves are
-/// harmless. AV_LOG_SKIP_REPEATED collapses consecutive identical messages
-/// into one "Last message repeated N times" line; raising the level to
-/// WARNING also drops the high-volume per-open INFO chatter.
+/// fps, multi-second hangs, and visibly corrupted frames from the decode
+/// pipeline falling behind), even though the messages themselves are
+/// harmless.
+///
+/// AV_LOG_SKIP_REPEATED alone does NOT fix this: it only fully silences a
+/// repeated line when FFmpeg's internal isatty() check on stderr is false.
+/// Under lldb the device's stdio is backed by a pty, so isatty() reports
+/// true and it still fprintf()s a shortened "Last message repeated N
+/// times\r" on *every* occurrence — same call frequency as before, just a
+/// shorter string (confirmed by device log: thousands of these lines at
+/// the same rate as the original spam). The level check in av_log() itself
+/// runs before any formatting or I/O, so cutting the level below WARNING
+/// is what actually eliminates the per-packet cost.
 private let configureFFmpegLoggingOnce: Void = {
-    av_log_set_level(AV_LOG_WARNING)
+    av_log_set_level(AV_LOG_ERROR)
     av_log_set_flags(AV_LOG_SKIP_REPEATED)
 }()
 
