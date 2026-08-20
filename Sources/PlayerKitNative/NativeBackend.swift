@@ -108,6 +108,20 @@ public final class NativeBackend: PlayerBackend {
     /// Written once in _finishOpen(), then swapped from the demux queue on fallback.
     private nonisolated(unsafe) var videoDecoder: (any VideoDecoding)?
     private var audioDecoder: FFmpegAudioDecoder?
+    /// Serial queue audio packets are decoded on, off the demux/video loop's
+    /// thread. FFmpeg's software DTS-HD MA decode can be CPU-heavy enough
+    /// per packet to starve video decode when both ran serially on the same
+    /// thread — measured on-device: reads served instantly from a warm
+    /// prefetch buffer (network fully ruled out) yet video fps still sat at
+    /// 1-10fps. Also, decode staying serial with the demux loop meant a slow
+    /// audio decode directly delayed audioClock, which then throttled video
+    /// via the "stay within 2s of audio" sleep below — so a slow audio
+    /// decoder was doubly capping video: starving its CPU time *and* pacing
+    /// it down to match. Serial (not concurrent) so packet order — and
+    /// therefore audio sample order — is preserved; flush() call sites are
+    /// routed through this same queue (via .sync) so they can't race a
+    /// still-in-flight decode() of an earlier packet.
+    private let audioDecodeQueue = DispatchQueue(label: "io.reflux.PlayerKit.audioDecode")
 
     // A/V sync modules
     private let audioClock = AudioClock()
@@ -794,7 +808,11 @@ public final class NativeBackend: PlayerBackend {
                         logger.error("immediate EOF, recovering to 0")
                         dLock.lock()
                         _ = demuxer.seek(to: 0)
-                        self.videoDecoder?.flush(); audioDec?.flush()
+                        self.videoDecoder?.flush()
+                        // Routed through audioDecodeQueue so this can't race a
+                        // still-in-flight decode() of an earlier packet on that
+                        // queue (see audioDecodeQueue's doc comment).
+                        self.audioDecodeQueue.sync { audioDec?.flush() }
                         dLock.unlock()
                         jitter.flush()
                         clock.reset(to: 0, sampleRate: audioDec?.outputSampleRate ?? 44100)
@@ -813,6 +831,11 @@ public final class NativeBackend: PlayerBackend {
                 if pktSize > 0 { totalBytesRead += Int64(pktSize) }
                 let streamIndex = result.streamIndex
                 let packet = result.packet
+                // Set true by the audio branch when it hands packet ownership
+                // to audioDecodeQueue — the tail av_packet_free below must not
+                // also free it in that case (audioDecodeQueue frees it once
+                // decode actually runs).
+                var handedOffPacket = false
 
                 if streamIndex == demuxer.videoStreamIndex {
                     let rawPTS = Self.ptsFromPacket(packet, demuxer: demuxer)
@@ -896,14 +919,23 @@ public final class NativeBackend: PlayerBackend {
                         dLock.unlock()
                         _injectedAudioOutput?.outputCompressed(data, pts: pts, codec: codecName)
                     } else {
-                        // PCM path: decode with FFmpeg and enqueue to AudioUnit.
-                        // Read decoder/output from self each iteration — selectAudioTrack
-                        // may have replaced them since the loop started.
+                        // PCM path: decode with FFmpeg and enqueue to AudioUnit,
+                        // off the demux/video thread (see audioDecodeQueue's doc
+                        // comment). Capture decoder/output now — selectAudioTrack
+                        // may replace self.audioDecoder/audioUnitOutput before
+                        // this actually runs on the queue; currentDec/currentOut
+                        // stay bound to whatever was current when this packet was
+                        // read, matching the previous synchronous behavior.
                         let currentDec = self.audioDecoder
                         let currentOut = self.audioUnitOutput
-                        let pcm = currentDec?.decode(packet: packet)
                         dLock.unlock()
-                        if let pcm { currentOut?.enqueue(pcm) }
+                        handedOffPacket = true
+                        audioDecodeQueue.async {
+                            let pcm = currentDec?.decode(packet: packet)
+                            if let pcm { currentOut?.enqueue(pcm) }
+                            var p: UnsafeMutablePointer<AVPacket>? = packet
+                            av_packet_free(&p)
+                        }
                     }
                 } else if streamIndex == demuxer.subtitleStreamIndex,
                           demuxer.subtitleStreamIndex >= 0 {
@@ -970,8 +1002,10 @@ public final class NativeBackend: PlayerBackend {
                     dLock.unlock()
                 }
 
-                var p: UnsafeMutablePointer<AVPacket>? = packet
-                av_packet_free(&p)
+                if !handedOffPacket {
+                    var p: UnsafeMutablePointer<AVPacket>? = packet
+                    av_packet_free(&p)
+                }
             }
         }
     }
@@ -1435,7 +1469,10 @@ public final class NativeBackend: PlayerBackend {
         demuxLock.lock()
         seekLock.withLock { seekSerial += 1 }
         _ = demuxer?.seek(to: secs)
-        videoDecoder?.flush(); audioDecoder?.flush()
+        videoDecoder?.flush()
+        // Routed through audioDecodeQueue so this can't race a still-in-flight
+        // decode() of a pre-seek packet on that queue.
+        audioDecodeQueue.sync { audioDecoder?.flush() }
         demuxLock.unlock()
 
         subtitleLock.withLock { subtitleCues.removeAll() }
@@ -1521,7 +1558,9 @@ public final class NativeBackend: PlayerBackend {
         // pair of (audioStreamIndex, audioDecoder). Creating the decoder outside the lock
         // caused the loop to feed new-stream packets into the stale old decoder.
         demuxLock.lock()
-        audioDecoder?.flush()
+        // Routed through audioDecodeQueue so this can't race a still-in-flight
+        // decode() of an old-track packet on that queue.
+        audioDecodeQueue.sync { audioDecoder?.flush() }
         audioDecoder = nil
         guard demuxer.selectAudioStream(by: trackId) else {
             demuxLock.unlock()
