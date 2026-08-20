@@ -2,6 +2,9 @@
 import Foundation
 import PlayerKit
 import CFFmpeg
+import os
+
+private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "avio")
 
 /// Bridges a Swift `MediaRandomAccessReader` to ffmpeg's synchronous C I/O callbacks.
 ///
@@ -138,6 +141,11 @@ final class AVIOBridge: @unchecked Sendable {
             currentOffset += Int64(n)
             return Int32(n)
         } catch {
+            // Previously silent — a thrown reader error (network timeout, SSL
+            // failure, cancelled task, etc.) turned into a bare -1 with no
+            // trace of *why*, making a demuxer-side "av_read_frame error: -1"
+            // undebuggable from the console log alone.
+            logger.error("read failed at offset=\(offset) length=\(length): \(error.localizedDescription, privacy: .public)")
             return -1  // AVERROR
         }
     }
