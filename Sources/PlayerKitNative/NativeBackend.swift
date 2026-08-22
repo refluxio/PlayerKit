@@ -759,6 +759,21 @@ public final class NativeBackend: PlayerBackend {
             }
             state.subtitleTracks = subs
             logger.info("subtitle tracks: \(subs.count)")
+
+            // Auto-select a subtitle stream if the demuxer hasn't already.
+            // Without this, applyStreamDiscard() sets AVDISCARD_ALL on every
+            // subtitle stream (because subtitleStream == nil), so PGS packets
+            // are never read and bitmap subtitles never appear. Prefer the
+            // stream with AV_DISPOSITION_DEFAULT; fall back to the first
+            // subtitle stream of any type.
+            if demuxer.subtitleStreamIndex < 0, !subs.isEmpty {
+                let defaultSub = subs.first(where: { $0.isDefault }) ?? subs.first
+                if let id = defaultSub?.id {
+                    demuxer.selectSubtitleStream(by: id)
+                    state.selectedSubtitleTrackId = id
+                    logger.info("[sub] auto-selected stream \(id) (default=\(defaultSub?.isDefault ?? false))")
+                }
+            }
         }
 
         // Initialize graphic subtitle decoder for PGS/VOBSUB streams
