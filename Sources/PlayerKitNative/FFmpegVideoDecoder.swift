@@ -20,6 +20,16 @@ final class FFmpegVideoDecoder {
     /// Per-frame Level 1 / Level 6 come from `AV_FRAME_DATA_DOVI_METADATA`.
     private let doviConfig: DolbyVisionFrameMetadata?
 
+    // Cached YUV→BGRA conversion context for convertSWFrame(), keyed by
+    // (width, height, source pixel format). Recreated only when those change
+    // (e.g. never, for a fixed-resolution stream) instead of every single
+    // frame — sws_getContext/sws_freeContext per frame was pure per-frame
+    // allocation churn with no correctness benefit.
+    private var swsCtx: UnsafeMutablePointer<SwsContext>?
+    private var swsWidth: Int32 = 0
+    private var swsHeight: Int32 = 0
+    private var swsSrcFormat = AV_PIX_FMT_NONE
+
     var width:  Int { Int(codecCtx?.pointee.width  ?? 0) }
     var height: Int { Int(codecCtx?.pointee.height ?? 0) }
 
@@ -201,15 +211,46 @@ final class FFmpegVideoDecoder {
                          Int32(frame.pointee.linesize.1),
                          Int32(frame.pointee.linesize.2)]
         var dstStride = Int32(stride)
-        guard let sws = sws_getContext(
-            Int32(w), Int32(h), AVPixelFormat(rawValue: frame.pointee.format),
-            Int32(w), Int32(h), AV_PIX_FMT_BGRA,
-            Int32(SWS_BICUBIC.rawValue), nil, nil, nil
-        ) else { return nil }
-        defer { sws_freeContext(sws) }
+        let srcFormat = AVPixelFormat(rawValue: frame.pointee.format)
+        guard let sws = swsContext(width: Int32(w), height: Int32(h), srcFormat: srcFormat) else { return nil }
         sws_scale(sws, &srcSlice, &srcStride, 0, Int32(h),
                   [base.assumingMemoryBound(to: UInt8.self)], &dstStride)
         return pb
+    }
+
+    /// Returns a cached swscale context for the given (width, height,
+    /// srcFormat), recreating it — and re-applying colorspace details —
+    /// only when those change. The colorspace is set explicitly from the
+    /// stream's actual matrix/range (rather than left at swscale's default,
+    /// which is BT.601 limited-range — wrong for the common BT.709 case and
+    /// silently producing incorrect colours with no error).
+    private func swsContext(width: Int32, height: Int32, srcFormat: AVPixelFormat) -> UnsafeMutablePointer<SwsContext>? {
+        if let existing = swsCtx, width == swsWidth, height == swsHeight, srcFormat == swsSrcFormat {
+            return existing
+        }
+        if let existing = swsCtx { sws_freeContext(existing) }
+        swsCtx = nil
+        guard let sws = sws_getContext(
+            width, height, srcFormat,
+            width, height, AV_PIX_FMT_BGRA,
+            Int32(SWS_BICUBIC.rawValue), nil, nil, nil
+        ) else { return nil }
+        let colorspace: Int32
+        switch colorParams.matrix {
+        case .bt709:  colorspace = Int32(SWS_CS_ITU709)
+        case .bt601:  colorspace = Int32(SWS_CS_ITU601)
+        case .bt2020: colorspace = Int32(SWS_CS_BT2020)
+        }
+        let srcRange: Int32 = colorParams.range == .full ? 1 : 0
+        if let coeffs = sws_getCoefficients(colorspace) {
+            // dstRange=1 (full range) — BGRA output has no limited-range concept.
+            _ = sws_setColorspaceDetails(sws, coeffs, srcRange, coeffs, 1, 0, 1 << 16, 1 << 16)
+        }
+        swsCtx = sws
+        swsWidth = width
+        swsHeight = height
+        swsSrcFormat = srcFormat
+        return sws
     }
 
     // MARK: - 10-bit biplanar output
@@ -488,6 +529,7 @@ final class FFmpegVideoDecoder {
     deinit {
         FFmpegVideoDecoder.safeFree(&self.codecCtx)
         if hwDeviceCtx != nil { av_buffer_unref(&self.hwDeviceCtx) }
+        if let sws = swsCtx { sws_freeContext(sws) }
         logger.info("deinit, decoded \(self.decodedFrames) frames")
     }
 
