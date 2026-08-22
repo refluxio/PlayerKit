@@ -146,19 +146,6 @@ public final class NativeBackend: PlayerBackend {
     // normal "nearest keyframe was slightly before the seek target" rounding
     // (typically well under a second for BD content) — see displayNextFrame().
     private let maxCalibrationGap: Double = 5.0
-    // Set after play()/seek()/selectAudioTrack(). The displayNextFrame
-    // calibration aligns audioClock to the first *video* PTS, but FFmpeg seeks
-    // audio and video streams independently — their keyframe landing points can
-    // differ by up to several seconds.  Without aligning audioClock to the first
-    // *audio* PTS too, audio playback starts from the audio stream's actual seek
-    // landing while the clock claims it's at the video's seek landing → a constant,
-    // non-converging A/V offset (audio content doesn't match what's on screen).
-    // This flag triggers one-shot recalibration to the first decoded audio PTS.
-    // Written from main thread (play/seek/selectAudioTrack), read+cleared from
-    // audioDecodeQueue (demux loop).  Bool is atomic on ARM64; one-shot semantics
-    // tolerate the rare lost-write race (if cleared by demux before main sets it,
-    // the calibration just doesn't happen that cycle — no crash, no divergence).
-    private nonisolated(unsafe) var needsAudioCalibration: Bool = false
 
     // Subtitle cue buffer — written from demux loop, read from display loop.
     private struct SubtitleCue {
@@ -843,7 +830,6 @@ public final class NativeBackend: PlayerBackend {
         // tick — same as post-seek calibration. Required for H.264 B-frame streams
         // whose PTS does not start at 0 (priming delay).
         needsClockCalibration = true
-        needsAudioCalibration = true
         audioClockReady = false
 
         state.isPlaying = true
@@ -1117,25 +1103,10 @@ public final class NativeBackend: PlayerBackend {
                         // read, matching the previous synchronous behavior.
                         let currentDec = self.audioDecoder
                         let currentOut = self.audioUnitOutput
-                        let needsAudioCalib = self.needsAudioCalibration
                         dLock.unlock()
                         handedOffPacket = true
                         audioDecodeQueue.async {
                             let pcm = currentDec?.decode(packet: packet)
-                            // One-shot calibration: align audioClock to the first
-                            // decoded audio PTS.  The displayNextFrame calibration
-                            // aligns to video PTS, but FFmpeg seeks audio/video
-                            // streams independently (different keyframe landing
-                            // points).  Without this, audio playback starts from
-                            // the audio stream's actual position while audioClock
-                            // claims to be at the video's position → a constant,
-                            // non-converging A/V offset (audio content doesn't
-                            // match what's on screen).
-                            if let pcm, needsAudioCalib {
-                                self.audioClock.calibrate(to: pcm.pts,
-                                    sampleRate: currentDec?.outputSampleRate ?? 44100)
-                                self.needsAudioCalibration = false
-                            }
                             if let pcm { currentOut?.enqueue(pcm) }
                             var p: UnsafeMutablePointer<AVPacket>? = packet
                             av_packet_free(&p)
@@ -1708,7 +1679,6 @@ public final class NativeBackend: PlayerBackend {
         // would be ahead of the first decoded frame; without re-calibration the
         // display loop's skip-behind guard would drop the first few frames.
         needsClockCalibration = true
-        needsAudioCalibration = true
         audioClockReady = false
     }
 
@@ -1730,8 +1700,6 @@ public final class NativeBackend: PlayerBackend {
         syncController.reset()
         audioClock.reset(to: 0, sampleRate: 44100)  // critical: must reset or stale seek position
                                                      // from previous session pollutes AudioClock
-        needsClockCalibration = false
-        needsAudioCalibration = false
         _renderer.flush()
         _renderer.clear()  // hide the previous video's last frame until the new
                            // video renders its first frame (MetalRenderer.display
@@ -1797,7 +1765,6 @@ public final class NativeBackend: PlayerBackend {
         audioUnitOutput?.start(sampleRate: sr, channels: ch)
         audioUnitOutput?.pause()
         needsClockCalibration = true
-        needsAudioCalibration = true
         // Reset audioClockReady — TrueHD has significant decoder delay (first
         // several packets produce no PCM output), so audioClock stays frozen at
         // posSecs while video PTS advances.  Without this reset, the display
