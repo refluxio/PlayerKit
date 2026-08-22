@@ -1765,6 +1765,15 @@ public final class NativeBackend: PlayerBackend {
         audioUnitOutput?.start(sampleRate: sr, channels: ch)
         audioUnitOutput?.pause()
         needsClockCalibration = true
+        // Reset audioClockReady — TrueHD has significant decoder delay (first
+        // several packets produce no PCM output), so audioClock stays frozen at
+        // posSecs while video PTS advances.  Without this reset, the display
+        // loop's freeze-ahead/skip-behind guard uses the stale audioClock and
+        // produces a persistent A/V desync that never converges.  Mirrors the
+        // seek()/play() paths which both set audioClockReady = false.
+        audioClockReady = false
+        // Reset download tracking for the new seek position (same as seek()).
+        maxDownloadedPts = posSecs
 
         // 6. Update state
         state.selectedAudioTrackId = trackId
