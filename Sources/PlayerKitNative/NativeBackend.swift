@@ -882,6 +882,7 @@ public final class NativeBackend: PlayerBackend {
             // repeating" report.
             var diagAppendCount = 0
             var diagLastAppendedPts = -Double.infinity
+            var lastThrottleAudioPos: Double = 0
 
             let frameDuration: Double
             if let vs = demuxer.videoStream {
@@ -1035,10 +1036,21 @@ public final class NativeBackend: PlayerBackend {
                     // We sleep AT MOST 50ms per video packet so the outer loop
                     // continues reading audio/subtitle packets in between, keeping
                     // the AudioUnit queue fed and subtitle cues pre-read.
+                    //
+                    // CRITICAL: skip the throttle when audioClock has not advanced
+                    // since the last iteration (AudioQueue underrun). If we sleep
+                    // while audio is stalled, the demux loop never reads audio
+                    // packets (they're next in the TS interleave), the AudioQueue
+                    // stays empty, and audioClock never recovers — a deadlock.
+                    // Observed on 4K HEVC UHD remuxes where VT decode is slow
+                    // enough that the 50ms throttle × 24fps = 1.2s/s of sleep
+                    // starves the audio path entirely.
                     let audioPos = clock.audioTime
-                    if pts.isFinite && pts > audioPos + 2.0 {
+                    if pts.isFinite && pts > audioPos + 2.0,
+                       audioPos > lastThrottleAudioPos {
                         Thread.sleep(forTimeInterval: min(pts - audioPos - 2.0, 0.050))
                     }
+                    lastThrottleAudioPos = audioPos
 
                 } else if streamIndex == demuxer.audioStreamIndex {
                     let codecName = String(cString: avcodec_get_name(
