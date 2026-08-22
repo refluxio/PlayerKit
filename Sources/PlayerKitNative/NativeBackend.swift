@@ -102,7 +102,7 @@ public final class NativeBackend: PlayerBackend {
         weak var sink: (any FrameSink)?
     }
 
-    private var demuxer: FFmpegDemuxer?
+    private var demuxer: (any PacketDemuxing)?
     /// VT may fail on extreme-parameter streams (e.g. 4K@120fps).
     /// When that happens the demux loop hot-swaps in a software FFmpegVideoDecoder.
     /// Written once in _finishOpen(), then swapped from the demux queue on fallback.
@@ -421,11 +421,96 @@ public final class NativeBackend: PlayerBackend {
         }
     }
 
-    private func _finishOpen(demuxer: FFmpegDemuxer, url: URL, headers: [String: String],
+    /// Start playback of an ordered sequence of independently-timed clips
+    /// (BDMV disc playback) as one continuous presentation timeline, using
+    /// MultiClipDemuxer's per-clip demux + PTS rebase instead of ffmpeg's
+    /// concat demuxer (these readers are custom-I/O, not URL-openable by
+    /// ffmpeg — see `play(concatURLs:)` for the URL-based alternative).
+    /// - Parameters:
+    ///   - clips: Ordered clips; `reader` feeds each clip's bytes to ffmpeg,
+    ///     `durationSecs` is the clip's own real duration (caller-supplied,
+    ///     e.g. from BD playlist metadata). Must be non-empty with all
+    ///     durations > 0.
+    ///   - seekTo: Optional start position (global timeline).
+    ///   - knownDuration: Pre-known total duration, skips probe if non-nil.
+    public func play(clips: [(reader: any MediaRandomAccessReader, durationSecs: Double)],
+                     seekTo: Duration?,
+                     knownDuration: Duration? = nil) {
+        stop()
+        state = PlayerState()
+        state.isBuffering = true
+        notifyStateChange()
+
+        guard !clips.isEmpty else {
+            state.error = "play(clips:): no clips"
+            notifyStateChange()
+            return
+        }
+
+        logger.notice("play \(clips.count) clips")
+
+        playGeneration += 1
+        let gen = playGeneration
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+
+            let demuxer = MultiClipDemuxer(clips: clips)
+            guard let demuxer else {
+                let msg = "play(clips:): MultiClipDemuxer init failed (empty clips or non-positive duration)"
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.playGeneration == gen else { return }
+                    self.state.error = msg
+                    self.notifyStateChange()
+                }
+                return
+            }
+            do {
+                // MultiClipDemuxer has no finishOpen of its own — open()
+                // already drives FFmpegDemuxer.open(reader:) for clip 0, which
+                // runs the full avformat_find_stream_info probe, so decoder
+                // setup below can read stream metadata off it directly.
+                try demuxer.open()
+            } catch {
+                logger.error("demuxer.open (clips) FAILED: \(error)")
+                let msg = (error as? CustomStringConvertible)?.description
+                    ?? String(describing: error)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.playGeneration == gen else { return }
+                    self.state.error = msg
+                    self.notifyStateChange()
+                }
+                return
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.playGeneration == gen else {
+                    demuxer.close()
+                    return
+                }
+                self._finishOpen(demuxer: demuxer,
+                                 url: URL(string: "clips://multi")!,
+                                 headers: [:], seekTo: seekTo,
+                                 knownDuration: knownDuration)
+            }
+        }
+    }
+
+    private func _finishOpen(demuxer: any PacketDemuxing, url: URL, headers: [String: String],
                               seekTo: Duration?, knownDuration: Duration?) {
         let t0 = Date()
         self.demuxer = demuxer
-        let demuxDur = demuxer.duration
+        // PacketDemuxing deliberately has no `duration` member (MultiClip's
+        // total timeline length lives on ClipTimeline, not on the current
+        // clip's demuxer), so recover it from the concrete types.
+        let demuxDur: Double
+        if let fd = demuxer as? FFmpegDemuxer {
+            demuxDur = fd.duration
+        } else if let mc = demuxer as? MultiClipDemuxer {
+            demuxDur = mc.timeline.totalDurationSecs
+        } else {
+            demuxDur = 0
+        }
         if let kd = knownDuration, kd > .zero {
             state.duration = kd
         } else if demuxDur > 0 {
@@ -839,7 +924,19 @@ public final class NativeBackend: PlayerBackend {
 
                 if streamIndex == demuxer.videoStreamIndex {
                     let rawPTS = Self.ptsFromPacket(packet, demuxer: demuxer)
-                    let pts = ptsValidator.validate(rawPTS)
+                    // MultiClipDemuxer rebases every packet's PTS onto the
+                    // continuous global timeline before handing it out, so the
+                    // packet right after a clip boundary carries a known-good
+                    // jump — not the kind of >5s anomaly validate() exists to
+                    // detect. Write it in as the new trusted baseline directly
+                    // instead of sending it through blind-clock detection.
+                    let pts: Double
+                    if result.didSwitchClip, rawPTS.isFinite {
+                        ptsValidator.forceRebase(to: rawPTS)
+                        pts = rawPTS
+                    } else {
+                        pts = ptsValidator.validate(rawPTS)
+                    }
                     // Track download progress (highest video PTS read so far)
                     if rawPTS.isFinite && rawPTS > maxDownloadedPts { maxDownloadedPts = rawPTS }
                     if packetCount < 5 || (packetCount % 500 == 0) {
@@ -1011,7 +1108,7 @@ public final class NativeBackend: PlayerBackend {
     }
 
     private nonisolated static func ptsFromPacket(_ packet: UnsafeMutablePointer<AVPacket>,
-                                                   demuxer: FFmpegDemuxer) -> Double {
+                                                   demuxer: any PacketDemuxing) -> Double {
         guard let vs = demuxer.videoStream else { return .nan }
         let tb = vs.pointee.time_base
         let nopts = Int64(bitPattern: 0x8000000000000000)

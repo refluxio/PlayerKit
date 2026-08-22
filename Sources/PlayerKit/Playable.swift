@@ -39,6 +39,22 @@ public protocol Playable: AnyObject {
     func play(concatURLs: [URL], headers: [String: String],
               seekTo: Duration?, knownDuration: Duration?)
 
+    /// Start playback of an ordered sequence of custom-I/O clip readers as
+    /// one continuous presentation timeline (BDMV disc playback). Unlike
+    /// `play(concatURLs:)` (ffmpeg concat demuxer, URL-openable inputs),
+    /// each clip's bytes come from a `MediaRandomAccessReader` that ffmpeg
+    /// cannot open by protocol — the backend demuxes each clip separately
+    /// and rebases PTS onto a continuous timeline.
+    /// - Parameters:
+    ///   - clips: Ordered clips; each carries the clip's reader and its own
+    ///     real duration (caller-supplied, e.g. from BD playlist metadata).
+    ///     Must be non-empty with all durations > 0.
+    ///   - seekTo: Optional start position (global timeline).
+    ///   - knownDuration: Pre-known total duration, skips probe if non-nil.
+    func play(clips: [(reader: any MediaRandomAccessReader, durationSecs: Double)],
+              seekTo: Duration?,
+              knownDuration: Duration?)
+
     /// Pause playback. Call `resume()` to continue.
     func pause()
 

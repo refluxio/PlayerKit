@@ -106,6 +106,7 @@ CODEC_FLAGS=(
   --enable-demuxer=matroska   # mkv/webm
   --enable-demuxer=mpegts
   --enable-demuxer=hls
+  --enable-demuxer=concat     # BD/BDMV 多 clip 拼接播放(playDiscCloud → play(concatURLs:))
   --enable-demuxer=flv
   --enable-demuxer=avi
   --enable-demuxer=ogg

@@ -22,6 +22,15 @@ public protocol MediaRandomAccessReader: AnyObject, Sendable {
     /// Synchronous — called from ffmpeg's I/O thread via avio_alloc_context
     /// callbacks. Implementations must NOT use Swift async/await internally;
     /// use synchronous APIs (e.g. URLSession data task + semaphore) instead.
+    ///
+    /// Concurrency contract: `read` may be invoked concurrently from
+    /// multiple threads. MultiClipDemuxer, for example, pre-opens the next
+    /// clip's reader in the background while the current clip's reader is
+    /// still being read, and in real deployments the readers of adjacent
+    /// clips may share the same underlying connection/resource.
+    /// Implementations must therefore be thread-safe themselves, or the
+    /// caller must guarantee external serialization of the underlying
+    /// shared resource.
     func read(offset: Int64, length: Int, into buffer: UnsafeMutableRawBufferPointer) throws -> Int
 
     /// Release resources (close connections, invalidate sessions).

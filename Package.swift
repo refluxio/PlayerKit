@@ -53,7 +53,8 @@ let package = Package(
         .testTarget(
             name: "PlayerKitTests",
             dependencies: ["PlayerKit", "PlayerKitNative"],
-            path: "Tests/PlayerKitTests"
+            path: "Tests/PlayerKitTests",
+            resources: [.copy("Fixtures")]
         ),
 
         // NativeBackend FFmpeg — built from source by scripts/build_ffmpeg.sh.

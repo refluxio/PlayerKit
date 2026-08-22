@@ -531,7 +531,13 @@ final class FFmpegDemuxer: @unchecked Sendable {
         return refined
     }
 
-    func readPacket() -> (streamIndex: Int32, packet: UnsafeMutablePointer<AVPacket>)? {
+    /// Reads the next packet. `didSwitchClip` is always `false` for a single
+    /// file — a mono-file demuxer never switches clips mid-stream. The flag
+    /// exists so `PacketDemuxing` callers (NativeBackend's demux loop) can
+    /// treat the first packet after a `MultiClipDemuxer` clip boundary
+    /// specially (its PTS is a known-good rebase onto the continuous
+    /// timeline, not an anomaly).
+    func readPacket() -> (streamIndex: Int32, packet: UnsafeMutablePointer<AVPacket>, didSwitchClip: Bool)? {
         guard let ctx = formatCtx else { return nil }
         var pkt = av_packet_alloc()
         let ret = av_read_frame(ctx, pkt)
@@ -542,7 +548,7 @@ final class FFmpegDemuxer: @unchecked Sendable {
             av_packet_free(&pkt)
             return nil
         }
-        return (packet.pointee.stream_index, packet)
+        return (packet.pointee.stream_index, packet, false)
     }
 
     // Probe real duration by opening a SEPARATE context on the same URL and

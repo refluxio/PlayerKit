@@ -44,4 +44,15 @@ struct PTSValidator {
         predictPTS = 0
         usingBlindClock = false
     }
+
+    /// Adopt `pts` as the new trusted baseline without anomaly detection.
+    /// Used when the caller knows the timeline jumped deliberately — e.g.
+    /// MultiClipDemuxer's first packet after a clip boundary, whose PTS is
+    /// already rebased onto the continuous global timeline. Bypassing
+    /// validate() here avoids misreading the known switch as a >5s glitch.
+    mutating func forceRebase(to pts: Double) {
+        lastValidPTS = pts
+        predictPTS = pts
+        usingBlindClock = false
+    }
 }

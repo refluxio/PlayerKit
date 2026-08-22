@@ -46,4 +46,21 @@ final class PTSValidatorTests: XCTestCase {
         let result = v.validate(0.0)  // reset 后首帧不触发跳变检测
         XCTAssertEqual(result, 0.0, accuracy: 0.001)
     }
+    func testForceRebaseAdoptsLargeJumpWithoutBlindClock() {
+        var v = PTSValidator(frameDuration: 0.04)
+        _ = v.validate(1.0)
+        // 多clip边界:rebase 后的全局 PTS 从 1s 跳到 60s(59s 跳变 > 5s 阈值)。
+        // forceRebase 直接采信为可信基准,后续正常包不被误判进盲钟。
+        v.forceRebase(to: 60.0)
+        let result = v.validate(60.04)
+        XCTAssertEqual(result, 60.04, accuracy: 0.001)
+    }
+    func testForceRebaseClearsBlindClock() {
+        var v = PTSValidator(frameDuration: 0.04)
+        _ = v.validate(1.0)
+        _ = v.validate(.nan)  // 进入盲钟
+        v.forceRebase(to: 2.0)  // 强制重建基准
+        let result = v.validate(2.04)  // 直接通过,不再走盲钟增量
+        XCTAssertEqual(result, 2.04, accuracy: 0.001)
+    }
 }
