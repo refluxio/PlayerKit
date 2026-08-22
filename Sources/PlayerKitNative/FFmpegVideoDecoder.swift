@@ -152,6 +152,21 @@ final class FFmpegVideoDecoder {
             logger.info("frame #\(self.decodedFrames): \(f.pointee.width)x\(f.pointee.height) fmt=\(f.pointee.format)")
         }
 
+        // avcodec_receive_frame() returns frames in display order, but with
+        // B-frames its output for THIS call can correspond to a packet sent
+        // several calls ago — pairing the caller's submission-order packet
+        // pts with whatever pixel buffer comes back mislabels roughly 1 in 3
+        // frames with a pts several frame-durations too far ahead (confirmed
+        // on-device: exact +3-frame offset, cyclic). best_effort_timestamp is
+        // already correct, monotonically-increasing display-order pts —
+        // convert it through the codec context's time_base and let the
+        // caller use it in place of its own packet-based pts.
+        let ticks = f.pointee.best_effort_timestamp
+        let tb = ctx.pointee.time_base
+        let noPTS = Int64(bitPattern: 0x8000000000000000)
+        let framePTS: Double? = (ticks != noPTS && tb.den > 0)
+            ? Double(ticks) * Double(tb.num) / Double(tb.den) : nil
+
         // Build the per-frame FrameMetadata bundle before av_frame_free drops
         // the side data. All side data pointers are owned by the AVFrame; we
         // copy into Swift value types here so the result is safe to hold past
@@ -160,13 +175,13 @@ final class FFmpegVideoDecoder {
 
         if f.pointee.format == Int32(AV_PIX_FMT_VIDEOTOOLBOX.rawValue) {
             guard let pb = extractHWPixelBuffer(from: f) else { return nil }
-            return DecodedVideoFrame(pixelBuffer: pb, metadata: metadata)
+            return DecodedVideoFrame(pixelBuffer: pb, metadata: metadata, pts: framePTS)
         } else if Self.is10BitPlanar(f.pointee.format) {
             guard let pb = create10BitBiplanarBuffer(from: f) else { return nil }
-            return DecodedVideoFrame(pixelBuffer: pb, metadata: metadata)
+            return DecodedVideoFrame(pixelBuffer: pb, metadata: metadata, pts: framePTS)
         } else {
             guard let pb = convertSWFrame(f) else { return nil }
-            return DecodedVideoFrame(pixelBuffer: pb, metadata: metadata)
+            return DecodedVideoFrame(pixelBuffer: pb, metadata: metadata, pts: framePTS)
         }
     }
 

@@ -959,8 +959,25 @@ public final class NativeBackend: PlayerBackend {
 
                     if let frame = decoded,
                        sLock.withLock({ self.seekSerial }) == currentSerial {
-                        jitter.append(.init(pixelBuffer: frame.pixelBuffer, pts: pts, metadata: frame.metadata))
-                        let ptsCopy = pts
+                        // With B-frames, the pixel buffer returned by THIS
+                        // decode() call can correspond to an earlier-submitted
+                        // packet (decoder-internal reorder) — pairing it with
+                        // this packet's own `pts` mislabels it by a few frame
+                        // durations. When the decoder reports its own
+                        // display-order pts (currently: FFmpegVideoDecoder SW
+                        // fallback path; VTVideoDecoder returns nil here and
+                        // this is a no-op), correct `pts` by the measured
+                        // delta rather than recomputing it from scratch, so
+                        // clip-rebase/anomaly-detection state from the
+                        // rawPTS→pts pipeline above still applies.
+                        let framePts: Double
+                        if let decoderPts = frame.pts, decoderPts.isFinite {
+                            framePts = pts - (rawPTS - decoderPts)
+                        } else {
+                            framePts = pts
+                        }
+                        jitter.append(.init(pixelBuffer: frame.pixelBuffer, pts: framePts, metadata: frame.metadata))
+                        let ptsCopy = framePts
                         DispatchQueue.main.async { [weak self] in
                             guard let self else { return }
                             let d = Duration.milliseconds(Int64(ptsCopy * 1000))
