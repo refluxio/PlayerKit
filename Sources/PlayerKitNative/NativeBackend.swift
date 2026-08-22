@@ -1452,27 +1452,13 @@ public final class NativeBackend: PlayerBackend {
             while let lagging = jitterBuffer.peek(at: 0), lagging.pts < audioTime - 0.06 {
                 jitterBuffer.pop()
             }
-            // Freeze-ahead: if the front frame is ahead of audio, stall.
-            // But when the gap is large (>0.5s), skip-ahead instead of freezing —
-            // freezing for a full second produces the "缓冲-播放-缓冲-播放"
-            // stutter cycle when audio is lagging behind video (common after seek
-            // on 4K UHD where audio primer + packet latency creates a ~1s gap).
-            // Skip-ahead pops the excess frames to realign video with audio,
-            // trading a few dropped frames for smooth continuous playback.
+            // Freeze-ahead: if the front frame is ahead of audio, stall
             if let ahead = jitterBuffer.peek(at: 0), ahead.pts > audioTime + 0.06 {
-                if ahead.pts > audioTime + 0.5 {
-                    // Large gap: drop frames to realign instead of freezing
-                    while let f = jitterBuffer.peek(at: 0), f.pts < audioTime + 0.06 {
-                        jitterBuffer.pop()
-                    }
-                } else {
-                    // Small gap: freeze briefly until audio catches up
-                    let pos = Duration.milliseconds(Int64(audioTime * 1000))
-                    if (pos - lastNotifiedPos) >= .milliseconds(500) {
-                        state.position = pos; notifyStateChange(); lastNotifiedPos = pos
-                    }
-                    return
+                let pos = Duration.milliseconds(Int64(audioTime * 1000))
+                if (pos - lastNotifiedPos) >= .milliseconds(500) {
+                    state.position = pos; notifyStateChange(); lastNotifiedPos = pos
                 }
+                return
             }
         }
 
