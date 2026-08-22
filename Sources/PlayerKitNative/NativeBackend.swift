@@ -1537,8 +1537,13 @@ public final class NativeBackend: PlayerBackend {
 
         // Update active subtitle text. Only notify when the text actually changes
         // to avoid redundant view invalidations on every frame.
+        // Use the displayed frame's PTS (not audioTime) for subtitle matching —
+        // this keeps subtitles in sync with the video, not the audio clock.
+        // Audio clock can lag behind video (seek, primer, underrun) causing
+        // subtitles to appear late when matched against audioTime.
+        let displayPts = popped.pts
         let activeSub: String? = subtitleLock.withLock {
-            subtitleCues.first { $0.startPts <= audioTime && audioTime < $0.endPts }?.text
+            subtitleCues.first { $0.startPts <= displayPts && displayPts < $0.endPts }?.text
         }
         if activeSub != lastSubtitleText {
             lastSubtitleText = activeSub
@@ -1553,9 +1558,9 @@ public final class NativeBackend: PlayerBackend {
             // Prune expired cues so first(where:) doesn't scan a growing list.
             // Keep only cues whose endPts hasn't passed yet.
             if subtitleImageCues.count > 4 {
-                subtitleImageCues.removeAll { $0.endPts < audioTime - 1.0 }
+                subtitleImageCues.removeAll { $0.endPts < displayPts - 1.0 }
             }
-            if let c = subtitleImageCues.first(where: { $0.startPts <= audioTime && audioTime < $0.endPts }) {
+            if let c = subtitleImageCues.first(where: { $0.startPts <= displayPts && displayPts < $0.endPts }) {
                 return (c.image, c.rect)
             }
             return (nil, .zero)
