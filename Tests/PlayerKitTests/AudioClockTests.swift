@@ -18,13 +18,13 @@ final class AudioClockTests: XCTestCase {
     func testPrimeDebtClampsToZero() {
         let clock = AudioClock()
         // 3个 primer buffer，每个 4096 bytes，2ch → 欠账 1536 样本
-        clock.primeDebt(bufferCount: 3, bytesPerBuffer: 4096, channels: 2)
+        clock.startPrimer(bufferCount: 3, bytesPerBuffer: 4096, channels: 2)
         XCTAssertEqual(clock.audioTime, 0.0, "primer 债务期间 audioTime 应被夹到 0")
     }
 
     func testPrimeDebtPaidOff() {
         let clock = AudioClock()
-        clock.primeDebt(bufferCount: 3, bytesPerBuffer: 4096, channels: 2)
+        clock.startPrimer(bufferCount: 3, bytesPerBuffer: 4096, channels: 2)
         // 消费 3 × 4096 bytes 的 primer 数据（偿清债务）
         clock.advance(byteCount: 3 * 4096, channels: 2)
         XCTAssertEqual(clock.audioTime, 0.0, accuracy: 0.001, "债务还清后 audioTime 应为 0")
