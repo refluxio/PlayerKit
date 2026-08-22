@@ -3,7 +3,7 @@ import Foundation
 /// ffplay-style frame_timer + low-pass A/V sync. Main-thread only — no locks needed.
 final class SyncController {
 
-    let alpha: Double = 0.1
+    let alpha: Double = 0.15
     let maxDelay: Double = 0.5
 
     /// Display pipeline latency compensation. ASBDLRenderer.enqueue() is
@@ -11,7 +11,8 @@ final class SyncController {
     /// Without compensation, sync thinks video is on-time but the user sees
     /// audio/subtitles ahead of video. This offset makes sync treat video as
     /// slightly behind audio, so it speeds up video to compensate.
-    let displayLatencyCompensation: Double = 0.03  // ~1 frame at 24fps
+    /// 50ms ≈ 2 frames at 24fps — covers ASBDL's HDR tone mapping + vsync wait.
+    let displayLatencyCompensation: Double = 0.05
 
     private var frameTimer: Double = 0
     private var frameTimerSerial: Int64 = -1
