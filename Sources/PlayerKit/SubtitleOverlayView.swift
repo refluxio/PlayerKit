@@ -11,10 +11,13 @@ public struct SubtitleOverlayView: View {
     public let player: Player
     /// User-adjustable vertical offset in points (positive = move down, negative = move up).
     public var verticalOffset: CGFloat = 0
+    /// User-adjustable horizontal offset in points (positive = move right, negative = move left).
+    public var horizontalOffset: CGFloat = 0
 
-    public init(player: Player, verticalOffset: CGFloat = 0) {
+    public init(player: Player, verticalOffset: CGFloat = 0, horizontalOffset: CGFloat = 0) {
         self.player = player
         self.verticalOffset = verticalOffset
+        self.horizontalOffset = horizontalOffset
     }
 
     public var body: some View {
@@ -75,7 +78,7 @@ public struct SubtitleOverlayView: View {
             .padding(.horizontal, 24)
             .frame(maxWidth: videoRect.width - 16)
             .padding(.bottom, 20)
-            .offset(y: verticalOffset)
+            .offset(x: horizontalOffset, y: verticalOffset)
     }
 
     private func bitmapSubtitle(_ image: CGImage, rect: CGRect,
@@ -89,6 +92,6 @@ public struct SubtitleOverlayView: View {
         return Image(decorative: image, scale: 1)
             .resizable()
             .frame(width: frame.width, height: frame.height)
-            .position(x: frame.midX, y: frame.midY + verticalOffset)
+            .position(x: frame.midX + horizontalOffset, y: frame.midY + verticalOffset)
     }
 }
