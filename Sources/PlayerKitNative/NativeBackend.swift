@@ -872,7 +872,10 @@ public final class NativeBackend: PlayerBackend {
 
     private func startDemuxLoop() {
         demuxCancelled = false
-        let demuxer = self.demuxer!
+        guard let demuxer = self.demuxer else {
+            logger.error("startDemuxLoop: demuxer is nil (stop was called?)")
+            return
+        }
         let audioDec = audioDecoder
         let audioOut = audioUnitOutput
         let clock = audioClock
@@ -1616,6 +1619,10 @@ public final class NativeBackend: PlayerBackend {
     }
 
     public func resume() {
+        guard demuxer != nil else {
+            logger.warning("resume: demuxer is nil, player was stopped — ignoring")
+            return
+        }
         logger.info("resume")
         // Re-activate the AudioSession.  After a background/PiP transition iOS may
         // deactivate the session, which silently prevents AudioQueue callbacks
