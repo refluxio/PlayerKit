@@ -1151,6 +1151,23 @@ public final class NativeBackend: PlayerBackend {
                             // displays immediately instead of being skipped.
                             let adjustedStart = cue.startPts < audioPos ? audioPos : cue.startPts
                             self.subtitleImageLock.withLock {
+                                // Truncate existing cues' endPts to the new cue's
+                                // startPts so the old subtitle stops displaying
+                                // when the new one starts. Without this, the old
+                                // cue (with a long endPts from PGS UINT32_MAX
+                                // fallback) would shadow the new cue —
+                                // first(where:) matches the old one first since
+                                // its endPts hasn't been reached yet.
+                                let cutoff = adjustedStart
+                                for i in self.subtitleImageCues.indices {
+                                    if self.subtitleImageCues[i].endPts > cutoff {
+                                        self.subtitleImageCues[i] = SubtitleImageCue(
+                                            startPts: self.subtitleImageCues[i].startPts,
+                                            endPts: cutoff,
+                                            image: self.subtitleImageCues[i].image,
+                                            rect: self.subtitleImageCues[i].rect)
+                                    }
+                                }
                                 self.subtitleImageCues.append(
                                     SubtitleImageCue(startPts: adjustedStart, endPts: cue.endPts,
                                                      image: cue.image, rect: cue.rect)
