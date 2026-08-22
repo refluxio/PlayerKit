@@ -459,16 +459,18 @@ final class FFmpegDemuxer: @unchecked Sendable {
                     videoStreamScore = score
                 }
             } else if codecType == AVMEDIA_TYPE_AUDIO {
-                // Prefer lightweight codecs for PCM decode (DTS > AC3 > AAC > TrueHD).
-                // TrueHD is extremely expensive to software decode (8-channel MLP),
-                // causing CPU starvation on iOS alongside 4K HEVC decoding.
-                // Only pick TrueHD if no lighter codec is available.
+                // Prefer lightweight codecs for PCM decode, but prefer TrueHD
+                // over AC3 — some BD ISOs have TrueHD as the only real audio
+                // track with AC3 as an empty placeholder stream.
+                // Selecting the empty AC3 → no sound. TrueHD on 1080p H.264
+                // is fine on iOS (the heavy case is 4K HEVC + TrueHD together).
                 let score: Int
                 switch codecId {
+                case AV_CODEC_ID_TRUEHD: score = 5
                 case AV_CODEC_ID_AAC, AV_CODEC_ID_MP3: score = 4
                 case AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3: score = 3
-                case AV_CODEC_ID_DTS: score = 2
-                case AV_CODEC_ID_TRUEHD: score = 1
+                case AV_CODEC_ID_DTS: score = 3
+                case AV_CODEC_ID_PCM_BLURAY: score = 2
                 default: score = 3
                 }
                 if audioStream == nil || score > audioStreamScore {
