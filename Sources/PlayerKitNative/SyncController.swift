@@ -6,6 +6,13 @@ final class SyncController {
     let alpha: Double = 0.1
     let maxDelay: Double = 0.5
 
+    /// Display pipeline latency compensation. ASBDLRenderer.enqueue() is
+    /// async — the frame appears on screen ~1-2 vsync intervals after enqueue.
+    /// Without compensation, sync thinks video is on-time but the user sees
+    /// audio/subtitles ahead of video. This offset makes sync treat video as
+    /// slightly behind audio, so it speeds up video to compensate.
+    let displayLatencyCompensation: Double = 0.03  // ~1 frame at 24fps
+
     private var frameTimer: Double = 0
     private var frameTimerSerial: Int64 = -1
     private(set) var lastDisplayedPTS: Double = -1
@@ -71,7 +78,13 @@ final class SyncController {
         // With α=0.1 and typical diff in ±50ms, correction is ±5ms — well below
         // one-frame duration (~33ms) and imperceptible, but still pulls video
         // toward audio continuously.
-        let diff = nextPTS - audioTime  // >0: video ahead; <0: video behind
+        //
+        // displayLatencyCompensation: ASBDLRenderer.enqueue() is async, so the
+        // frame actually appears on screen 1-2 vsyncs after we call enqueue.
+        // Without this, sync thinks video is on-time but the user perceives
+        // audio/subtitles ahead of video. Subtracting the compensation from
+        // diff makes sync think video is slightly behind, speeding it up.
+        let diff = nextPTS - audioTime - displayLatencyCompensation
         let delay = nominalDelay + alpha * diff
         return max(0, min(delay, maxDelay))
     }
