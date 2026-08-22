@@ -1603,6 +1603,15 @@ public final class NativeBackend: PlayerBackend {
         displayLinkProxy = nil
         #endif
         audioUnitOutput?.pause()
+        // Stop the demux loop so jitterBuffer doesn't fill up while audio is
+        // paused. Without this, the demux loop keeps reading packets and
+        // appending frames (video throttle skips sleep when audioClock is
+        // stalled), accumulating tens of seconds of video ahead of the paused
+        // audio position. On resume, freeze-ahead guard holds all frames
+        // → stutter/卡顿.
+        demuxLock.lock()
+        demuxCancelled = true
+        demuxLock.unlock()
         state.isPlaying = false; notifyStateChange()
     }
 
@@ -1634,7 +1643,16 @@ public final class NativeBackend: PlayerBackend {
         #if os(iOS)
         displayLinkProxy = nil
         #endif
+        // Restart the demux loop (pause() set demuxCancelled=true).
+        // Flush stale frames that accumulated during pause to prevent
+        // freeze-ahead stutter on resume.
+        jitterBuffer.flush()
+        syncController.reset()
+        startDemuxLoop()
         startDisplayLink()
+        // Calibrate audioClock to the first post-resume frame (like post-seek).
+        needsClockCalibration = true
+        audioClockReady = false
         state.isPlaying = true; notifyStateChange()
     }
 
