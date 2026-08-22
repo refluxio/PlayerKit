@@ -35,6 +35,9 @@ final class VTVideoDecoder {
     // Set by vtDecode when VT returns a non-zero status (real decode error).
     private var lastVTError = false
 
+    private let streamStartTime: Int64
+    private let streamTimeBase: AVRational
+
     // Per-NAL-type success/failure counts, split IDR vs non-IDR. Some BD
     // H.264 streams make VT fail the majority of non-IDR (P/B) NALs with
     // kVTVideoDecoderBadDataErr while every IDR decodes fine; keyframes are
@@ -81,6 +84,8 @@ final class VTVideoDecoder {
     init?(stream: UnsafeMutablePointer<AVStream>, prefer10Bit: Bool = false,
           colorParams: VideoColorParams = VideoColorParams()) {
         let cp = stream.pointee.codecpar.pointee
+        self.streamStartTime = stream.pointee.start_time
+        self.streamTimeBase  = stream.pointee.time_base
         // VideoToolbox only decodes H.264 and HEVC. Without this guard, every
         // other codec (RealVideo rv40, VP8, old MPEG-4 profiles, WMV...) falls
         // through the `isH264 ? H.264 : HEVC` binary below and gets silently
@@ -202,7 +207,27 @@ final class VTVideoDecoder {
             }
         }
 
-        let pbOpt = vtDecode(lpData: lpData, session: session, formatDesc: formatDesc)
+        // Build CMSampleTimingInfo from the packet's PTS/DTS so VT can
+        // reorder B-frames correctly. Without this (previously all-zero),
+        // VT emits frames in decode order, and the caller has no way to
+        // recover display-order PTS → ~1/3 of frames are mislabelled,
+        // producing visible judder on B-frame-heavy BD content.
+        let noPTS = Int64(bitPattern: 0x8000000000000000)
+        let timescale = Int32(max(streamTimeBase.den, 1))
+        let ptsCMTime: CMTime = packet.pointee.pts != noPTS
+            ? CMTime(value: CMTimeValue(packet.pointee.pts), timescale: timescale)
+            : .invalid
+        let dtsCMTime: CMTime = packet.pointee.dts != noPTS
+            ? CMTime(value: CMTimeValue(packet.pointee.dts), timescale: timescale)
+            : .invalid
+        let timing = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: ptsCMTime,
+            decodeTimeStamp: dtsCMTime
+        )
+
+        let (pbOpt, outPTS) = vtDecode(lpData: lpData, session: session,
+                                       formatDesc: formatDesc, timing: timing)
         if pbOpt != nil {
             if isIDR { idrSuccessCount += 1 } else { nonIDRSuccessCount += 1 }
         } else {
@@ -222,7 +247,20 @@ final class VTVideoDecoder {
         }
         // VT strips Dolby Vision RPU side data, so per-frame metadata is empty.
         // DoVi streams forced to FFmpeg SW in NativeBackend carry per-frame DM.
-        return DecodedVideoFrame(pixelBuffer: pb, metadata: FrameMetadata())
+        // Convert VT's output PTS (display-order, post-reorder) to the same
+        // t=0-relative timeline as the caller's ptsFromPacket() by subtracting
+        // stream start_time — without this, BD streams with ~600s start_time
+        // would put decoderPts far ahead of rawPTS, failing the sanity bound.
+        var framePTS: Double? = nil
+        if outPTS.isValid {
+            var ptsSecs = Double(outPTS.value) / Double(outPTS.timescale)
+            if streamStartTime != noPTS {
+                let startOffset = Double(streamStartTime) * Double(streamTimeBase.num) / Double(max(streamTimeBase.den, 1))
+                ptsSecs -= startOffset
+            }
+            framePTS = ptsSecs
+        }
+        return DecodedVideoFrame(pixelBuffer: pb, metadata: FrameMetadata(), pts: framePTS)
     }
 
     // MARK: - flush / deinit
@@ -262,14 +300,15 @@ final class VTVideoDecoder {
 
     private func vtDecode(lpData: Data,
                           session: VTDecompressionSession,
-                          formatDesc: CMVideoFormatDescription) -> CVPixelBuffer? {
+                          formatDesc: CMVideoFormatDescription,
+                          timing: CMSampleTimingInfo) -> (CVPixelBuffer?, CMTime) {
         var blockBuf: CMBlockBuffer?
         guard CMBlockBufferCreateWithMemoryBlock(
             allocator: kCFAllocatorDefault, memoryBlock: nil,
             blockLength: lpData.count, blockAllocator: kCFAllocatorDefault,
             customBlockSource: nil, offsetToData: 0, dataLength: lpData.count,
             flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &blockBuf
-        ) == kCMBlockBufferNoErr, let bb = blockBuf else { return nil }
+        ) == kCMBlockBufferNoErr, let bb = blockBuf else { return (nil, .invalid) }
 
         var ok = false
         lpData.withUnsafeBytes { raw in
@@ -278,24 +317,26 @@ final class VTVideoDecoder {
                 offsetIntoDestination: 0, dataLength: lpData.count
             ) == kCMBlockBufferNoErr
         }
-        guard ok else { return nil }
+        guard ok else { return (nil, .invalid) }
 
-        var timing    = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
+        var timingInfo = timing
         var sampleLen = lpData.count
         var sb: CMSampleBuffer?
         guard CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: bb,
             formatDescription: formatDesc, sampleCount: 1,
-            sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleTimingEntryCount: 1, sampleTimingArray: &timingInfo,
             sampleSizeEntryCount: 1, sampleSizeArray: &sampleLen,
             sampleBufferOut: &sb
-        ) == noErr, let sb else { return nil }
+        ) == noErr, let sb else { return (nil, .invalid) }
 
         var result: CVPixelBuffer?
         var decodeError = false
-        VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb, flags: [], infoFlagsOut: nil) { status, _, buf, _, _ in
+        var outputPTS: CMTime = .invalid
+        VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb, flags: [], infoFlagsOut: nil) { status, _, buf, pts, _ in
             if status != noErr { decodeError = true }
             result = buf
+            outputPTS = pts
         }
         lastVTError = decodeError
 
@@ -312,7 +353,7 @@ final class VTVideoDecoder {
             CVBufferSetAttachment(buf, kCVImageBufferYCbCrMatrixKey,
                                   kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
         }
-        return result
+        return (result, outputPTS)
     }
 
     // MARK: - Codec-parameter extraction (FFmpeg 8.x aware)

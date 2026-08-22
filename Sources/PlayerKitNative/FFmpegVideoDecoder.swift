@@ -15,6 +15,9 @@ final class FFmpegVideoDecoder {
     let isHardware: Bool
     private var decodedFrames = 0
 
+    private let streamStartTime: Int64
+    private let streamTimeBase: AVRational
+
     /// Stream-level DoVi config (profile + BL signal compatibility id),
     /// read once from `AV_PKT_DATA_DOVI_CONF` in codecpar coded_side_data.
     /// Per-frame Level 1 / Level 6 come from `AV_FRAME_DATA_DOVI_METADATA`.
@@ -94,6 +97,9 @@ final class FFmpegVideoDecoder {
             }
         }
 
+        self.streamStartTime = stream.pointee.start_time
+        self.streamTimeBase  = stream.pointee.time_base
+
         ctx.pointee.time_base = stream.pointee.time_base
 
         if forceSoftware {
@@ -159,13 +165,21 @@ final class FFmpegVideoDecoder {
         // frames with a pts several frame-durations too far ahead (confirmed
         // on-device: exact +3-frame offset, cyclic). best_effort_timestamp is
         // already correct, monotonically-increasing display-order pts —
-        // convert it through the codec context's time_base and let the
-        // caller use it in place of its own packet-based pts.
+        // convert it through the stream's time_base and subtract start_time
+        // so the result is on the same t=0-relative timeline as the caller's
+        // ptsFromPacket(), letting the bounded correction in NativeBackend
+        // actually fire (without this, start_time offsets of ~600s on BD
+        // streams make decoderPts >> rawPTS, failing the sanity bound and
+        // silently disabling the correction).
         let ticks = f.pointee.best_effort_timestamp
-        let tb = ctx.pointee.time_base
+        let tb = streamTimeBase
         let noPTS = Int64(bitPattern: 0x8000000000000000)
-        let framePTS: Double? = (ticks != noPTS && tb.den > 0)
+        var framePTS: Double? = (ticks != noPTS && tb.den > 0)
             ? Double(ticks) * Double(tb.num) / Double(tb.den) : nil
+        if let p = framePTS, streamStartTime != noPTS {
+            let startOffset = Double(streamStartTime) * Double(tb.num) / Double(tb.den)
+            framePTS = p - startOffset
+        }
 
         // Build the per-frame FrameMetadata bundle before av_frame_free drops
         // the side data. All side data pointers are owned by the AVFrame; we

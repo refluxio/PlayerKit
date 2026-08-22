@@ -862,6 +862,11 @@ public final class NativeBackend: PlayerBackend {
             var packetCount: Int32 = 0
             var eofRecoveryDone = false
             var lastSeenSerial: Int64 = -1
+            // Diagnostic-only: confirms whether jitterBuffer append order is
+            // truly monotonic (or regresses/repeats) — see the "mouth keeps
+            // repeating" report.
+            var diagAppendCount = 0
+            var diagLastAppendedPts = -Double.infinity
 
             let frameDuration: Double
             if let vs = demuxer.videoStream {
@@ -982,12 +987,21 @@ public final class NativeBackend: PlayerBackend {
                         // frame miscomputed as far in the future never becomes
                         // "not ahead of audio" and permanently stalls playback).
                         let framePts: Double
+                        let diagBounded: Bool
                         if let decoderPts = frame.pts, decoderPts.isFinite,
                            decoderPts <= rawPTS, rawPTS - decoderPts < 1.0 {
                             framePts = pts - (rawPTS - decoderPts)
+                            diagBounded = true
                         } else {
                             framePts = pts
+                            diagBounded = false
                         }
+                        diagAppendCount += 1
+                        if diagAppendCount <= 200 {
+                            let regressed = framePts < diagLastAppendedPts
+                            logger.info("[diag] append#\(diagAppendCount) framePts=\(String(format:"%.3f",framePts)) decoderPts=\(frame.pts.map { String(format:"%.3f",$0) } ?? "nil") bounded=\(diagBounded) rawPTS=\(String(format:"%.3f",rawPTS)) REGRESSED=\(regressed)")
+                        }
+                        diagLastAppendedPts = framePts
                         jitter.append(.init(pixelBuffer: frame.pixelBuffer, pts: framePts, metadata: frame.metadata))
                         let ptsCopy = framePts
                         DispatchQueue.main.async { [weak self] in
