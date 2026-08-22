@@ -1,6 +1,7 @@
 import Foundation
 import CoreMedia
 import CoreVideo
+import QuartzCore
 import VideoToolbox
 import PlayerKit
 import CFFmpeg
@@ -34,6 +35,18 @@ final class VTVideoDecoder {
     // Set by vtDecode when VT returns a non-zero status (real decode error).
     private var lastVTError = false
 
+    // Per-NAL-type success/failure counts, split IDR vs non-IDR. Some BD
+    // H.264 streams make VT fail the majority of non-IDR (P/B) NALs with
+    // kVTVideoDecoderBadDataErr while every IDR decodes fine; keyframes are
+    // a small always-succeeding minority (~1 per GOP) that permanently
+    // dilutes the aggregate totalAttempts/failedAttempts ratio below,
+    // masking the problem from the whole-stream fallback heuristic. Feeds
+    // needsSoftwareFallback below.
+    private var idrSuccessCount = 0
+    private var idrFailCount = 0
+    private var nonIDRSuccessCount = 0
+    private var nonIDRFailCount = 0
+
     /// True when VT decoder is genuinely broken (real errors, not just idle packets).
     /// Only counts frames where VT returned a non-zero error status. Packets that
     /// produce no output because they contain only non-decodable NALs (AUD, SEI etc.)
@@ -41,8 +54,24 @@ final class VTVideoDecoder {
     var needsSoftwareFallback: Bool {
         if initFailed { return true }
         // Must have meaningful sample size AND >90% real error rate.
-        return totalAttempts >= 200
-            && Double(failedAttempts) / Double(totalAttempts) > 0.9
+        if totalAttempts >= 200 && Double(failedAttempts) / Double(totalAttempts) > 0.9 {
+            return true
+        }
+        // Non-keyframe-specific fallback: some BD H.264 streams hit VT
+        // returning kVTVideoDecoderBadDataErr on the majority of non-IDR
+        // NALs while every IDR decodes fine (observed on-device: ~75-80%
+        // sustained failure rate on P/B frames, 0% on keyframes). Keyframes
+        // are a small, always-succeeding minority of attempts (~1 per GOP),
+        // so they permanently dilute the aggregate ratio above well under
+        // the 90% cutoff — the whole-stream heuristic never fires even
+        // after minutes of persistent near-frozen playback. This mirrors
+        // the same >90%-of-a-meaningful-sample shape, scoped to the subset
+        // that's actually failing instead of the diluted aggregate.
+        let nonIDRTotal = nonIDRSuccessCount + nonIDRFailCount
+        if nonIDRTotal >= 100, Double(nonIDRFailCount) / Double(nonIDRTotal) > 0.5 {
+            return true
+        }
+        return false
     }
 
     // MARK: - init
@@ -162,7 +191,24 @@ final class VTVideoDecoder {
         }
         guard !lpData.isEmpty else { return nil }
 
-        guard let pb = vtDecode(lpData: lpData, session: session, formatDesc: formatDesc) else {
+        // Classify whether this packet's NAL stream contains an IDR slice
+        // (type 5) — feeds the idr/nonIDR success/failure counters that
+        // needsSoftwareFallback uses above.
+        var isIDR = false
+        if isAnnexB {
+            let raw = Array(UnsafeBufferPointer(start: dataPtr, count: dataSize))
+            for nalu in VTVideoDecoder.splitAnnexB(raw) where !nalu.isEmpty {
+                if Int(nalu[0] & 0x1F) == 5 { isIDR = true; break }
+            }
+        }
+
+        let pbOpt = vtDecode(lpData: lpData, session: session, formatDesc: formatDesc)
+        if pbOpt != nil {
+            if isIDR { idrSuccessCount += 1 } else { nonIDRSuccessCount += 1 }
+        } else {
+            if isIDR { idrFailCount += 1 } else { nonIDRFailCount += 1 }
+        }
+        guard let pb = pbOpt else {
             // VT decode failure path — still count attempts for fallback heuristics.
             if !needsParamSetInit {
                 totalAttempts += 1
