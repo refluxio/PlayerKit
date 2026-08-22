@@ -83,6 +83,11 @@ public final class NativeBackend: PlayerBackend {
     /// Set by the app layer based on Pro subscription status.
     public var doviEnabled: Bool = true
 
+    /// Preferred maximum video width (0 = unlimited). When >0, the demuxer
+    /// picks the highest-resolution video stream not exceeding this width.
+    /// Set by PlayerController based on the user's quality preference.
+    public nonisolated(unsafe) var preferredMaxVideoWidth: Int = 0
+
     /// Strategy resolved once at open time from stream attributes + display
     /// capability + renderer's `prefersTenBit`. Drives decoder selection and
     /// is forwarded to `VideoRenderer.render` every frame so EDRRenderer can
@@ -254,8 +259,9 @@ public final class NativeBackend: PlayerBackend {
         // avformat_find_stream_info block on network I/O and must not run on
         // the main actor.  The player screen already shows isBuffering=true
         // (spinner) while we wait.
-        Task.detached(priority: .userInitiated) { [weak self] in
+        Task.detached(priority: .userInitiated) { [weak self, preferredMaxVideoWidth] in
             let demuxer = FFmpegDemuxer()
+            demuxer.preferredMaxVideoWidth = preferredMaxVideoWidth
             do {
                 try demuxer.open(url: url, headers: headers,
                                  skipDurationProbe: knownDuration != nil,
@@ -309,6 +315,7 @@ public final class NativeBackend: PlayerBackend {
             logger.info("GCD block started, delay=\(String(format: "%.0f", t1.timeIntervalSince(t0) * 1000))ms")
 
             let demuxer = FFmpegDemuxer()
+            demuxer.preferredMaxVideoWidth = self.preferredMaxVideoWidth
             do {
                 try demuxer.open(reader: reader,
                                  skipDurationProbe: knownDuration != nil,
@@ -393,6 +400,7 @@ public final class NativeBackend: PlayerBackend {
             defer { try? FileManager.default.removeItem(at: listFile) }
 
             let demuxer = FFmpegDemuxer()
+            demuxer.preferredMaxVideoWidth = self.preferredMaxVideoWidth
             do {
                 try demuxer.openConcat(listFileURL: listFile, headers: hdrs,
                                        skipDurationProbe: knownDuration != nil,

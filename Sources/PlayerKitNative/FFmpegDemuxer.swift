@@ -183,7 +183,14 @@ final class FFmpegDemuxer: @unchecked Sendable {
     private(set) var videoStream: UnsafeMutablePointer<AVStream>?
     private(set) var audioStream: UnsafeMutablePointer<AVStream>?
     private var audioStreamScore: Int = 0
+    private var videoStreamScore: Int = 0
     private(set) var subtitleStream: UnsafeMutablePointer<AVStream>?
+
+    /// Preferred maximum video width (0 = unlimited). When >0, the demuxer
+    /// picks the highest-resolution video stream not exceeding this width.
+    /// Streams wider than this are still candidates but ranked lower, so a
+    /// file with only a 4K stream still works (falls back to 4K).
+    var preferredMaxVideoWidth: Int = 0
 
     var subtitleStreamIndex: Int32 { subtitleStream.map { $0.pointee.index } ?? -1 }
 
@@ -424,8 +431,22 @@ final class FFmpegDemuxer: @unchecked Sendable {
             let cp = stream.pointee.codecpar.pointee
             logger.info("stream[\(i)]: type=\(codecType.rawValue) codec=\(codecId != AV_CODEC_ID_NONE ? String(cString: avcodec_get_name(codecId)) : "none") \(cp.width)x\(cp.height)")
 
-            if codecType == AVMEDIA_TYPE_VIDEO && videoStream == nil {
-                videoStream = stream
+            if codecType == AVMEDIA_TYPE_VIDEO {
+                let width = Int(cp.width)
+                let score: Int
+                if preferredMaxVideoWidth > 0 {
+                    if width <= preferredMaxVideoWidth {
+                        score = 100_000 + width
+                    } else {
+                        score = width
+                    }
+                } else {
+                    score = width
+                }
+                if videoStream == nil || score > videoStreamScore {
+                    videoStream = stream
+                    videoStreamScore = score
+                }
             } else if codecType == AVMEDIA_TYPE_AUDIO {
                 // Prefer lightweight codecs for PCM decode (DTS > AC3 > AAC > TrueHD).
                 // TrueHD is extremely expensive to software decode (8-channel MLP),
