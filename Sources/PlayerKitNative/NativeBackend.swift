@@ -1142,15 +1142,21 @@ public final class NativeBackend: PlayerBackend {
                         }
                     } else if codecId == AV_CODEC_ID_HDMV_PGS_SUBTITLE || codecId == AV_CODEC_ID_DVD_SUBTITLE {
                         let dec = self.subtitleDecoder
+                        let audioPos = clock.audioTime
                         dLock.unlock()
                         if let cue = dec?.decode(packet: packet) {
+                            // If the cue's startPts is already in the past (demux
+                            // read the subtitle packet late due to video throttle),
+                            // adjust startPts to current audioTime so the subtitle
+                            // displays immediately instead of being skipped.
+                            let adjustedStart = cue.startPts < audioPos ? audioPos : cue.startPts
                             self.subtitleImageLock.withLock {
                                 self.subtitleImageCues.append(
-                                    SubtitleImageCue(startPts: cue.startPts, endPts: cue.endPts,
+                                    SubtitleImageCue(startPts: adjustedStart, endPts: cue.endPts,
                                                      image: cue.image, rect: cue.rect)
                                 )
                             }
-                            logger.debug("[sub] PGS cue appended: pts=\(String(format:"%.2f",cue.startPts))-\(String(format:"%.2f",cue.endPts))")
+                            logger.debug("[sub] PGS cue appended: pts=\(String(format:"%.2f",adjustedStart))-\(String(format:"%.2f",cue.endPts))")
                         } else if dec == nil {
                             logger.warning("[sub] PGS packet received but subtitleDecoder is nil")
                         }
