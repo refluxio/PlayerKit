@@ -19,6 +19,49 @@ final class InMemoryReader: MediaRandomAccessReader, @unchecked Sendable {
     func close() {}
 }
 
+/// Models a cloud CDN session whose close is TERMINAL for every reader that
+/// shares it — the Cloud115StreamReader semantics behind C1: once any reader
+/// closes the connection, every read on every reader sharing it returns 0
+/// (EOF). InMemoryReader.close() being a no-op is exactly why the existing
+/// tests could not expose the seam-close bug; these tests must fail before
+/// the fix and pass after.
+final class TerminatingConnection: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isClosed = false
+    private var closes = 0
+
+    var closed: Bool { lock.lock(); defer { lock.unlock() }; return isClosed }
+    var closeCount: Int { lock.lock(); defer { lock.unlock() }; return closes }
+
+    func close() {
+        lock.lock(); defer { lock.unlock() }
+        isClosed = true
+        closes += 1
+    }
+}
+
+/// A clip reader over a shared `TerminatingConnection`. After the connection
+/// is closed, read() returns 0 — EOF for every clip, matching
+/// Cloud115StreamReader's post-close behavior.
+final class TerminatingReader: MediaRandomAccessReader, @unchecked Sendable {
+    private let data: Data
+    private let connection: TerminatingConnection
+    init(data: Data, connection: TerminatingConnection) {
+        self.data = data
+        self.connection = connection
+    }
+    var totalSize: Int64 { Int64(data.count) }
+    func read(offset: Int64, length: Int, into buffer: UnsafeMutableRawBufferPointer) throws -> Int {
+        guard !connection.closed else { return 0 }
+        guard offset < data.count else { return 0 }
+        let end = min(Int(offset) + length, data.count)
+        let n = end - Int(offset)
+        data.copyBytes(to: buffer.bindMemory(to: UInt8.self), from: Int(offset)..<end)
+        return n
+    }
+    func close() { connection.close() }
+}
+
 final class MultiClipDemuxerTests: XCTestCase {
     /// Two tiny, independently-generated MPEG-TS clips (each starting its
     /// own PTS near 0 — exactly the "no shared PTS base" scenario this
@@ -179,5 +222,86 @@ final class MultiClipDemuxerTests: XCTestCase {
             return
         }
         XCTFail("no packet with a valid PTS within 10 reads after seek")
+    }
+
+    /// C1 regression: the EOF seam switch must NOT close the shared
+    /// underlying connection. Before the fix, switchTo's first line
+    /// `current?.close()` released the clip's reader (terminally closing the
+    /// shared connection for every clip), so the clip1 demuxer — whether
+    /// reused from the pre-open or opened synchronously — read pure EOF and
+    /// playback died silently at the very first seam.
+    func testSeamSwitchDoesNotCloseSharedReaderConnection() throws {
+        let connection = TerminatingConnection()
+        let clip0 = TerminatingReader(data: loadFixture("clip0_5s"), connection: connection)
+        let clip1 = TerminatingReader(data: loadFixture("clip1_5s"), connection: connection)
+        let demuxer = MultiClipDemuxer(clips: [(clip0, 5.0), (clip1, 5.0)])!
+        try demuxer.open()
+        XCTAssertEqual(connection.closeCount, 0, "open must not close the shared connection")
+
+        // Walk to the REAL clip0→clip1 EOF seam. open() sets
+        // pendingSwitchFlag, so the first didSwitchClip is a Task 3 artifact;
+        // the seam is the second one (the first packet of clip1).
+        var seamsSeen = 0
+        var n = 0
+        while let result = demuxer.readPacket(), n < 2000 {
+            n += 1
+            var packet: UnsafeMutablePointer<AVPacket>? = result.packet
+            if result.didSwitchClip {
+                seamsSeen += 1
+                if seamsSeen == 2 {
+                    av_packet_free(&packet)
+                    break
+                }
+            }
+            av_packet_free(&packet)
+        }
+        XCTAssertEqual(seamsSeen, 2,
+            "never reached the clip0→clip1 EOF seam within 2000 reads — seam switch killed the shared connection and playback terminated")
+
+        // The seam must NOT have closed the connection.
+        XCTAssertEqual(connection.closeCount, 0,
+            "seam switch closed the shared connection — every subsequent clip read returns EOF (C1)")
+
+        // Packets from clip1 keep flowing on the still-open connection.
+        var postSeamPackets = 0
+        while let result = demuxer.readPacket(), postSeamPackets < 100 {
+            postSeamPackets += 1
+            var packet: UnsafeMutablePointer<AVPacket>? = result.packet
+            av_packet_free(&packet)
+        }
+        XCTAssertGreaterThan(postSeamPackets, 0,
+            "no packets from clip1 after the seam — the shared connection was terminally closed by the switch (C1)")
+
+        // Reader release happens exactly once per clip, in close().
+        demuxer.close()
+        XCTAssertEqual(connection.closeCount, 2,
+            "close() must release each clip reader exactly once, only when playback stops")
+    }
+
+    /// C1 regression, seek variant: a cross-clip seek must not close the
+    /// shared connection either. Before the fix, seek → switchTo →
+    /// current?.close() → connection terminally closed → the target clip's
+    /// synchronous open read pure EOF → open threw → seek returned false.
+    func testSeekAcrossClipDoesNotCloseSharedReaderConnection() throws {
+        let connection = TerminatingConnection()
+        let clip0 = TerminatingReader(data: loadFixture("clip0_5s"), connection: connection)
+        let clip1 = TerminatingReader(data: loadFixture("clip1_5s"), connection: connection)
+        let demuxer = MultiClipDemuxer(clips: [(clip0, 5.0), (clip1, 5.0)])!
+        try demuxer.open()
+
+        XCTAssertTrue(demuxer.seek(to: 7.0),
+            "cross-clip seek failed — the switch closed the shared connection and the target clip open read EOF (C1)")
+        XCTAssertEqual(connection.closeCount, 0,
+            "cross-clip seek closed the shared connection (C1)")
+
+        // The first packet after the seek still arrives from clip1's reader.
+        var packet: UnsafeMutablePointer<AVPacket>? = demuxer.readPacket()?.packet
+        XCTAssertNotNil(packet,
+            "no packet after cross-clip seek — the shared connection was terminally closed (C1)")
+        av_packet_free(&packet)
+
+        demuxer.close()
+        XCTAssertEqual(connection.closeCount, 2,
+            "close() must release each clip reader exactly once")
     }
 }

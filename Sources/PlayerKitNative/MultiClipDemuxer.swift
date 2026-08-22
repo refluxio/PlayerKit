@@ -59,7 +59,12 @@ final class MultiClipDemuxer: @unchecked Sendable {
     var currentDemuxer: FFmpegDemuxer? { current }
 
     private func switchTo(clipIndex: Int, localSeekSecs: Double?) throws {
-        current?.close()
+        // Never release the outgoing clip's reader here: clip readers may
+        // share one underlying connection (MediaRandomAccessReader.close()
+        // is "Called by the player when playback stops"), so closing it at a
+        // seam/seek boundary would terminally kill the next clip's reads.
+        // Reader lifecycle is owned by close() below.
+        current?.close(releaseReader: false)
         let pre = preOpenedNext
         preOpenedNext = nil
         var reusedPreOpened = false
@@ -74,10 +79,18 @@ final class MultiClipDemuxer: @unchecked Sendable {
             // Cache miss (seek target differs from the sequential next clip,
             // or the background open hadn't landed yet) — discard the stale
             // entry and open synchronously. This is the correctness fallback.
-            if let pre { pre.demuxer.close() }
+            if let pre { pre.demuxer.close(releaseReader: false) }
             let demuxer = FFmpegDemuxer()
-            try demuxer.open(reader: readers[clipIndex],
-                             knownDurationSecs: timeline.durationsSecs[clipIndex])
+            do {
+                try demuxer.open(reader: readers[clipIndex],
+                                 knownDurationSecs: timeline.durationsSecs[clipIndex])
+            } catch {
+                // The failed open may have bound the clip's reader to an
+                // AVIOBridge — defer its release like every other path here;
+                // close() owns the readers.
+                demuxer.close(releaseReader: false)
+                throw error
+            }
             if let localSeekSecs, localSeekSecs > 0 {
                 _ = demuxer.seek(to: localSeekSecs)
             }
@@ -142,9 +155,16 @@ final class MultiClipDemuxer: @unchecked Sendable {
         preOpenInFlight = true
         preOpenQueue.async { [weak self] in
             let demuxer = FFmpegDemuxer()
-            let opened = (try? demuxer.open(reader: nextReader, knownDurationSecs: nextDuration)) != nil
-            if opened {
+            do {
+                try demuxer.open(reader: nextReader, knownDurationSecs: nextDuration)
                 self?.preOpenedNext = (nextIndex, demuxer)
+            } catch {
+                // A failed pre-open may still have bound the clip's reader to
+                // an AVIOBridge; deferring its release matters because that
+                // reader can share the underlying connection with the clip
+                // currently playing — deinit-releasing it would kill the
+                // current clip's reads mid-playback.
+                demuxer.close(releaseReader: false)
             }
             // Cleared on both success and failure so a failed pre-open can
             // be retried by the next packet, not suppressed forever.
@@ -162,11 +182,18 @@ final class MultiClipDemuxer: @unchecked Sendable {
         return true
     }
 
+    /// Playback has truly stopped — this is the single place every clip
+    /// reader gets released. The demuxer closes above only free C-side
+    /// resources (releaseReader: false): the clip readers may share one
+    /// underlying connection, so each one is closed exactly once, here.
+    /// MediaRandomAccessReader.close() is "Called by the player when
+    /// playback stops" — this is that call site.
     func close() {
-        current?.close()
+        current?.close(releaseReader: false)
         current = nil
-        preOpenedNext?.demuxer.close()
+        preOpenedNext?.demuxer.close(releaseReader: false)
         preOpenedNext = nil
+        for reader in readers { reader.close() }
     }
 
     private func streamFor(_ streamIndex: Int32) -> UnsafeMutablePointer<AVStream>? {

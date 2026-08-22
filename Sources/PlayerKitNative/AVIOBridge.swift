@@ -88,7 +88,13 @@ final class AVIOBridge: @unchecked Sendable {
 
     /// Free the AVIOContext and release resources.
     /// Called by FFmpegDemuxer.close(). avio_context_free also frees the buffer.
-    func free() {
+    ///
+    /// `releaseReader` controls whether the underlying reader is closed too.
+    /// The single-file path owns its reader and always releases it; the
+    /// multi-clip path defers release to MultiClipDemuxer.close(), because
+    /// clip readers may share one underlying connection — closing it at a
+    /// clip seam would terminally kill every clip's subsequent reads.
+    func free(releaseReader: Bool = true) {
         if ioContext != nil {
             avio_context_free(&ioContext)
             ioContext = nil
@@ -99,7 +105,9 @@ final class AVIOBridge: @unchecked Sendable {
         // cause EXC_BAD_ACCESS when the owning FFmpegDemuxer releases its strong
         // reference. Just clear the pointer so no dangling C callback can fire.
         selfPointer = nil
-        reader.close()
+        if releaseReader {
+            reader.close()
+        }
     }
 
     // MARK: - C Callbacks (@convention(c))

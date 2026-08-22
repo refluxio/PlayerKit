@@ -703,19 +703,48 @@ final class FFmpegDemuxer: @unchecked Sendable {
         return nil
     }
 
+    /// Set by close(releaseReader: false) so deinit — which releases the
+    /// demuxer's last strong references — must not release the underlying
+    /// reader on behalf of an owner that is still actively reading it.
+    /// Write-once before the last reference is dropped on the same thread,
+    /// so no cross-thread access under the class's @unchecked Sendable
+    /// contract. See close(releaseReader:).
+    private var readerReleaseDeferred = false
+
+    /// Release the demuxer's C-side resources (AVFormatContext, AVIOContext,
+    /// stream bookkeeping) and the underlying reader. Satisfies
+    /// `PacketDemuxing.close()` — the single-file path's existing behavior
+    /// is unchanged: everything is released.
     func close() {
+        close(releaseReader: true)
+    }
+
+    /// Release the demuxer's C-side resources (AVFormatContext, AVIOContext,
+    /// stream bookkeeping).
+    ///
+    /// `releaseReader: false` defers `reader.close()` to the reader's owner:
+    /// MultiClipDemuxer's clip readers may share a single underlying
+    /// connection (MediaRandomAccessReader.close() documents itself as
+    /// "Called by the player when playback stops"), so closing it at a clip
+    /// seam/seek boundary would terminally kill every clip's subsequent
+    /// reads. `releaseReader: true` (used by the single-file path and by
+    /// close()) releases everything, reader included.
+    func close(releaseReader: Bool) {
         if formatCtx != nil {
             avformat_close_input(&formatCtx)
             formatCtx = nil
         }
-        avioBridge?.free()
+        avioBridge?.free(releaseReader: releaseReader)
         avioBridge = nil
         videoStream = nil
         audioStream = nil
         audioStreamScore = 0
         subtitleStream = nil
         duration = 0
+        if !releaseReader {
+            readerReleaseDeferred = true
+        }
     }
 
-    deinit { close() }
+    deinit { close(releaseReader: !readerReleaseDeferred) }
 }
