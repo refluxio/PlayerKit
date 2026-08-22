@@ -433,6 +433,17 @@ final class FFmpegDemuxer: @unchecked Sendable {
 
             if codecType == AVMEDIA_TYPE_VIDEO {
                 let width = Int(cp.width)
+                // Skip non-video image codecs (mjpeg, png, bmp, etc.) that
+                // some MKV files embed as embedded cover art/thumbnails.
+                // These are not the main video stream and should never be
+                // selected as the primary video track.
+                let isImageCodec = codecId == AV_CODEC_ID_MJPEG ||
+                    codecId == AV_CODEC_ID_PNG ||
+                    codecId == AV_CODEC_ID_BMP ||
+                    codecId == AV_CODEC_ID_GIF
+                if isImageCodec {
+                    continue
+                }
                 let score: Int
                 if preferredMaxVideoWidth > 0 {
                     if width <= preferredMaxVideoWidth {
