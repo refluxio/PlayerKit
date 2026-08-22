@@ -1018,8 +1018,8 @@ public final class NativeBackend: PlayerBackend {
                     // to that far-future PTS, causing A/V desync / black screen.
                     //
                     // We sleep AT MOST 50ms per video packet so the outer loop
-                    // continues reading audio packets in between, keeping the
-                    // AudioUnit queue fed and audioClock advancing.
+                    // continues reading audio/subtitle packets in between, keeping
+                    // the AudioUnit queue fed and subtitle cues pre-read.
                     let audioPos = clock.audioTime
                     if pts.isFinite && pts > audioPos + 2.0 {
                         Thread.sleep(forTimeInterval: min(pts - audioPos - 2.0, 0.050))
