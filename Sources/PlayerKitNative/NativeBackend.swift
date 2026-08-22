@@ -970,8 +970,20 @@ public final class NativeBackend: PlayerBackend {
                         // delta rather than recomputing it from scratch, so
                         // clip-rebase/anomaly-detection state from the
                         // rawPTS→pts pipeline above still applies.
+                        // Sanity-bound the correction: a genuine reorder delay is at
+                        // most a handful of frame durations (well under 1s for any
+                        // real GOP structure) and the returned frame is always from
+                        // the SAME position or earlier than the packet just sent
+                        // (never later). Outside that — e.g. the decoder's first
+                        // few outputs right after a mid-stream codec swap, before
+                        // its internal reorder state has a clean run to interpolate
+                        // from — trust the packet-based pts unmodified rather than
+                        // risk a wild correction that strands the sync gate (a
+                        // frame miscomputed as far in the future never becomes
+                        // "not ahead of audio" and permanently stalls playback).
                         let framePts: Double
-                        if let decoderPts = frame.pts, decoderPts.isFinite {
+                        if let decoderPts = frame.pts, decoderPts.isFinite,
+                           decoderPts <= rawPTS, rawPTS - decoderPts < 1.0 {
                             framePts = pts - (rawPTS - decoderPts)
                         } else {
                             framePts = pts
