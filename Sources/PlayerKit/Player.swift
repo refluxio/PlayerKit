@@ -57,6 +57,16 @@ public final class Player {
                      seekTo: seekTo, knownDuration: knownDuration)
     }
 
+    /// Start playback of an ordered sequence of custom-I/O clip readers as
+    /// one continuous presentation timeline (BDMV disc playback). Each clip's
+    /// bytes come from a `MediaRandomAccessReader`; the backend demuxes each
+    /// clip separately and rebases PTS onto the continuous timeline.
+    public func play(clips: [(reader: any MediaRandomAccessReader, durationSecs: Double)],
+                     seekTo: Duration? = nil,
+                     knownDuration: Duration? = nil) {
+        backend.play(clips: clips, seekTo: seekTo, knownDuration: knownDuration)
+    }
+
     /// Pause playback. Call `resume()` to continue.
     public func pause()                        { backend.pause() }
 
