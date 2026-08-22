@@ -1649,6 +1649,11 @@ public final class NativeBackend: PlayerBackend {
     public func resume() {
         guard demuxer != nil else {
             logger.warning("resume: demuxer is nil, player was stopped — ignoring")
+            // Don't leave demuxCancelled=true if there's no demuxer —
+            // otherwise the next play() won't start the demux loop.
+            demuxLock.lock()
+            demuxCancelled = false
+            demuxLock.unlock()
             return
         }
         logger.info("resume")
