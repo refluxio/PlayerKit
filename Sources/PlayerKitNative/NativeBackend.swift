@@ -205,6 +205,7 @@ public final class NativeBackend: PlayerBackend {
     private var displayLinkStartWallTime: Double?
     private var firstTickLogged = false
     private var lastNotifiedPos: Duration = .zero
+    private var lastDisplayAudioTime: Double = 0
 
     // Throughput tracking. Written from demux queue, read on main actor.
     private nonisolated(unsafe) var totalBytesRead: Int64 = 0
@@ -823,6 +824,7 @@ public final class NativeBackend: PlayerBackend {
         // whose PTS does not start at 0 (priming delay).
         needsClockCalibration = true
         audioClockReady = false
+        lastDisplayAudioTime = 0
 
         state.isPlaying = true
         notifyStateChange()
@@ -1416,6 +1418,24 @@ public final class NativeBackend: PlayerBackend {
         }
         let serial = seekLock.withLock { seekSerial }
 
+        // Detect when audioClock has started advancing (primer callbacks fired).
+        // Until then, bypass syncController timing and display frames as fast as
+        // they're decoded so video doesn't stall waiting for audio to catch up.
+        if !audioClockReady, audioTime > 0.001 {
+            audioClockReady = true
+        }
+
+        // If audioClock is stuck (AudioQueue underrun) but jitterBuffer has
+        // plenty of video, fall back to video-master mode: display frames at
+        // nominal rate using frame PTS as the clock instead of freezing.
+        // Without this, freeze-ahead guard holds all frames when audioTime
+        // can't advance, producing a black screen with audio stalled — the
+        // exact "黑屏无声音" symptom on 4K UHD remuxes where VT decode is
+        // slow enough to starve the audio path.
+        let audioStalled = audioTime < lastDisplayAudioTime + 0.001
+        lastDisplayAudioTime = audioTime
+        let useVideoMaster = audioClockReady && audioStalled && jitterBuffer.duration > 0.5
+
         // --- Freeze-ahead / Skip-behind (commercial player A/V sync) ---
         // After the first post-seek frame has been displayed, guard against large
         // desync without changing playback speed.  Video ahead of audio: freeze
@@ -1427,7 +1447,7 @@ public final class NativeBackend: PlayerBackend {
         // until almost every frame triggers the guard → the user sees a frozen image.
         // Draining ALL stale frames in one pass keeps video locked to audio regardless
         // of the source→display ratio.
-        if syncController.hasDisplayedFrame, !needsClockCalibration, audioClockReady {
+        if syncController.hasDisplayedFrame, !needsClockCalibration, audioClockReady, !useVideoMaster {
             // Drain frames significantly behind audio
             while let lagging = jitterBuffer.peek(at: 0), lagging.pts < audioTime - 0.06 {
                 jitterBuffer.pop()
@@ -1442,13 +1462,6 @@ public final class NativeBackend: PlayerBackend {
             }
         }
 
-        // Detect when audioClock has started advancing (primer callbacks fired).
-        // Until then, bypass syncController timing and display frames as fast as
-        // they're decoded so video doesn't stall waiting for audio to catch up.
-        if !audioClockReady, audioTime > 0.001 {
-            audioClockReady = true
-        }
-
         guard let frame = jitterBuffer.peek(at: 0) else { return }
 
         let followingPTS = jitterBuffer.peek(at: 1)?.pts
@@ -1457,8 +1470,10 @@ public final class NativeBackend: PlayerBackend {
         // at nominal rate without waiting for audio sync.  Without this the
         // syncController sees video far ahead of audio(audio=0) and holds
         // frames indefinitely → "首帧后不播放" bug.
+        // Also bypass audio sync when audio is stalled (underrun) but video
+        // has buffered enough — use video PTS as master to avoid freezing.
         let (shouldShow, delay): (Bool, Double)
-        if audioClockReady {
+        if audioClockReady && !useVideoMaster {
             (shouldShow, delay) = syncController.check(
                 nextPTS: frame.pts,
                 followingPTS: followingPTS,
@@ -1672,6 +1687,7 @@ public final class NativeBackend: PlayerBackend {
         // display loop's skip-behind guard would drop the first few frames.
         needsClockCalibration = true
         audioClockReady = false
+        lastDisplayAudioTime = 0
     }
 
     public func stop() {
