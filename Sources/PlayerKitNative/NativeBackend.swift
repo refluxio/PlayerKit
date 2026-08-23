@@ -1710,8 +1710,11 @@ public final class NativeBackend: PlayerBackend {
 
         subtitleLock.withLock { subtitleCues.removeAll() }
         lastSubtitleText = nil
+        state.currentSubtitleText = nil
         subtitleImageLock.withLock { subtitleImageCues.removeAll() }
         lastSubtitleImage = nil
+        state.currentSubtitleImage = nil
+        state.currentSubtitleImageRect = .zero
 
         jitterBuffer.flush()
         syncController.reset()
@@ -1767,8 +1770,11 @@ public final class NativeBackend: PlayerBackend {
         maxDownloadedPts = 0
         subtitleLock.withLock { subtitleCues.removeAll() }
         lastSubtitleText = nil
+        state.currentSubtitleText = nil
         subtitleImageLock.withLock { subtitleImageCues.removeAll() }
         lastSubtitleImage = nil
+        state.currentSubtitleImage = nil
+        state.currentSubtitleImageRect = .zero
         subtitleDecoder = nil
         state = PlayerState()
     }
