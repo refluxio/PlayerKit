@@ -26,6 +26,11 @@ public struct SubtitleOverlayView: View {
     public var body: some View {
         GeometryReader { geo in
             let videoRect = videoDisplayRect(in: geo)
+            // Use videoRect as the alignment frame so subtitles align to the
+            // bottom of the video (not the full screen). In portrait with
+            // letterbox bars, the video is centered — aligning to screen
+            // bottom would put subtitles in the bottom black bar, not on
+            // the video.
             ZStack(alignment: .bottom) {
                 if let text = player.state.currentSubtitleText {
                     textSubtitle(text, videoRect: videoRect)
@@ -37,6 +42,8 @@ public struct SubtitleOverlayView: View {
                         .transition(.opacity)
                 }
             }
+            .frame(width: videoRect.width, height: videoRect.height, alignment: .bottom)
+            .position(x: videoRect.midX, y: videoRect.midY)
         }
         .allowsHitTesting(false)
         .animation(.easeInOut(duration: 0.12), value: player.state.currentSubtitleText)
