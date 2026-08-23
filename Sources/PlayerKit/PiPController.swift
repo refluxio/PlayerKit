@@ -8,6 +8,10 @@ import QuartzCore
 /// A minimal playback delegate that keeps PiP from asking for playback control.
 @available(iOS 15.0, macOS 12.0, *)
 private class PiPPlaybackDelegate: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate {
+    /// Closure that returns the actual player playback state.
+    /// When false, the system knows there is nothing to play and won't auto-start PiP.
+    var isPlayingProvider: (() -> Bool)?
+
     func pictureInPictureController(_: AVPictureInPictureController, setPlaying _: Bool) {}
     func pictureInPictureControllerTimeRangeForPlayback(_: AVPictureInPictureController) -> CMTimeRange {
         // Return a large finite range so AVKit stays in "playing" state rather
@@ -16,7 +20,9 @@ private class PiPPlaybackDelegate: NSObject, AVPictureInPictureSampleBufferPlayb
         CMTimeRange(start: .zero, duration: CMTime(value: 86400, timescale: 1))
     }
     func pictureInPictureControllerIsPlaybackPaused(_: AVPictureInPictureController) -> Bool {
-        false
+        // Return the inverse of the real playback state so the system can
+        // correctly decide whether PiP is warranted.
+        !(isPlayingProvider?() ?? false)
     }
     func pictureInPictureController(_: AVPictureInPictureController, didTransitionToRenderSize _: CMVideoDimensions) {}
     func pictureInPictureController(_: AVPictureInPictureController, skipByInterval _: CMTime, completion: @escaping () -> Void) {
@@ -68,6 +74,14 @@ public class PiPController: NSObject {
     /// Retained for future use (e.g. if a supported API for hinting PiP window
     /// size from pixel-buffer dimensions becomes available).
     public var videoSize: CGSize?
+
+    /// Closure that returns whether the player is actively playing.
+    /// The delegate reports this to AVKit so the system can decide whether
+    /// auto-PiP is warranted. Set by PlayerController after init.
+    public var isPlayingProvider: (() -> Bool)? {
+        get { delegate.isPlayingProvider }
+        set { delegate.isPlayingProvider = newValue }
+    }
 
     public var isActive: Bool { pipController.isPictureInPictureActive }
     public var isPossible: Bool { pipController.isPictureInPicturePossible }
