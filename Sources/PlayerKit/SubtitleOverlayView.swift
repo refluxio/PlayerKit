@@ -13,11 +13,14 @@ public struct SubtitleOverlayView: View {
     public var verticalOffset: CGFloat = 0
     /// User-adjustable horizontal offset in points (positive = move right, negative = move left).
     public var horizontalOffset: CGFloat = 0
+    /// User-adjustable scale factor for subtitle size (1.0 = original, 1.5 = 50% larger, 0.8 = 20% smaller).
+    public var scale: CGFloat = 1.0
 
-    public init(player: Player, verticalOffset: CGFloat = 0, horizontalOffset: CGFloat = 0) {
+    public init(player: Player, verticalOffset: CGFloat = 0, horizontalOffset: CGFloat = 0, scale: CGFloat = 1.0) {
         self.player = player
         self.verticalOffset = verticalOffset
         self.horizontalOffset = horizontalOffset
+        self.scale = scale
     }
 
     public var body: some View {
@@ -66,15 +69,15 @@ public struct SubtitleOverlayView: View {
 
     private func textSubtitle(_ text: String, videoRect: CGRect) -> some View {
         Text(text)
-            .font(.system(size: 20, weight: .semibold))
+            .font(.system(size: 20 * scale, weight: .semibold))
             .foregroundStyle(.white)
             .multilineTextAlignment(.center)
-            .lineSpacing(4)
+            .lineSpacing(4 * scale)
             .shadow(color: .black.opacity(0.95), radius: 0, x: 1,  y: 1)
             .shadow(color: .black.opacity(0.95), radius: 0, x: -1, y: 1)
             .shadow(color: .black.opacity(0.95), radius: 0, x: 1,  y: -1)
             .shadow(color: .black.opacity(0.95), radius: 0, x: -1, y: -1)
-            .shadow(color: .black.opacity(0.6),  radius: 3)
+            .shadow(color: .black.opacity(0.6),  radius: 3 * scale)
             .padding(.horizontal, 24)
             .frame(maxWidth: videoRect.width - 16)
             .padding(.bottom, 20)
@@ -86,12 +89,20 @@ public struct SubtitleOverlayView: View {
         let frame = CGRect(
             x: videoRect.origin.x + rect.origin.x * videoRect.width,
             y: videoRect.origin.y + rect.origin.y * videoRect.height,
+            width: rect.width * videoRect.width * scale,
+            height: rect.height * videoRect.height * scale
+        )
+        // Keep the position anchored to the original rect center (not scaled),
+        // so scaling grows from the center rather than shifting.
+        let origFrame = CGRect(
+            x: videoRect.origin.x + rect.origin.x * videoRect.width,
+            y: videoRect.origin.y + rect.origin.y * videoRect.height,
             width: rect.width * videoRect.width,
             height: rect.height * videoRect.height
         )
         return Image(decorative: image, scale: 1)
             .resizable()
             .frame(width: frame.width, height: frame.height)
-            .position(x: frame.midX + horizontalOffset, y: frame.midY + verticalOffset)
+            .position(x: origFrame.midX + horizontalOffset, y: origFrame.midY + verticalOffset)
     }
 }
