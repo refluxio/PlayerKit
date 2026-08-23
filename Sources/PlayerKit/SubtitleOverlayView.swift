@@ -86,17 +86,14 @@ public struct SubtitleOverlayView: View {
 
     private func bitmapSubtitle(_ image: CGImage, rect: CGRect,
                                 in geo: GeometryProxy, videoRect: CGRect) -> some View {
-        // Ignore PGS's original x/y position — BD subtitle placement is often
-        // off-center (left-aligned, bottom-fixed), which looks wrong on a
-        // phone in landscape. Instead, center horizontally and place at the
-        // bottom of the video rect (same as text subtitles), then apply
-        // user offsets on top.
+        // Center the bitmap subtitle horizontally within the video rect,
+        // placed at the bottom (same layout as text subtitles).
+        // Ignore PGS's original x/y — BD placement is often off-center.
         let scaledWidth = rect.width * videoRect.width * scale
         let scaledHeight = rect.height * videoRect.height * scale
         return Image(decorative: image, scale: 1)
             .resizable()
             .frame(width: scaledWidth, height: scaledHeight)
-            .frame(maxWidth: videoRect.width - 16, alignment: .center)
             .padding(.bottom, 20)
             .offset(x: horizontalOffset, y: verticalOffset)
     }
