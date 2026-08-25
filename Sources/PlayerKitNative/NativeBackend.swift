@@ -4,7 +4,7 @@ import CoreMedia
 import CoreVideo
 import QuartzCore
 import PlayerKit
-import CFFmpeg
+@_exported import CFFmpeg
 import os
 
 private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "backend")
