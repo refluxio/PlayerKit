@@ -187,6 +187,13 @@ public final class NativeBackend: PlayerBackend {
     private var displayLinkProxy: DisplayLinkProxy?
     #if os(macOS)
     private var cvDisplayLink: CVDisplayLink?
+    /// macOS 兜底渲染驱动。CVDisplayLink 在 stop→start 之后可能延迟数秒才恢复
+    /// 回调(实测:CVDisplayLinkStart 后 6.3s 才收到 first tick),期间视频冻结、
+    /// state.position 不更新 → app 层 UpNext 检测读到 ~0 的初始值误触发 EOF。
+    /// 用主 queue 的 DispatchSourceTimer 兜底驱动 displayNextFrame —— 它幂等
+    /// (每 tick 最多 pop 一帧),与 CVDisplayLink 竞争无害;link 恢复后自然占主导,
+    /// 兜底 timer 空转。
+    private var fallbackRenderTimer: DispatchSourceTimer?
     #endif
 
     // Cancellation: incremented on every play()/stop() to discard stale async opens
@@ -526,7 +533,7 @@ public final class NativeBackend: PlayerBackend {
             // it already reflects the true end-of-stream PTS, not the container placeholder.
             state.duration = Duration.seconds(demuxDur)
         }
-        logger.info("duration: knownDuration=\(knownDuration.map{"\(Double($0.components.seconds))s"} ?? "nil") demuxer=\(String(format:"%.1f",demuxDur))s → using \(String(format:"%.1f",Double(self.state.duration.components.seconds)))s")
+        logger.info("duration: knownDuration=\(knownDuration.map{"\(Double($0.components.seconds))s"} ?? "nil") demuxer=\(String(format:"%.1f",demuxDur))s → using \(String(format:"%.1f",Double(self.state.duration.components.seconds)))s self=\(String(format:"%p", UInt(bitPattern: Unmanaged.passUnretained(self).toOpaque())))")
 
         // Extract HDR color metadata from the video stream's codec parameters
         if let vs = demuxer.videoStream {
@@ -1536,6 +1543,11 @@ public final class NativeBackend: PlayerBackend {
         let posDur = Duration.milliseconds(Int64(popped.pts * 1000))
         state.position = posDur
         if posDur > state.duration { state.duration = posDur }
+        if displayedVideoFrames == 1 {
+            // 诊断:首帧写入 state 时的实际值与 backend 身份,
+            // 用于核对 app 层 timer 读到的 state 是否同一个对象。
+            logger.info("[diag] first frame written pos=\(String(format:"%.3f", Double(posDur.components.seconds)))s dur=\(String(format:"%.3f", Double(self.state.duration.components.seconds)))s self=\(String(format:"%p", UInt(bitPattern: Unmanaged.passUnretained(self).toOpaque())))")
+        }
 
         // Update bufferedDuration.
         // Prefer reader-level download offset (reflects actual pre-fetched bytes, not just
@@ -1630,6 +1642,8 @@ public final class NativeBackend: PlayerBackend {
         // unretained raw pointer to it. Releasing the proxy here would leave a
         // dangling pointer that gets dereferenced on the next CVDisplayLinkStart.
         if let cv = cvDisplayLink, CVDisplayLinkIsRunning(cv) { CVDisplayLinkStop(cv) }
+        fallbackRenderTimer?.cancel()
+        fallbackRenderTimer = nil
         #else
         displayLinkProxy = nil
         #endif
@@ -1750,6 +1764,8 @@ public final class NativeBackend: PlayerBackend {
         #if os(macOS)
         if let cv = cvDisplayLink, CVDisplayLinkIsRunning(cv) { CVDisplayLinkStop(cv) }
         cvDisplayLink = nil
+        fallbackRenderTimer?.cancel()
+        fallbackRenderTimer = nil
         #endif
         demuxCancelled = true
         audioUnitOutput?.stop()
@@ -2022,6 +2038,17 @@ public final class NativeBackend: PlayerBackend {
         if let cv = cvDisplayLink, !CVDisplayLinkIsRunning(cv) {
             CVDisplayLinkStart(cv)
         }
+        // 兜底驱动(见 fallbackRenderTimer 属性注释)。主 queue 保证与
+        // MainActor 隔离一致;displayNextFrame 幂等,双驱动无副作用。
+        fallbackRenderTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 0.05, repeating: 0.033)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            MainActor.assumeIsolated { self.displayNextFrame() }
+        }
+        timer.resume()
+        fallbackRenderTimer = timer
         #endif
     }
 }
