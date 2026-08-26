@@ -145,7 +145,11 @@ public final class NativeBackend: PlayerBackend {
     // Above this, a video/audio PTS gap at calibration time is no longer a
     // normal "nearest keyframe was slightly before the seek target" rounding
     // (typically well under a second for BD content) — see displayNextFrame().
-    private let maxCalibrationGap: Double = 5.0
+    // 15s:覆盖 4K HEVC 大 GOP(可达 5-10s)的 seek 对齐差。seek 落点
+    // (目标前最近 I 帧)与目标差小于该值就校准 audioClock 到落点,避免
+    // 大 GOP 时"校准失败 → audioClock 停在目标 → 视频帧全被 drain →
+    // seek 后黑屏/位置跳变"。
+    private let maxCalibrationGap: Double = 15.0
 
     // Subtitle cue buffer — written from demux loop, read from display loop.
     private struct SubtitleCue {
@@ -1760,6 +1764,12 @@ public final class NativeBackend: PlayerBackend {
         // display loop's skip-behind guard would drop the first few frames.
         needsClockCalibration = true
         audioClockReady = false
+        // 立即把 position 置为 seek 目标并通知:seek 到首帧渲染之间
+        // displayNextFrame 不更新 position(渲染恢复后才写实际落点),
+        // 不置位的话进度条/快进基准会停留在 seek 前的位置(旧值漂移,
+        // "15s 快进实际跳 100s"的根因之一)。首帧渲染后覆盖为落点。
+        state.position = .seconds(secs)
+        notifyStateChange()
     }
 
     public func stop() {
