@@ -220,6 +220,11 @@ public final class NativeBackend: PlayerBackend {
     // check — it just silently sets the baseline).
     private var displayLinkStartWallTime: Double?
     private var firstTickLogged = false
+    /// 同步旁路(audioClockReady=false)弹帧的节拍基准:上一帧实际弹出的
+    /// 墙钟时刻。旁路不再每个显示驱动 tick 都弹帧,而是按源 PTS 间隔 pacing。
+    /// 初始 0 → 首个 tick 立即弹出;seek/resume/stop/flush 后复位同样立即
+    /// 弹出,不会等待。
+    private var lastBypassPopTime: Double = 0
     private var lastNotifiedPos: Duration = .zero
 
     // Throughput tracking. Written from demux queue, read on main actor.
@@ -825,9 +830,16 @@ public final class NativeBackend: PlayerBackend {
             sampleAspectRatio: demuxer.sampleAspectRatio)
 
         wireJitterBuffer()
-        startDemuxLoop()
-        startDisplayLink()
 
+        // 音频队列必须先于 demux/display 启动建好并暂停。否则 demux 线程把
+        // jitterBuffer 翻到 .playing(onStateChange → resume())时,音频队列
+        // 尚未创建(start() 未跑)或本次 pause() 晚于那次 resume() 而覆盖了
+        // 它 —— 两种情况下 resume() 都丢失,状态不再翻转 → 音频永久暂停,
+        // audioClock 永远为 0 → audioClockReady=false → 同步旁路以显示驱动
+        // 频率弹帧(macOS 双驱动最高 ~90Hz)≈ 2.4-3.6x 加速,并因排空
+        // jitterBuffer 卡死 —— 即"自动播下一集加速/卡住"与偶发默认加速。
+        // 主线程在两者之间稍有延迟(如自动播下一集的开场负载)就会把这个
+        // 微秒级窗口放大到秒级,竞态几乎必现。
         if let out = audioUnitOutput, let dec = audioDecoder {
             out.start(sampleRate: dec.outputSampleRate, channels: dec.outputChannels)
             // Pause immediately — jitterBuffer.onStateChange will resume when
@@ -836,6 +848,9 @@ public final class NativeBackend: PlayerBackend {
             // 500ms–1s ahead of video before the first frame appears.
             out.pause()
         }
+
+        startDemuxLoop()
+        startDisplayLink()
 
         // Calibrate audioClock to first decoded frame PTS on the first display
         // tick — same as post-seek calibration. Required for H.264 B-frame streams
@@ -1517,11 +1532,27 @@ public final class NativeBackend: PlayerBackend {
                 serial: serial
             )
         } else {
-            (shouldShow, delay) = (true, 0)
+            // 旁路不再每 tick 弹帧:音频时钟卡死时 audioClockReady 永远为
+            // false,原来每个显示驱动 tick 都直接弹帧 —— macOS 双驱动
+            // (CVDisplayLink 60Hz + 兜底 timer 30Hz)最高 ~90Hz ≈ 2.4-3.6x
+            // 加速("自动播下一集加速"的直接放大器),且弹帧快于 demux
+            // 补充率会排空 jitterBuffer → .buffering → 卡死。改为按源
+            // PTS 间隔 pacing:首帧立即显示,后续帧等足源帧间隔,永远不
+            // 高于 1x;主线程长卡顿积压的 tick 也只会弹出一帧,不爆发。
+            let srcGap = followingPTS.map { max(0.01, min(0.5, $0 - frame.pts)) }
+                ?? (1.0 / 25.0)
+            if now - lastBypassPopTime >= srcGap {
+                lastBypassPopTime = now
+                (shouldShow, delay) = (true, 0)
+            } else {
+                (shouldShow, delay) = (false, 0)
+            }
         }
 
         guard shouldShow else {
-            let pos = Duration.milliseconds(Int64(audioTime * 1000))
+            // 旁路 pacing 等待时视频帧已在正确位置,用帧 PTS 而非 audioTime
+            // (音频卡死时恒为 0,会把进度条打回 0)。
+            let pos = Duration.milliseconds(Int64((audioClockReady ? audioTime : frame.pts) * 1000))
             if (pos - lastNotifiedPos) >= .milliseconds(500) {
                 state.position = pos; notifyStateChange(); lastNotifiedPos = pos
             }
@@ -1711,6 +1742,7 @@ public final class NativeBackend: PlayerBackend {
         // freeze-ahead stutter on resume.
         jitterBuffer.flush()
         syncController.reset()
+        lastBypassPopTime = 0
         startDemuxLoop()
         startDisplayLink()
         // Calibrate audioClock to the first post-resume frame (like post-seek).
@@ -1741,6 +1773,7 @@ public final class NativeBackend: PlayerBackend {
 
         jitterBuffer.flush()
         syncController.reset()
+        lastBypassPopTime = 0
         // Clear the displayed frame so the pre-seek frame doesn't linger on
         // screen until the first post-seek frame is decoded and rendered.
         _renderer.flush()
@@ -1790,6 +1823,7 @@ public final class NativeBackend: PlayerBackend {
         demuxLock.unlock()
         jitterBuffer.flush()
         syncController.reset()
+        lastBypassPopTime = 0
         audioClock.reset(to: 0, sampleRate: 44100)  // critical: must reset or stale seek position
                                                      // from previous session pollutes AudioClock
         _renderer.flush()
@@ -1850,6 +1884,7 @@ public final class NativeBackend: PlayerBackend {
         videoDecoder?.flush()
         jitterBuffer.flush()
         syncController.reset()
+        lastBypassPopTime = 0
         _renderer.flush()
 
         // 5. Recreate audio output with new decoder's parameters

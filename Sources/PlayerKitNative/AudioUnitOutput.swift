@@ -196,8 +196,16 @@ public final class AudioUnitOutput: AudioOutputBackend {
         let queue = audioQueue
         if paused { paused = false }
         lock.unlock()
-        if let queue {
-            AudioQueueStart(queue, nil)
+        guard let queue else {
+            // 音频队列尚不存在时被要求恢复:start() 未跑或队列已 dispose。
+            // 若此后不再有 .playing 翻转,音频会永久暂停 → audioClock 卡 0
+            // → 同步旁路加速/卡死。这是 _finishOpen 竞态的直接症状。
+            logger.warning("resume() called but audioQueue is nil")
+            return
+        }
+        let rc = AudioQueueStart(queue, nil)
+        if rc != noErr {
+            logger.error("AudioQueueStart(resume) FAILED: \(rc)")
         }
     }
 
@@ -240,7 +248,12 @@ public final class AudioUnitOutput: AudioOutputBackend {
         lock.unlock()
 
         // Only (re)start if not deliberately paused by the buffering state machine.
-        if shouldRestart { AudioQueueStart(queue, nil) }
+        if shouldRestart {
+            let rc = AudioQueueStart(queue, nil)
+            if rc != noErr {
+                logger.error("AudioQueueStart(enqueue) FAILED: \(rc)")
+            }
+        }
     }
 
     /// Called from the AudioQueue callback — do not call directly.
