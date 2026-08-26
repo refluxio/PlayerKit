@@ -1743,6 +1743,14 @@ public final class NativeBackend: PlayerBackend {
         jitterBuffer.flush()
         syncController.reset()
         lastBypassPopTime = 0
+        // Flush the video decoder after a pause/resume or PiP/background
+        // transition. VTDecompressionSession may have been invalidated by
+        // the system during the transition — VTVideoDecoder will recreate
+        // its session on the next transient error, but we flush delayed
+        // frames first to avoid feeding stale reordered frames.
+        if let vt = videoDecoder as? VTVideoDecoder {
+            vt.flush()
+        }
         startDemuxLoop()
         startDisplayLink()
         // Calibrate audioClock to the first post-resume frame (like post-seek).

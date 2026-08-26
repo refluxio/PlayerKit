@@ -34,6 +34,12 @@ final class VTVideoDecoder {
     private var failedAttempts = 0
     // Set by vtDecode when VT returns a non-zero status (real decode error).
     private var lastVTError = false
+    /// Transient error recovery: when VT returns a session-level error
+    /// (kVTInvalidSessionErr etc.), we recreate the session instead of
+    /// counting it toward the permanent fallback heuristic. These errors
+    /// happen during PiP/background transitions and are recoverable.
+    private var transientErrorCount = 0
+    private var maxTransientRetries = 3
 
     private let streamStartTime: Int64
     private let streamTimeBase: AVRational
@@ -331,14 +337,46 @@ final class VTVideoDecoder {
         ) == noErr, let sb else { return (nil, .invalid) }
 
         var result: CVPixelBuffer?
-        var decodeError = false
+        var decodeStatus: OSStatus = noErr
         var outputPTS: CMTime = .invalid
         VTDecompressionSessionDecodeFrame(session, sampleBuffer: sb, flags: [], infoFlagsOut: nil) { status, _, buf, pts, _ in
-            if status != noErr { decodeError = true }
+            decodeStatus = status
             result = buf
             outputPTS = pts
         }
-        lastVTError = decodeError
+
+        // Distinguish transient session errors (recoverable: PiP/background
+        // transitions invalidate the VT session) from permanent data errors
+        // (codec incompatibility, corrupt bitstream). Transient errors should
+        // trigger session recreation, not count toward fallback heuristic.
+        if decodeStatus != noErr {
+            if Self.isTransientError(decodeStatus) {
+                logger.warning("VT transient error \(decodeStatus) — recreating session")
+                transientErrorCount += 1
+                if transientErrorCount <= maxTransientRetries {
+                    recreateSession()
+                    // Retry decode with the new session
+                    if let newSession = self.session {
+                        VTDecompressionSessionDecodeFrame(newSession, sampleBuffer: sb, flags: [], infoFlagsOut: nil) { status2, _, buf2, pts2, _ in
+                            decodeStatus = status2
+                            result = buf2
+                            outputPTS = pts2
+                        }
+                        if decodeStatus == noErr {
+                            transientErrorCount = 0
+                            lastVTError = false
+                        }
+                    }
+                }
+                // Transient errors don't count toward fallback heuristic
+                lastVTError = false
+            } else {
+                lastVTError = true
+            }
+        } else {
+            lastVTError = false
+            transientErrorCount = 0
+        }
 
         // Tag HEVC Main 10 output with BT.2020/PQ colour metadata only when the
         // stream is actually HDR (PQ or HLG). 10-bit SDR streams (HEVC Main 10
@@ -354,6 +392,37 @@ final class VTVideoDecoder {
                                   kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
         }
         return (result, outputPTS)
+    }
+
+    /// Check if a VT error status is transient (recoverable by recreating session).
+    /// These happen during PiP/background transitions when the system invalidates
+    /// the VT session — they're NOT permanent decoder failures.
+    private static func isTransientError(_ status: OSStatus) -> Bool {
+        switch status {
+        case kVTInvalidSessionErr,              // -12903: session invalidated (PiP/background)
+             kVTVideoDecoderNotAvailableNowErr,  // -12913: HW decoder temporarily unavailable
+             kVTAllocationFailedErr:             // -12904: transient resource pressure
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Recreate the VTDecompressionSession using the existing formatDesc.
+    /// Called when a transient error invalidates the session (PiP/background).
+    private func recreateSession() {
+        guard let desc = formatDesc else { return }
+        if let oldSession = session {
+            VTDecompressionSessionInvalidate(oldSession)
+        }
+        if let newSession = VTVideoDecoder.makeSession(formatDesc: desc, is10Bit: is10Bit) {
+            session = newSession
+            logger.info("VT session recreated after transient error")
+        } else {
+            logger.error("VT session recreation failed — marking as failed")
+            // If recreation fails, the session is truly broken
+            session = nil
+        }
     }
 
     // MARK: - Codec-parameter extraction (FFmpeg 8.x aware)
