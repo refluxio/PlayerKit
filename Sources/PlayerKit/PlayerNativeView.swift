@@ -39,13 +39,46 @@ public final class PlayerNativeViewMac: NSView {
             layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
             layer?.addSublayer(target)
         }
-        // Pin the render layer to the view's full bounds. Without this, the
-        // CAMetalLayer can end up with a zero or stale frame and the video
-        // appears shrunken in the top-left corner instead of filling the view.
+        let frame: CGRect
+        if target is AVSampleBufferDisplayLayer {
+            // Size the display layer to the video's actual aspect-ratio rect within
+            // the view bounds (same as the iOS variant).  The parent view (black
+            // background) provides the letterbox/pillarbox bars.  This is essential
+            // for PiP: the PiP window keeps the video's proportions, and when the
+            // user returns from PiP the system animates the PiP window back to the
+            // layer's frame — if the layer spans the full view bounds (arbitrary
+            // window aspect), the animation target proportion mismatches the video
+            // and the picture visibly stretches for a moment before aspect-fit
+            // restores it.
+            frame = videoLayerFrame(in: bounds, videoInfo: player.state.videoInfo)
+            (target as? AVSampleBufferDisplayLayer)?.videoGravity =
+                (frame == bounds) ? .resizeAspect : .resize
+        } else {
+            // Non-ASBDL renderers (e.g. Metal) manage their own content rect.
+            // Without this, the CAMetalLayer can end up with a zero or stale frame
+            // and the video appears shrunken in the top-left corner instead of
+            // filling the view.
+            frame = bounds
+        }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        target.frame = bounds
+        target.frame = frame
         CATransaction.commit()
+    }
+
+    private func videoLayerFrame(in bounds: CGRect, videoInfo: VideoInfo?) -> CGRect {
+        guard let info = videoInfo, info.width > 0, info.height > 0 else { return bounds }
+        let aspect = CGFloat(info.width) / CGFloat(info.height)
+        let boundsAspect = bounds.width / bounds.height
+        if aspect > boundsAspect {
+            // Letterbox: black bars top and bottom
+            let h = bounds.width / aspect
+            return CGRect(x: 0, y: (bounds.height - h) / 2, width: bounds.width, height: h)
+        } else {
+            // Pillarbox: black bars left and right
+            let w = bounds.height * aspect
+            return CGRect(x: (bounds.width - w) / 2, y: 0, width: w, height: bounds.height)
+        }
     }
 }
 
@@ -58,7 +91,14 @@ public struct PlayerNativeView: NSViewRepresentable {
         PlayerNativeViewMac(player: player)
     }
 
-    public func updateNSView(_ nsView: PlayerNativeViewMac, context: Context) {}
+    public func updateNSView(_ nsView: PlayerNativeViewMac, context: Context) {
+        // Reading videoInfo here registers SwiftUI observation tracking.
+        // When videoInfo changes (video opens), SwiftUI re-calls updateNSView,
+        // which triggers layout so the display layer is resized to the video's
+        // aspect-ratio rect (see layout()).
+        _ = player.state.videoInfo
+        nsView.needsLayout = true
+    }
 }
 
 #elseif os(iOS) || os(tvOS)
