@@ -947,6 +947,11 @@ public final class NativeBackend: PlayerBackend {
                         continue
                     }
                     logger.info("demux EOF after \(packetCount) packets")
+                    // 告知 jitterBuffer 视频流已结束:若剩余帧不足 resumeDuration
+                    // (seek 到接近末尾),立即开播渲染,而不是永远停在 buffering
+                    // 黑屏(displayNextFrame 的 guard jitterBuffer.state == .playing
+                    // 直接 return,零帧显示)。
+                    jitter.markEOF()
                     break
                 }
 
