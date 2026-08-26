@@ -187,6 +187,15 @@ public final class NativeBackend: PlayerBackend {
     // Bool reads/writes are atomic on ARM64 in practice; nonisolated(unsafe) makes
     // that contract explicit for the compiler's concurrency checker.
     private nonisolated(unsafe) var demuxCancelled = false
+    // 当前 demux 循环是否在运行(锁内读写,dispatch-global 线程)。防止 resume()
+    // 在旧循环仍在运行(PiP 场景 willResignActive 不 pause)时再启动第二个循环
+    // —— 两个循环并行读同一 demuxer 会竞争包,jitterBuffer 出现交错双序列
+    // append,视频卡住。
+    private nonisolated(unsafe) var demuxLoopRunning = false
+    // 运行中循环对应的 demuxer 实例(仅指针比较,循环退出时清空)。stop→play
+    // 换媒体后旧循环必须退出、由 startDemuxLoop 等待后启动新循环;而
+    // pause→resume / PiP→resume 不换 demuxer,直接复用旧循环。
+    private nonisolated(unsafe) var demuxLoopDemuxer: (any PacketDemuxing)?
     private var displayLink: CADisplayLink?
     private var displayLinkProxy: DisplayLinkProxy?
     #if os(macOS)
@@ -906,9 +915,47 @@ public final class NativeBackend: PlayerBackend {
     // MARK: - Demux loop
 
     private func startDemuxLoop() {
+        demuxLock.lock()
+        if demuxLoopRunning {
+            if let current = demuxer, current as AnyObject === demuxLoopDemuxer as AnyObject {
+                // PiP→resume:willResignActive 不 pause(为了让 auto-PiP 有内容
+                // 可播),旧循环仍在运行;而 resume() 无条件调用本方法 —— 若再
+                // 启动一个循环,两个循环并行读同一 demuxer 竞争包、jitterBuffer
+                // 出现双序列 append,视频卡住(append#87→append#1 交错日志)。
+                // 复位取消标志,让旧循环继续。
+                demuxCancelled = false
+                demuxLock.unlock()
+                logger.info("startDemuxLoop: loop already running (same demuxer), reviving it")
+                return
+            }
+            // stop→play 换了 demuxer:旧循环在下一次迭代看到 demuxer 不一致
+            // (或 demuxCancelled)就会退出,这里等它退出再启动新循环(毫秒级)。
+            var waitedTicks = 0
+            while demuxLoopRunning && waitedTicks < 200 {
+                demuxLock.unlock()
+                Thread.sleep(forTimeInterval: 0.005)
+                demuxLock.lock()
+                waitedTicks += 1
+            }
+            if demuxLoopRunning {
+                // 理论不可达:stop() 已置 demuxCancelled 并 close 旧 demuxer,
+                // readPacket 立即失败 → 循环退出。防御性兜底,避免主线程死等。
+                logger.warning("startDemuxLoop: old loop did not exit in 1s, forcing")
+                demuxLoopRunning = false
+                demuxLoopDemuxer = nil
+            }
+        }
+        demuxLoopRunning = true
+        demuxLoopDemuxer = demuxer
         demuxCancelled = false
+        demuxLock.unlock()
+
         guard let demuxer = self.demuxer else {
             logger.error("startDemuxLoop: demuxer is nil (stop was called?)")
+            demuxLock.lock()
+            demuxLoopRunning = false
+            demuxLoopDemuxer = nil
+            demuxLock.unlock()
             return
         }
         let audioDec = audioDecoder
@@ -919,6 +966,17 @@ public final class NativeBackend: PlayerBackend {
         let sLock = seekLock
 
         DispatchQueue.global().async { [weak self, colorParams] in
+            // 任何退出路径(break/return)都清 running 标志,保证 startDemuxLoop()
+            // 的防重入判断始终准确。循环内所有 break 出口都发生在 dLock 解锁
+            // 之后,这里锁内清理不会死锁。
+            defer {
+                dLock.lock()
+                if let self {
+                    self.demuxLoopRunning = false
+                    self.demuxLoopDemuxer = nil
+                }
+                dLock.unlock()
+            }
             var ptsValidator = PTSValidator()
             var packetCount: Int32 = 0
             var eofRecoveryDone = false
@@ -944,6 +1002,13 @@ public final class NativeBackend: PlayerBackend {
 
                 dLock.lock()
                 if self.demuxCancelled { dLock.unlock(); break }
+                // stop→play 换了 demuxer:旧循环捕获的是已 close 的旧实例,
+                // 立即退出,由 startDemuxLoop 等待后启动新循环。
+                if demuxer as AnyObject !== self.demuxer as AnyObject {
+                    dLock.unlock()
+                    logger.info("demux loop: demuxer replaced, exiting")
+                    break
+                }
 
                 let currentSerial = sLock.withLock { self.seekSerial }
 
