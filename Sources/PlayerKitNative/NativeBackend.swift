@@ -226,6 +226,15 @@ public final class NativeBackend: PlayerBackend {
     /// 弹出,不会等待。
     private var lastBypassPopTime: Double = 0
     private var lastNotifiedPos: Duration = .zero
+    /// resume() 后置位:后台期间(PiP 未激活/不支持)音频会话被系统暂停,
+    /// AudioQueue 停止消费,音频时钟停在暂停位置,而 demux/解码器在 app
+    /// 未被挂起时继续推进 —— 恢复时音频时钟可能落后视频帧 PTS 数十秒,
+    /// 远超 maxCalibrationGap,不校准则 freeze-ahead 把超前帧全部冻结,
+    /// 画面长时间卡死。置位后首个校准帧强制校准(丢弃暂停期静音差距);
+    /// seek 场景不置位,保持 maxCalibrationGap 对 byte-offset seek 大偏差
+    /// 的掩盖保护。
+    private var forceClockCalibration = false
+
 
     // Throughput tracking. Written from demux queue, read on main actor.
     private nonisolated(unsafe) var totalBytesRead: Int64 = 0
@@ -1463,10 +1472,12 @@ public final class NativeBackend: PlayerBackend {
             // large gap, skip calibration and let the freeze-ahead guard hold
             // video until the real audioClock catches up instead — a one-time
             // stall, but it converges on what's actually audible.
-            if abs(firstFrame.pts - audioClock.audioTime) < maxCalibrationGap {
+            if forceClockCalibration
+                || abs(firstFrame.pts - audioClock.audioTime) < maxCalibrationGap {
                 audioClock.calibrate(to: firstFrame.pts, sampleRate: audioDecoder?.outputSampleRate ?? 44100)
             }
             needsClockCalibration = false
+            forceClockCalibration = false
         }
 
         // In passthrough mode AudioUnitOutput never runs so audioClock stays at 0.
@@ -1717,6 +1728,20 @@ public final class NativeBackend: PlayerBackend {
         #if canImport(UIKit)
         try? AVAudioSession.sharedInstance().setActive(true)
         #endif
+        // 重建音频输出。后台期间(PiP 未激活/不支持/启动失败)音频会话被系统
+        // 暂停,AudioQueue 停止消费,音频时钟停在暂停位置;而 demux/解码器在
+        // app 未被挂起时继续推进 —— resume 时音频时钟落后视频帧 PTS 可达
+        // 数十秒,freeze-ahead 把超前帧全部冻结 → 画面长时间卡死。flush()
+        // 丢弃后台积压的旧帧(它们的内容与校准后的时钟会错位),时钟归零,
+        // 首个校准帧强制校准到帧 PTS(见 forceClockCalibration),让音频从
+        // 当前视频位置重新起步,而不是从暂停位置慢速追赶。
+        audioUnitOutput?.flush()
+        let resumeSR = audioDecoder?.outputSampleRate ?? 44100
+        let resumeCh = audioDecoder?.outputChannels ?? 2
+        audioUnitOutput?.start(sampleRate: resumeSR, channels: resumeCh)
+        audioUnitOutput?.pause()
+        audioClock.reset(to: 0, sampleRate: resumeSR)
+        forceClockCalibration = true
         // Always resume audio output regardless of jitter buffer state.
         // If the player was paused while the jitter buffer was in .buffering state,
         // the conditional guard (state == .playing) would leave audio silently stopped.
@@ -1832,6 +1857,7 @@ public final class NativeBackend: PlayerBackend {
         jitterBuffer.flush()
         syncController.reset()
         lastBypassPopTime = 0
+        forceClockCalibration = false
         audioClock.reset(to: 0, sampleRate: 44100)  // critical: must reset or stale seek position
                                                      // from previous session pollutes AudioClock
         _renderer.flush()
