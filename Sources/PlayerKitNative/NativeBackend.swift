@@ -1793,20 +1793,29 @@ public final class NativeBackend: PlayerBackend {
         #if canImport(UIKit)
         try? AVAudioSession.sharedInstance().setActive(true)
         #endif
-        // 重建音频输出。后台期间(PiP 未激活/不支持/启动失败)音频会话被系统
-        // 暂停,AudioQueue 停止消费,音频时钟停在暂停位置;而 demux/解码器在
-        // app 未被挂起时继续推进 —— resume 时音频时钟落后视频帧 PTS 可达
-        // 数十秒,freeze-ahead 把超前帧全部冻结 → 画面长时间卡死。flush()
-        // 丢弃后台积压的旧帧(它们的内容与校准后的时钟会错位),时钟归零,
-        // 首个校准帧强制校准到帧 PTS(见 forceClockCalibration),让音频从
-        // 当前视频位置重新起步,而不是从暂停位置慢速追赶。
-        audioUnitOutput?.flush()
-        let resumeSR = audioDecoder?.outputSampleRate ?? 44100
-        let resumeCh = audioDecoder?.outputChannels ?? 2
-        audioUnitOutput?.start(sampleRate: resumeSR, channels: resumeCh)
-        audioUnitOutput?.pause()
-        audioClock.reset(to: 0, sampleRate: resumeSR)
-        forceClockCalibration = true
+        // PiP 恢复时 demux 循环从未中断(demuxLoopRunning && !demuxCancelled,
+        // 见 startDemuxLoop 防重入):播放管线保持连续 —— 音频时钟在 PiP 期间
+        // 持续推进、jitterBuffer 持续填充。此时 flush/重建反而有害:清空
+        // jitterBuffer 后恢复瞬间没有新帧可显示(主画面闪过 PiP 的最后内容)、
+        // 音频时钟归零重校准产生咔哒。只有真正 pause 过(循环已取消)才需要
+        // 走完整的重建路径。
+        let resumingContinuous = demuxLock.withLock { demuxLoopRunning && !demuxCancelled }
+        if !resumingContinuous {
+            // 重建音频输出。后台期间(PiP 未激活/不支持/启动失败)音频会话被系统
+            // 暂停,AudioQueue 停止消费,音频时钟停在暂停位置;而 demux/解码器在
+            // app 未被挂起时继续推进 —— resume 时音频时钟落后视频帧 PTS 可达
+            // 数十秒,freeze-ahead 把超前帧全部冻结 → 画面长时间卡死。flush()
+            // 丢弃后台积压的旧帧(它们的内容与校准后的时钟会错位),时钟归零,
+            // 首个校准帧强制校准到帧 PTS(见 forceClockCalibration),让音频从
+            // 当前视频位置重新起步,而不是从暂停位置慢速追赶。
+            audioUnitOutput?.flush()
+            let resumeSR = audioDecoder?.outputSampleRate ?? 44100
+            let resumeCh = audioDecoder?.outputChannels ?? 2
+            audioUnitOutput?.start(sampleRate: resumeSR, channels: resumeCh)
+            audioUnitOutput?.pause()
+            audioClock.reset(to: 0, sampleRate: resumeSR)
+            forceClockCalibration = true
+        }
         // Always resume audio output regardless of jitter buffer state.
         // If the player was paused while the jitter buffer was in .buffering state,
         // the conditional guard (state == .playing) would leave audio silently stopped.
@@ -1829,23 +1838,29 @@ public final class NativeBackend: PlayerBackend {
         #endif
         // Restart the demux loop (pause() set demuxCancelled=true).
         // Flush stale frames that accumulated during pause to prevent
-        // freeze-ahead stutter on resume.
-        jitterBuffer.flush()
-        syncController.reset()
-        lastBypassPopTime = 0
-        // Flush the video decoder after a pause/resume or PiP/background
-        // transition. VTDecompressionSession may have been invalidated by
-        // the system during the transition — VTVideoDecoder will recreate
-        // its session on the next transient error, but we flush delayed
-        // frames first to avoid feeding stale reordered frames.
-        if let vt = videoDecoder as? VTVideoDecoder {
-            vt.flush()
+        // freeze-ahead stutter on resume. PiP 连续播放场景跳过 —— jitter
+        // 里全是新鲜帧,flush 只会造成恢复瞬间无帧可显示(PiP 画面一闪)。
+        if !resumingContinuous {
+            jitterBuffer.flush()
+            syncController.reset()
+            lastBypassPopTime = 0
+            // Flush the video decoder after a pause/resume or PiP/background
+            // transition. VTDecompressionSession may have been invalidated by
+            // the system during the transition — VTVideoDecoder will recreate
+            // its session on the next transient error, but we flush delayed
+            // frames first to avoid feeding stale reordered frames.
+            if let vt = videoDecoder as? VTVideoDecoder {
+                vt.flush()
+            }
         }
         startDemuxLoop()
         startDisplayLink()
         // Calibrate audioClock to the first post-resume frame (like post-seek).
-        needsClockCalibration = true
-        audioClockReady = false
+        // PiP 连续场景时钟从未停,无需校准。
+        if !resumingContinuous {
+            needsClockCalibration = true
+            audioClockReady = false
+        }
         state.isPlaying = true; notifyStateChange()
     }
 
