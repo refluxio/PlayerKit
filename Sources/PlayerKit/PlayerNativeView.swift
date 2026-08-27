@@ -107,12 +107,39 @@ import UIKit
 @MainActor
 public final class PlayerNativeViewiOS: UIView {
     private let player: Player
+    #if os(iOS)
+    private var lifecycleTokens: [NSObjectProtocol] = []
+    #endif
 
     init(player: Player) {
         self.player = player
         super.init(frame: .zero)
         backgroundColor = .black
         layer.addSublayer(player.renderLayer ?? CALayer())
+        #if os(iOS)
+        // PiP 激活时系统把 displayLayer 接入自己的渲染树,可能改动其 frame;
+        // 从 PiP 恢复时系统把 PiP 窗口动画回 contentSource layer 的 frame ——
+        // 若此时 frame 不是视频比例矩形,画面会在动画期间被拉伸放大、动画
+        // 结束才回缩("先放大一下,然后瞬间恢复",与 macOS layout() 修的同一
+        // 问题)。这里在 PiP 激活/停止与 app 回前台时强制重算 frame,保证
+        // 恢复动画开始前 frame 已是视频比例矩形。
+        let center = NotificationCenter.default
+        lifecycleTokens.append(center.addObserver(
+            forName: .playerKitPiPDidStart, object: nil, queue: .main
+        ) { [weak self] _ in self?.setNeedsLayout() })
+        lifecycleTokens.append(center.addObserver(
+            forName: .playerKitPiPDidStop, object: nil, queue: .main
+        ) { [weak self] _ in self?.setNeedsLayout() })
+        lifecycleTokens.append(center.addObserver(
+            forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.setNeedsLayout() })
+        #endif
+    }
+
+    deinit {
+        #if os(iOS)
+        lifecycleTokens.forEach { NotificationCenter.default.removeObserver($0) }
+        #endif
     }
 
     @available(*, unavailable)

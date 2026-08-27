@@ -35,6 +35,16 @@ private class PiPPlaybackDelegate: NSObject, AVPictureInPictureSampleBufferPlayb
     }
 }
 
+public extension Notification.Name {
+    /// Posted on the main thread when PiP becomes active (transition animation finished).
+    /// PlayerNativeView observes this to re-apply the video aspect-ratio frame to the
+    /// display layer — the system may have reparented or resized it during the transition.
+    static let playerKitPiPDidStart = Notification.Name("PlayerKit.pipDidStart")
+    /// Posted on the main thread when PiP stops (user dismisses it or the system
+    /// restores to inline). Same purpose as `playerKitPiPDidStart`.
+    static let playerKitPiPDidStop = Notification.Name("PlayerKit.pipDidStop")
+}
+
 @available(iOS 15.0, macOS 12.0, *)
 private class PiPDelegateObserver: NSObject, AVPictureInPictureControllerDelegate {
     weak var owner: PiPController?
@@ -43,10 +53,12 @@ private class PiPDelegateObserver: NSObject, AVPictureInPictureControllerDelegat
     func pictureInPictureControllerWillStartPictureInPicture(_ controller: AVPictureInPictureController) {}
 
     func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
+        NotificationCenter.default.post(name: .playerKitPiPDidStart, object: nil)
         owner?.onStart?()
     }
 
     func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
+        NotificationCenter.default.post(name: .playerKitPiPDidStop, object: nil)
         owner?.onStop?()
     }
 
