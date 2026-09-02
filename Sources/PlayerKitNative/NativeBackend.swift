@@ -1867,14 +1867,7 @@ public final class NativeBackend: PlayerBackend {
     public func seek(to: Duration) {
         let secs = to.secondsDouble
         logger.info("seek to \(String(format:"%.1f",secs))s")
-        demuxLock.lock()
         seekLock.withLock { seekSerial += 1 }
-        _ = demuxer?.seek(to: secs)
-        videoDecoder?.flush()
-        // Routed through audioDecodeQueue so this can't race a still-in-flight
-        // decode() of a pre-seek packet on that queue.
-        audioDecodeQueue.sync { audioDecoder?.flush() }
-        demuxLock.unlock()
 
         subtitleLock.withLock { subtitleCues.removeAll() }
         lastSubtitleText = nil
@@ -1916,6 +1909,32 @@ public final class NativeBackend: PlayerBackend {
         // "15s 快进实际跳 100s"的根因之一)。首帧渲染后覆盖为落点。
         state.position = .seconds(secs)
         notifyStateChange()
+
+        // demuxer.seek() 是同步阻塞调用(FFmpeg avformat 层的 seek;网盘/HTTP
+        // 流媒体场景下会触发一次新的字节范围网络请求,可能耗时几百毫秒到数秒)。
+        // 此前这一段(连同 demuxLock 的争抢)整段在调用方线程——SwiftUI 手势
+        // 回调直接同步调 seek(),即主线程——执行,期间整个 UI 完全冻住:拖动
+        // 跟手性差/松手卡顿/点击跳转慢,根子都是这个(2026-09-02 用户反馈+
+        // 代码走查实锤,NativeBackend 是 @MainActor,这个函数体此前从没让出
+        // 过主线程)。派发到跟 demux 主循环(startDemuxLoop)同一个
+        // DispatchQueue.global(),用同一把 demuxLock 保证跟循环互斥,不引入
+        // 新的数据竞争;调用方(MainActor)在上面已经完成所有状态更新后立即
+        // 返回,不用再等这段网络 I/O。videoDecoder/audioDecoder 的 flush 顺序
+        // 和 audioDecodeQueue 串行化跟原来同步版本完全一致,只是搬到了后台。
+        let demuxerRef = demuxer
+        let videoDec = videoDecoder
+        let audioDec = audioDecoder
+        let dLock = demuxLock
+        let aQueue = audioDecodeQueue
+        DispatchQueue.global().async {
+            dLock.lock()
+            _ = demuxerRef?.seek(to: secs)
+            videoDec?.flush()
+            // Routed through audioDecodeQueue so this can't race a still-in-flight
+            // decode() of a pre-seek packet on that queue.
+            aQueue.sync { audioDec?.flush() }
+            dLock.unlock()
+        }
     }
 
     public func stop() {
