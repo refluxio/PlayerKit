@@ -22,6 +22,9 @@ final class VideoJitterBuffer: @unchecked Sendable {
 
     let minDuration: Double = 0.5     // 低于此值 → buffering
     let resumeDuration: Double = 1.0  // 达到此值 → playing
+    // 2026-09-02 曾试降到 0.6s 换更快首帧,但 115 CDN 单次请求耗时观测到
+    // 5~9.5s 的抖动(Cloud115StreamReader.swift 头部注释详述),0.6s 的缓冲
+    // margin 扛不住,反而更频繁触发二次卡顿——已撤销回 1.0。
     let maxDuration: Double = 2.0     // demux 背压阈值（不丢帧，只是限速）
     let maxFrameCount: Int = 60       // ≈2.5s at 24fps; hard cap to bound memory
 

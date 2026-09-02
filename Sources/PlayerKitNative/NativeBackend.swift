@@ -178,6 +178,16 @@ public final class NativeBackend: PlayerBackend {
     private let seekLock = NSLock()
     // Guarded by seekLock — safe to access from any thread holding the lock.
     private nonisolated(unsafe) var seekSerial: Int64 = 0
+    /// 有别于 seekSerial(_seek() 同步调用瞬间就 +1):这个只在 demuxer.seek()
+    /// 真正物理执行之后才 +1。异步 seek 下,seekSerial 会在网络 I/O 落地前
+    /// 抢跑好几次(用户连续拖动/连续 seek 时尤其明显),demux 循环若拿
+    /// seekSerial 变化去触发 ptsValidator.reset(),reset 会在"抢跑"阶段就被
+    /// 用掉,轮到真正物理 seek 落地、PTS 真的跳变的那一刻反而没有 reset——
+    /// PTSValidator 把这次真实跳变当异常,进入 blind clock 模式,画面从旧
+    /// 位置逐帧爬向新位置而不是直接跳过去(2026-09-03 用户反馈"画面抖动"/
+    /// seek 后卡顿实锤)。只在 performDemuxerSeek 真正调用 demuxer.seek()
+    /// 那一刻(持有 demuxLock)才 +1,由 demuxLock 保护,不需要额外的锁。
+    private nonisolated(unsafe) var physicalSeekGeneration: Int64 = 0
     /// Set true after seek()/play(), cleared on first frame render + audioClock advance.
     /// While true, freeze-ahead guard is bypassed so primer callbacks have time to
     /// fire and advance audioClock past 0 — without this, seek-to-0 freezes because
@@ -867,6 +877,14 @@ public final class NativeBackend: PlayerBackend {
             out.pause()
         }
 
+        // 打开即恢复播放位置(seekTo)必须在 startDemuxLoop() 之前落地:demux 循环
+        // 一起跑就会从偏移 0 开始读包解帧,若 seek 落地滞后(哪怕只是派发到后台
+        // 异步执行),循环会抢先把好几帧 0s 附近的画面塞进 jitterBuffer,和目标
+        // 位置的帧混流,表现为播放卡死在旧帧、音视频时钟差出几十秒
+        // (2026-09-02 用户反馈"播放不出来"实锤)。同步执行不影响体验——
+        // demuxer.open() 本身已经是秒级的网络探测延迟,多等这一下无感知。
+        if let seekTo { _seek(to: seekTo, synchronousDemuxerSeek: true) }
+
         startDemuxLoop()
         startDisplayLink()
 
@@ -880,8 +898,6 @@ public final class NativeBackend: PlayerBackend {
         notifyStateChange()
         let t1 = Date()
         logger.info("_finishOpen done in \(String(format: "%.0f", t1.timeIntervalSince(t0) * 1000))ms")
-
-        if let seekTo { seek(to: seekTo) }
     }
 
     private func wireJitterBuffer() {
@@ -980,7 +996,10 @@ public final class NativeBackend: PlayerBackend {
             var ptsValidator = PTSValidator()
             var packetCount: Int32 = 0
             var eofRecoveryDone = false
-            var lastSeenSerial: Int64 = -1
+            // 跟踪 physicalSeekGeneration(而非 seekSerial)——见该属性声明处
+            // 注释:reset() 必须跟"demuxer.seek() 真正物理执行"同步,不能跟着
+            // seekSerial 抢跑。
+            var lastSeenPhysicalGen: Int64 = -1
             // Diagnostic-only: confirms whether jitterBuffer append order is
             // truly monotonic (or regresses/repeats) — see the "mouth keeps
             // repeating" report.
@@ -1012,10 +1031,18 @@ public final class NativeBackend: PlayerBackend {
 
                 let currentSerial = sLock.withLock { self.seekSerial }
 
-                // Reset state on seek so stale packets don't affect post-seek packets.
-                if currentSerial != lastSeenSerial {
+                // Reset state when a seek has *physically landed*(demuxer.seek()
+                // 真的执行过),不是 seekSerial 一变就 reset——异步 seek 下
+                // seekSerial 在网络 I/O 落地前就会抢跑好几次,连续 seek 时尤其
+                // 明显,拿它触发 reset 会在抢跑阶段被用掉,轮到真正物理跳变的
+                // 那个包反而没有 reset,PTSValidator 把这次真实跳变当异常
+                // 处理,进入 blind clock 逐帧爬向新位置(2026-09-03 用户反馈
+                // "画面抖动"实锤,见 physicalSeekGeneration 声明处注释)。
+                let currentPhysicalGen = self.physicalSeekGeneration
+                if currentPhysicalGen != lastSeenPhysicalGen {
+                    logger.info("ptsValidator.reset() for physicalSeekGeneration=\(currentPhysicalGen) (was \(lastSeenPhysicalGen))")
                     ptsValidator.reset()
-                    lastSeenSerial = currentSerial
+                    lastSeenPhysicalGen = currentPhysicalGen
                 }
 
                 guard let result = demuxer.readPacket() else {
@@ -1865,9 +1892,26 @@ public final class NativeBackend: PlayerBackend {
     }
 
     public func seek(to: Duration) {
+        _seek(to: to, synchronousDemuxerSeek: false)
+    }
+
+    /// - Parameter synchronousDemuxerSeek: 打开即恢复播放位置(`_finishOpen` 的
+    ///   `seekTo`)专用。该场景必须在 `startDemuxLoop()` 启动前让 demuxer 真正
+    ///   跳到目标位置——异步版本(默认路径)把 demuxer.seek()+flush 派发到后台,
+    ///   若这里也异步,demux 循环会在 seek 落地前抢先从偏移 0 读出好几帧塞进
+    ///   jitterBuffer,和落地后的目标位置帧混流,导致画面卡死在旧帧
+    ///   (2026-09-02 用户反馈"播放不出来"实锤,音频时钟已到 75s 而视频还停在
+    ///   0.04s)。初始 open 阶段本来就有秒级的网络探测延迟,这里多等几百毫秒
+    ///   完全不影响体验,不像交互式拖动 seek 那样对主线程阻塞敏感。
+    private func _seek(to: Duration, synchronousDemuxerSeek: Bool) {
         let secs = to.secondsDouble
         logger.info("seek to \(String(format:"%.1f",secs))s")
-        seekLock.withLock { seekSerial += 1 }
+        // 捕获自增后的值:连续快速 seek(拖动多次/连按快进)时,后面异步执行的
+        // performDemuxerSeek 要靠这个值判断"我是不是已经被更新的 seek 取代了"
+        // (2026-09-03 用户反馈连续 seek 后音视频差出几十秒实锤——旧代码里
+        // 谁最后抢到 demuxLock 谁说了算,不是谁最后调用 seek() 说了算,乱序
+        // 执行会让 demuxer 停在一个不是用户最终目标的位置)。
+        let mySerial: Int64 = seekLock.withLock { seekSerial += 1; return seekSerial }
 
         subtitleLock.withLock { subtitleCues.removeAll() }
         lastSubtitleText = nil
@@ -1926,15 +1970,54 @@ public final class NativeBackend: PlayerBackend {
         let audioDec = audioDecoder
         let dLock = demuxLock
         let aQueue = audioDecodeQueue
-        DispatchQueue.global().async {
-            dLock.lock()
-            _ = demuxerRef?.seek(to: secs)
-            videoDec?.flush()
-            // Routed through audioDecodeQueue so this can't race a still-in-flight
-            // decode() of a pre-seek packet on that queue.
-            aQueue.sync { audioDec?.flush() }
-            dLock.unlock()
+        let sLock = seekLock
+        if synchronousDemuxerSeek {
+            // 打开即恢复位置(_finishOpen)只会发生一次,不存在"被更新的 seek
+            // 取代"的可能,但仍然传 backend 以便正确记录 physicalSeekGeneration
+            // (demux 循环启动前这里同步执行,self 还在栈上,直接传不需要弱引用)。
+            NativeBackend.performDemuxerSeek(to: secs, expectedSerial: mySerial, seekLock: sLock, backend: self,
+                                              demuxer: demuxerRef, videoDecoder: videoDec,
+                                              audioDecoder: audioDec, lock: dLock, audioQueue: aQueue)
+        } else {
+            DispatchQueue.global().async { [weak self] in
+                NativeBackend.performDemuxerSeek(to: secs, expectedSerial: mySerial, seekLock: sLock, backend: self,
+                                                  demuxer: demuxerRef, videoDecoder: videoDec,
+                                                  audioDecoder: audioDec, lock: dLock, audioQueue: aQueue)
+            }
         }
+    }
+
+    /// demuxer.seek() + 两个解码器 flush 的实际执行体,独立成静态函数以便
+    /// _finishOpen() 打开即恢复播放位置时能同步调用(见下方调用点注释)。
+    ///
+    /// - Parameters:
+    ///   - expectedSerial: 派发这次调用时的 seekSerial 快照。执行前重新核对——
+    ///     如果这期间又来了更新的 seek(seekSerial 已经变了),说明这次调用
+    ///     的目标位置已经过时,直接跳过物理 seek,交给更新那次自己的调用去做。
+    ///     不加这个判断的话,谁最后抢到 demuxLock 谁的目标位置生效,不一定是
+    ///     用户最后一次操作的目标(2026-09-03 连续 seek 音视频差出几十秒实锤)。
+    ///   - backend: 用于成功执行物理 seek 后记录 physicalSeekGeneration(demux
+    ///     循环靠它判断"真的物理 seek 了"来触发 PTSValidator.reset(),不能用
+    ///     seekSerial——见该属性声明处注释)。弱引用语义由调用方保证(异步路径
+    ///     用 [weak self] 捕获后传入)。
+    private static func performDemuxerSeek(to secs: Double, expectedSerial: Int64, seekLock: NSLock,
+                                            backend: NativeBackend?, demuxer: (any PacketDemuxing)?,
+                                            videoDecoder: (any VideoDecoding)?, audioDecoder: FFmpegAudioDecoder?,
+                                            lock: NSLock, audioQueue: DispatchQueue) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard seekLock.withLock({ backend?.seekSerial }) == expectedSerial else {
+            logger.info("seek to \(String(format:"%.1f",secs))s skipped — superseded by a newer seek before it reached demuxLock")
+            return
+        }
+        _ = demuxer?.seek(to: secs)
+        videoDecoder?.flush()
+        // Routed through audioDecodeQueue so this can't race a still-in-flight
+        // decode() of a pre-seek packet on that queue.
+        audioQueue.sync { audioDecoder?.flush() }
+        let gen = (backend?.physicalSeekGeneration ?? 0) + 1
+        backend?.physicalSeekGeneration = gen
+        logger.info("seek to \(String(format:"%.1f",secs))s landed physically, physicalSeekGeneration=\(gen)")
     }
 
     public func stop() {
