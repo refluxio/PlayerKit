@@ -1,3 +1,4 @@
+#if !os(tvOS)
 #if canImport(AVKit)
 import AVKit
 #endif
@@ -139,3 +140,4 @@ public class PiPController: NSObject {
         pipController.stopPictureInPicture()
     }
 }
+#endif

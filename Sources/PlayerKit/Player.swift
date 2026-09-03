@@ -20,14 +20,18 @@ public final class Player {
         self.backend = backend
         backend.onStateChange = { [weak self] s in
             self?.state = s
+            #if !os(tvOS)
             if #available(iOS 15.0, macOS 12.0, *) {
                 if let info = s.videoInfo, info.width > 0, info.height > 0 {
                     self?.pipController?.videoSize = CGSize(width: Double(info.width),
                                                            height: Double(info.height))
                 }
             }
+            #endif
         }
+        #if !os(tvOS)
         setUpPiPController()
+        #endif
     }
 
     // MARK: - Playable forwarding
@@ -111,6 +115,7 @@ public final class Player {
     /// A controller for Picture in Picture playback.
     /// Requires an ASBDLRenderer-based backend; nil otherwise.
     /// Created once and cached for the player's lifetime.
+    #if !os(tvOS)
     @available(iOS 15.0, macOS 12.0, *)
     public private(set) var pipController: PiPController?
 
@@ -118,12 +123,9 @@ public final class Player {
         guard #available(iOS 15.0, macOS 12.0, *),
               let asbdlRenderer = (backend as? any PlayerBackend)?.renderer as? ASBDLRenderer
         else { return }
-        // Use the main display layer as the PiP content source.  It must be in the
-        // view hierarchy for pip.start() to succeed.  PlayerNativeView sizes the
-        // layer to the video's actual aspect-ratio rect (not full-screen), so the
-        // PiP window reflects the correct video proportions.
         pipController = PiPController(displayLayer: asbdlRenderer.displayLayer)
     }
+    #endif
 
     // MARK: - Frame sinks (requires PlayerBackend)
 
