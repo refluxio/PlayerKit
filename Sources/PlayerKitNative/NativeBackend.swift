@@ -1188,7 +1188,17 @@ public final class NativeBackend: PlayerBackend {
                     // Observed on 4K HEVC UHD remuxes where VT decode is slow
                     // enough that the 50ms throttle × 24fps = 1.2s/s of sleep
                     // starves the audio path entirely.
-                    let audioPos = clock.audioTime
+                    let audioPos: Double
+                    if _injectedAudioOutput != nil && isPassthroughActive,
+                       let pt = _injectedAudioOutput?.playbackTime {
+                        // Passthrough: the PCM AudioClock never runs; pace the
+                        // read-ahead against the passthrough renderer's clock
+                        // instead, or the demux loop would enqueue the entire
+                        // file's audio into the renderer at decode speed.
+                        audioPos = pt
+                    } else {
+                        audioPos = clock.audioTime
+                    }
                     if pts.isFinite && pts > audioPos + 2.0,
                        audioPos > lastThrottleAudioPos {
                         Thread.sleep(forTimeInterval: min(pts - audioPos - 2.0, 0.050))
@@ -1573,12 +1583,17 @@ public final class NativeBackend: PlayerBackend {
         }
 
         // In passthrough mode AudioUnitOutput never runs so audioClock stays at 0.
-        // Use video PTS as master clock so A/V sync still advances frames.
+        // Use the passthrough backend's own playback clock as the master clock.
+        // The previous fallback here — the jitter buffer's next-frame PTS — was
+        // self-referential (the paced quantity used as its own reference, no
+        // feedback), so with the dual display drivers video free-wheeled at
+        // decode speed: MKV/DTS sources played at ~2-3x (2026-09 bug report).
         // On iOS/tvOS passthrough is disabled (PCM decode), so audioClock is
         // driven by AudioUnitOutput even when PassthroughOutput is injected.
         let audioTime: Double
-        if _injectedAudioOutput != nil && isPassthroughActive {
-            audioTime = jitterBuffer.peek(at: 0)?.pts ?? audioClock.audioTime
+        if _injectedAudioOutput != nil && isPassthroughActive,
+           let pt = _injectedAudioOutput?.playbackTime, pt.isFinite, pt >= 0 {
+            audioTime = pt
         } else {
             audioTime = audioClock.audioTime
         }
@@ -1935,6 +1950,11 @@ public final class NativeBackend: PlayerBackend {
         // would let those callbacks push the clock past secs.  Reset after stop so
         // it always lands exactly at secs regardless of how many frames were buffered.
         audioUnitOutput?.stop()
+        // Passthrough: drop audio scheduled for the old position and re-anchor
+        // its clock to the first packet at the new position (playbackTime).
+        // Without this, post-seek packets schedule far in the future of the
+        // synchronizer timebase — silence, and a lying A/V sync clock.
+        _injectedAudioOutput?.flush()
         audioClock.reset(to: secs, sampleRate: sr)
         audioUnitOutput?.start(sampleRate: sr, channels: ch)
         // Pause until jitterBuffer has enough video — same as initial play().
@@ -2032,6 +2052,9 @@ public final class NativeBackend: PlayerBackend {
         #endif
         demuxCancelled = true
         audioUnitOutput?.stop()
+        // Passthrough: drop audio scheduled for the previous session so the
+        // next play() re-anchors its clock to the new stream (playbackTime).
+        _injectedAudioOutput?.flush()
         demuxLock.lock()
         demuxer?.close(); demuxer = nil
         videoDecoder = nil; audioDecoder = nil
