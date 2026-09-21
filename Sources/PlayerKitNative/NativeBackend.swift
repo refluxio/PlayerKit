@@ -1250,9 +1250,19 @@ public final class NativeBackend: PlayerBackend {
                         let currentOut = self.audioUnitOutput
                         dLock.unlock()
                         handedOffPacket = true
+                        let trackContent = AudioUnitOutput.tracksPlayedContent
+                        let packetPts = trackContent ? Self.ptsFromPacket(packet, demuxer: demuxer) : .nan
+                        let outputRate = Double(currentDec?.outputSampleRate ?? 48000)
                         audioDecodeQueue.async {
                             let pcm = currentDec?.decode(packet: packet)
-                            if let pcm { currentOut?.enqueue(pcm) }
+                            if let pcm {
+                                var contentPts = Double.nan
+                                if trackContent {
+                                    contentPts = packetPts.isFinite ? packetPts : self.playedContentTrackerEnd
+                                    self.playedContentTrackerEnd = contentPts + Double(pcm.sampleCount) / outputRate
+                                }
+                                currentOut?.enqueue(pcm, contentPts: contentPts)
+                            }
                             var p: UnsafeMutablePointer<AVPacket>? = packet
                             av_packet_free(&p)
                         }
@@ -1792,6 +1802,21 @@ public final class NativeBackend: PlayerBackend {
 
     // MARK: - Controls
 
+    /// Test seam (see `AudioUnitOutput.tracksPlayedContent`): running source-content
+    /// PTS of the last decoded PCM frame, so the PTS of the audio that was actually
+    /// played can be compared with the picture. Laced MKV audio has NaN pts after the
+    /// first frame of each lace, so it re-anchors on every finite packet pts and
+    /// otherwise accumulates decoded duration. Only touched on audioDecodeQueue.
+    private nonisolated(unsafe) var playedContentTrackerEnd: Double = .nan
+
+    /// Test seam: source-content PTS the audio device has fully played minus the audio
+    /// clock, in seconds. The video is paced against the clock, so this is the
+    /// audio-vs-picture offset (positive = sound ahead of the picture). NaN until the
+    /// first buffer completed or when `tracksPlayedContent` is off.
+    func audioContentGapForTesting() -> Double {
+        (audioUnitOutput?.playedContentEnd() ?? .nan) - audioClock.audioTime
+    }
+
     public func pause() {
         logger.info("pause")
         displayLink?.invalidate(); displayLink = nil
@@ -1858,7 +1883,8 @@ public final class NativeBackend: PlayerBackend {
             audioClock.reset(to: 0, sampleRate: resumeSR)
             forceClockCalibration = true
         }
-        // Always resume audio output regardless of jitter buffer state.
+        // Continuous path (pipeline never stopped, e.g. PiP): resume audio output
+        // regardless of jitter buffer state.
         // If the player was paused while the jitter buffer was in .buffering state,
         // the conditional guard (state == .playing) would leave audio silently stopped.
         // audioClock would stay frozen → demux backpressure (pts > audioPos+2.0) would
@@ -1867,7 +1893,17 @@ public final class NativeBackend: PlayerBackend {
         // advance, which unblocks the demux loop.  onStateChange(.buffering) will pause
         // audio again if the buffer drains below minDuration, and onStateChange(.playing)
         // will resume it; those two form the normal steady-state feedback loop.
-        audioUnitOutput?.resume()
+        //
+        // Rebuild path: do NOT resume here. jitterBuffer.flush() below puts the buffer
+        // back to .buffering, so the refilled buffer WILL flip to .playing (or EOF /
+        // slow-decode grace) and onStateChange(.playing) resumes the queue — the same
+        // protocol _finishOpen uses. Resuming now made the audio play by itself for the
+        // ~1 s the video needs to refill, after which the clock was calibrated to the
+        // first video frame: sound stayed ahead of the picture by that second
+        // (measured +0.97 s on the real movie).
+        if resumingContinuous {
+            audioUnitOutput?.resume()
+        }
         // Invalidate any existing display link before creating a new one.
         // Without this, calling resume() on an already-playing player (e.g. when
         // pip.start() was attempted but PiP never fully activated) would leave
@@ -1991,18 +2027,38 @@ public final class NativeBackend: PlayerBackend {
         let dLock = demuxLock
         let aQueue = audioDecodeQueue
         let sLock = seekLock
+        let audioOut = audioUnitOutput
+        let clockRef = audioClock
+        let jitterRef = jitterBuffer
+        // Runs once the physical seek has landed (see performDemuxerSeek): re-arm the
+        // one-shot clock calibration for the first POST-landing frame.
+        let onLanded: @Sendable () -> Void = { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.needsClockCalibration = true
+                self.audioClockReady = false
+                self.syncController.reset()
+                self.lastBypassPopTime = 0
+            }
+        }
         if synchronousDemuxerSeek {
             // 打开即恢复位置(_finishOpen)只会发生一次,不存在"被更新的 seek
             // 取代"的可能,但仍然传 backend 以便正确记录 physicalSeekGeneration
             // (demux 循环启动前这里同步执行,self 还在栈上,直接传不需要弱引用)。
             NativeBackend.performDemuxerSeek(to: secs, expectedSerial: mySerial, seekLock: sLock, backend: self,
                                               demuxer: demuxerRef, videoDecoder: videoDec,
-                                              audioDecoder: audioDec, lock: dLock, audioQueue: aQueue)
+                                              audioDecoder: audioDec, lock: dLock, audioQueue: aQueue,
+                                              audioOutput: audioOut, audioClock: clockRef,
+                                              audioSampleRate: sr, audioChannels: ch,
+                                              jitterBuffer: jitterRef, onLanded: onLanded)
         } else {
             DispatchQueue.global().async { [weak self] in
                 NativeBackend.performDemuxerSeek(to: secs, expectedSerial: mySerial, seekLock: sLock, backend: self,
                                                   demuxer: demuxerRef, videoDecoder: videoDec,
-                                                  audioDecoder: audioDec, lock: dLock, audioQueue: aQueue)
+                                                  audioDecoder: audioDec, lock: dLock, audioQueue: aQueue,
+                                              audioOutput: audioOut, audioClock: clockRef,
+                                              audioSampleRate: sr, audioChannels: ch,
+                                              jitterBuffer: jitterRef, onLanded: onLanded)
             }
         }
     }
@@ -2023,7 +2079,11 @@ public final class NativeBackend: PlayerBackend {
     private static func performDemuxerSeek(to secs: Double, expectedSerial: Int64, seekLock: NSLock,
                                             backend: NativeBackend?, demuxer: (any PacketDemuxing)?,
                                             videoDecoder: (any VideoDecoding)?, audioDecoder: FFmpegAudioDecoder?,
-                                            lock: NSLock, audioQueue: DispatchQueue) {
+                                            lock: NSLock, audioQueue: DispatchQueue,
+                                            audioOutput: AudioUnitOutput? = nil, audioClock: AudioClock? = nil,
+                                            audioSampleRate: Int32 = 44100, audioChannels: Int32 = 2,
+                                            jitterBuffer: VideoJitterBuffer? = nil,
+                                            onLanded: (@Sendable () -> Void)? = nil) {
         lock.lock()
         defer { lock.unlock() }
         guard seekLock.withLock({ backend?.seekSerial }) == expectedSerial else {
@@ -2035,6 +2095,34 @@ public final class NativeBackend: PlayerBackend {
         // Routed through audioDecodeQueue so this can't race a still-in-flight
         // decode() of a pre-seek packet on that queue.
         audioQueue.sync { audioDecoder?.flush() }
+        // The sync above is a barrier: every packet read from the OLD position has
+        // now been decoded and its PCM is already in the audio queue that _seek
+        // restarted BEFORE this physical seek landed (a cast at a position is
+        // play() + a separate seek ~30 ms later, and demux keeps reading the old
+        // position until this point). Playing that would put audio from the old
+        // position ahead of the post-seek audio — measured −0.86 s (old cap) and
+        // −2.60 s (5 s cap) between audio content and picture. Nothing from before
+        // the landing can arrive after the barrier, so restart the queue once more:
+        // same sequence as _seek (stop → clock reset → start → pause; the jitter
+        // buffer's .playing transition resumes it).
+        if let out = audioOutput, let clock = audioClock {
+            out.stop()
+            clock.reset(to: secs, sampleRate: audioSampleRate)
+            out.start(sampleRate: audioSampleRate, channels: audioChannels)
+            out.pause()
+        }
+        // Same for video. Until this landing the demux loop kept reading the OLD
+        // position (a cast at a position is play() + a separate seek), so the jitter
+        // buffer now holds stale frames; the first of them consumed the one-shot clock
+        // calibration (`needsClockCalibration`) — with the old position far from the
+        // target (> maxCalibrationGap) it SKIPPED the calibration and cleared the flag.
+        // The real post-landing frames then never re-calibrated the clock: it stayed at
+        // the target while audio started at the landing keyframe (audio behind picture
+        // by target − keyframe: −2.005 s on the real movie). Drop the stale frames and
+        // let the first post-landing frame calibrate. We still hold demuxLock, so no
+        // post-landing frame can have been appended yet.
+        jitterBuffer?.flush()
+        onLanded?()
         let gen = (backend?.physicalSeekGeneration ?? 0) + 1
         backend?.physicalSeekGeneration = gen
         logger.info("seek to \(String(format:"%.1f",secs))s landed physically, physicalSeekGeneration=\(gen)")
