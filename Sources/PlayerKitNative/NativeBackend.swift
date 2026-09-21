@@ -245,6 +245,10 @@ public final class NativeBackend: PlayerBackend {
     /// 弹出,不会等待。
     private var lastBypassPopTime: Double = 0
     private var lastNotifiedPos: Duration = .zero
+    /// Passthrough fallback pacing anchor (wall time ↔ read-ahead frontier PTS)
+    /// used while the injected output's playbackTime is unavailable. Nil once
+    /// the real passthrough clock takes over; reset per session in stop().
+    private var passthroughWallClockAnchor: (wall: Double, pts: Double)?
     /// resume() 后置位:后台期间(PiP 未激活/不支持)音频会话被系统暂停,
     /// AudioQueue 停止消费,音频时钟停在暂停位置,而 demux/解码器在 app
     /// 未被挂起时继续推进 —— 恢复时音频时钟可能落后视频帧 PTS 数十秒,
@@ -1196,6 +1200,26 @@ public final class NativeBackend: PlayerBackend {
                         // instead, or the demux loop would enqueue the entire
                         // file's audio into the renderer at decode speed.
                         audioPos = pt
+                        passthroughWallClockAnchor = nil
+                    } else if _injectedAudioOutput != nil && isPassthroughActive {
+                        // Passthrough clock unavailable (backend without a
+                        // device timeline, or not yet anchored). Pace against
+                        // WALL TIME anchored to the first finite read-ahead
+                        // frontier: without this the `audioPos >
+                        // lastThrottleAudioPos` guard below reads 0 > 0 forever
+                        // and the demux loop free-runs at decode speed — the
+                        // enqueue frontier outruns playback by minutes and the
+                        // jitter buffer overflow-evicts frames (2026-09-20
+                        // real-hardware DP-monitor regression: frozen picture,
+                        // no audio, ~20x drift).
+                        if let anchor = passthroughWallClockAnchor {
+                            audioPos = anchor.pts + CACurrentMediaTime() - anchor.wall
+                        } else if pts.isFinite {
+                            passthroughWallClockAnchor = (CACurrentMediaTime(), pts)
+                            audioPos = pts
+                        } else {
+                            audioPos = 0
+                        }
                     } else {
                         audioPos = clock.audioTime
                     }
@@ -1975,6 +1999,9 @@ public final class NativeBackend: PlayerBackend {
         jitterBuffer.flush()
         syncController.reset()
         lastBypassPopTime = 0
+        // The read-ahead frontier jumps to the seek target; a pre-seek wall
+        // anchor would misestimate the fallback pacing position.
+        passthroughWallClockAnchor = nil
         // Clear the displayed frame so the pre-seek frame doesn't linger on
         // screen until the first post-seek frame is decoded and rendered.
         _renderer.flush()
@@ -2151,6 +2178,15 @@ public final class NativeBackend: PlayerBackend {
         syncController.reset()
         lastBypassPopTime = 0
         forceClockCalibration = false
+        // Un-poison the status pipeline: without this, a position reported by a
+        // previous (e.g. frozen/free-wheeling) session persists here and every
+        // `(pos - lastNotifiedPos) >= 500ms` gate in displayNextFrame stays
+        // negative for the next session → Player/onStateChange copies freeze at
+        // 0 → cast /status reports a frozen position while the pipeline moves
+        // (2026-09-20 real-hardware regression: "next cast frozen until app
+        // restart").
+        lastNotifiedPos = .zero
+        passthroughWallClockAnchor = nil
         audioClock.reset(to: 0, sampleRate: 44100)  // critical: must reset or stale seek position
                                                      // from previous session pollutes AudioClock
         _renderer.flush()
