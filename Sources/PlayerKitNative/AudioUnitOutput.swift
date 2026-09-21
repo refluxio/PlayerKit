@@ -28,6 +28,34 @@ public final class AudioUnitOutput: AudioOutputBackend {
     /// clock.advancePrimer() so _primerPendingSamples stays accurate.
     private var pendingPrimerCallbacks: Int = 0
 
+    // Test seams (off by default; production never sets them). With
+    // `tracksPlayedContent` on, the source-content PTS of every enqueued buffer is
+    // queued (buffers complete in order) and, as buffers finish playing, the content
+    // position the device has actually played is recorded — so tests can compare what
+    // is HEARD with what is SHOWN. `mutedForTesting` sets the queue volume to 0 so
+    // tests can play real content silently. Guarded by lock.
+    nonisolated(unsafe) static var tracksPlayedContent = false
+    nonisolated(unsafe) static var mutedForTesting = false
+    private var contentFifo: [(pts: Double, dur: Double)] = []
+    private var playedContentEndPTS: Double = .nan
+
+    /// Test seam: source-content PTS (seconds) up to which audio has been fully
+    /// played by the device; NaN until a buffer with a known PTS completed.
+    func playedContentEnd() -> Double {
+        lock.lock(); defer { lock.unlock() }
+        return playedContentEndPTS
+    }
+
+    /// Upper bound (seconds of audio) the queue may hold while it is paused.
+    var maxPausedBufferSeconds: Double = 5.0
+
+    /// Samples (per channel) currently queued and not yet played, excluding the
+    /// silent primer buffers. Guarded by lock. Lets the paused cap be expressed
+    /// in seconds instead of in buffers — a buffer is 512 samples (10.7 ms) for
+    /// DTS but 1024 (21 ms) for AAC, so a buffer-count cap meant wildly
+    /// different amounts of audio per codec.
+    private var bufferedSamples = 0
+
     public let supportsPassthrough: Bool = false
 
     public var bufferedDuration: Double {
@@ -105,6 +133,8 @@ public final class AudioUnitOutput: AudioOutputBackend {
             return
         }
 
+        if Self.mutedForTesting { AudioQueueSetParameter(queue, kAudioQueueParam_Volume, 0) }
+
         // Primer: 3 silence buffers to prevent initial underrun.
         // startPrimer() creates a negative debt and records the pending count so
         // AudioClock.calibrate() can re-apply the exact remaining debt after a
@@ -133,6 +163,8 @@ public final class AudioUnitOutput: AudioOutputBackend {
         enqueuedFrames = 0
         bufferedFrameCount = 0
         pendingPrimerCallbacks = primerCount
+        bufferedSamples = 0
+        contentFifo.removeAll(); playedContentEndPTS = .nan
         lock.unlock()
 
         logger.info("started: \(sr)Hz \(ch)ch")
@@ -154,6 +186,8 @@ public final class AudioUnitOutput: AudioOutputBackend {
         bufferedFrameCount = 0
         enqueuedFrames = 0
         pendingPrimerCallbacks = 0
+        bufferedSamples = 0
+        contentFifo.removeAll(); playedContentEndPTS = .nan
         lock.unlock()
         return (old, finalEnqueued)
     }
@@ -209,7 +243,7 @@ public final class AudioUnitOutput: AudioOutputBackend {
         }
     }
 
-    func enqueue(_ frame: PCMFrame) {
+    func enqueue(_ frame: PCMFrame, contentPts: Double = .nan) {
         // Hold the lock across allocate+copy+enqueue so the dispose path can't
         // tear down the queue between the guard and the AudioQueue calls.
         // disposeUnderLock() also takes this lock, so it waits for any in-flight
@@ -225,9 +259,16 @@ public final class AudioUnitOutput: AudioOutputBackend {
         // buffering. When resume() is called, all frames drain at real-time,
         // advancing the audio clock far ahead of video — the skip-behind guard
         // then dumps all video frames from the jitter buffer → stuck.
-        // 60 frames ≈ 2s matches the demux's 2s video read-ahead throttle, so
-        // the clock jump on resume is within the range the demux can cover.
-        if paused, bufferedFrameCount >= 60 {
+        //
+        // The cap is in SECONDS of audio. It used to be "60 buffers", which was
+        // meant as ≈2 s but is only 0.64 s for 512-sample DTS frames — shorter
+        // than the ~1.2–1.4 s the video jitter buffer needs to fill after every
+        // start/resume. Every frame beyond it was silently discarded, so the
+        // audible content jumped ahead of the picture by the dropped span
+        // (measured: 0.555 s at each start, 0.57–0.74 s more after each resume).
+        // The default (5 s) is well above any normal buffering window and keeps
+        // the accumulation bounded.
+        if paused, Double(bufferedSamples) >= maxPausedBufferSeconds * Double(max(1, clock.sampleRate)) {
             lock.unlock()
             return
         }
@@ -242,8 +283,10 @@ public final class AudioUnitOutput: AudioOutputBackend {
                              count: frame.data.count)
         buf.pointee.mAudioDataByteSize = UInt32(frame.data.count)
         AudioQueueEnqueueBuffer(queue, buf, 0, nil)
+        if Self.tracksPlayedContent { contentFifo.append((contentPts, Double(frame.sampleCount) / Double(max(1, clock.sampleRate)))) }
         enqueuedFrames += 1
         bufferedFrameCount += 1
+        bufferedSamples += frame.sampleCount
         let shouldRestart = !paused
         lock.unlock()
 
@@ -263,6 +306,13 @@ public final class AudioUnitOutput: AudioOutputBackend {
         let ch = _channels
         let isPrimer = pendingPrimerCallbacks > 0
         if isPrimer { pendingPrimerCallbacks -= 1 }
+        else {
+            bufferedSamples = max(0, bufferedSamples - byteCount / (max(1, Int(ch)) * 4))
+            if Self.tracksPlayedContent, !contentFifo.isEmpty {
+                let done = contentFifo.removeFirst()
+                if done.pts.isFinite { playedContentEndPTS = done.pts + done.dur }
+            }
+        }
         lock.unlock()
         // Route primer callbacks to advancePrimer() so _primerPendingSamples in
         // AudioClock stays accurate for calibrate() after a position reset.
