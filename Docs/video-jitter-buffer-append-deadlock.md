@@ -1,10 +1,13 @@
-# VideoJitterBuffer.append 自死锁（未提交的 120fps 修复引入）
+# VideoJitterBuffer.append 自死锁（未提交的 120fps 修复引入，已修复）
 
 ## 背景
 
 这不是已提交代码里的 bug，是**这台机器上还没 commit 的本地改动**：`Sources/PlayerKitNative/VideoJitterBuffer.swift`
 和它的测试文件相对于 `main`（`0b6c96a`）有未提交 diff——正是修"流浪地球卡死"（2026-09-22，4K HDR 120fps HEVC，
 60 秒内状态只推进一次）那次的工作。这份记录只针对这次未提交的改动，`main` 上现在的已提交版本没有这个问题。
+
+**状态（2026-09-28 更新）：已由 GLM 按下面"建议的修法方向"修复，本地未提交改动尚未 commit。修复已回归验证，
+见下面"修复与验证"一节。**
 
 ## 复现
 
@@ -69,18 +72,42 @@ var maxFrameCount: Int {
 ## 影响面
 
 `append()` / `maxFrameCount` 是 demux 线程的通用代码，不区分调用方是投屏（LatticeCast）还是 reflux
-自己平时打开一个本地文件。我没能在本次会话里用"reflux 打开本地文件"这条路径独立复现（遇到的是文件访问
-本身没有触发起播，疑似沙盒对任意路径没有读权限，这个我没有深挖，是另一个待办，不代表那条路径没问题）。
-但从代码逻辑看，`append()` 里这次比较是无条件执行的，没有理由只在投屏场景触发——**大概率是这份改动一旦
-合并，会影响所有视频播放**，不止投屏。
+自己平时打开一个本地文件——**已确认影响所有视频播放，不止投屏**，验证过程见下面"修复与验证"一节。
 
-## 建议的修法方向（未实施，留给实际改这段代码的人判断）
+## 建议的修法方向（已按此实施）
 
 `append()` 已经持有 `lock`，判断上限时不应该再调用会加锁的 `maxFrameCount` getter，而是在已持锁的临界区里
 直接用 `framesPerSecondHint`/`maxDuration` 内联算出同样的值（或者拆一个不加锁的私有版本给 `append()` 内部用，
 公开的 `maxFrameCount` 保留加锁版本给外部调用方）。改完之后至少要把这份改动自带的、目前会挂住的单元测试
 （尤其 `testConfiguredFrameRateReachesResumeDurationAt120fps`、`testConfiguredFrameRateSurvivesOnePopWithoutImmediatelyRebuffering`）
 真正跑到通过，而不是写完没跑。
+
+## 修复与验证（2026-09-28）
+
+GLM 按上面的方向改的：拆出一个不加锁的私有 `maxFrameCountLocked`，公开的 `maxFrameCount` 只在外部调用时
+加锁并转发给它，`append()` 内部改用 `maxFrameCountLocked`（新代码里直接带注释点名了这次的重入死锁）。
+
+- **单测**：`xcrun swift test --filter VideoJitterBufferTests` 14 个全过（几十毫秒内，之前是永久挂起）。
+- **全量单测**：`xcrun swift test`（89 个）另有 4 个失败（`AudioClockTests` 2 个 + `SyncControllerTests`
+  2 个，都是时间精度型断言，误差在 0.001~0.02 量级）——把这份改动 `git stash` 掉单独重跑这 4 个测试，
+  失败情况完全一样，确认是这台机器上跟这次修复无关的既有问题，不是回归。
+- **真实投屏复现**（reflux 的 macOS app + 真实 LatticeCast 接收端，非 mock）：原来必第一帧死锁的两条
+  测试片（15 秒无 B 帧 / 300 秒 testsrc+sine）都正常 `playing`，位置持续推进，另加了 25 秒持续播放的
+  soak 测试确认不会中途再卡住；pause/seek/带位置续播/stop 全流程正常。
+- **真实本地文件打开路径**（`open -a` 走 `application(_:open:)` → `LocalMediaOpener`，和投屏走同一条
+  `NativeBackend`/`VideoJitterBuffer`）：同样两条测试片都正常开窗、正常解码渲染（有播放中的截图为证：
+  testsrc 彩条 + 倒计时正常滚动，进度条推进到 0:14/0:15，暂停按钮可交互），CPU 在 1.4%~5.9% 正常波动。
+  这条路径之前没独立验证成，见下面"和沙盒猜测的关系"。
+
+### 和"沙盒猜测"的关系
+
+之前（修复前那次）没能用"reflux 打开本地文件"独立复现，笔记里猜测是沙盒挡了任意路径的文件读权限。这次
+查证：`RefluxAppleMac.entitlements` 是空 `<dict/>`，`codesign -d --entitlements -` 读出来的签名
+entitlements 也只有调试用的 `com.apple.security.get-task-allow`，没有 `com.apple.security.app-sandbox`
+——这个 Debug 构建根本没开 App Sandbox，沙盒猜测不成立。真正原因：死锁发作时主线程卡在
+`VideoJitterBuffer.state.getter` 里（demux 线程和主线程各卡一处，见上面复现方式 3），整个 App 处于未响应
+状态；用来查窗口列表的 `System Events`/Accessibility 查询对无响应进程经常拿不到窗口列表，被误读成"没有
+窗口"，其实是"窗口开了但整个 App 卡死拿不到"。这个猜测已被推翻，不需要再单独排查沙盒问题。
 
 ## 复现环境
 
