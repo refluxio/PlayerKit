@@ -49,11 +49,12 @@ final class VideoJitterBufferTests: XCTestCase {
 
     func testTransitionsToBufferingWhenBelowMinDuration() {
         let buf = VideoJitterBuffer()
-        // 先进入 playing 状态
-        buf.append(makeFrame(pts: 0.0))
-        buf.append(makeFrame(pts: 2.0))
+        // 先进入 playing 状态。转态在 append 内同步发生,onStateChange 必须在
+        // append 之前就位——事后设置不会再收到已发生过的转态。
         let exp1 = expectation(description: "playing")
         buf.onStateChange = { _ in exp1.fulfill() }
+        buf.append(makeFrame(pts: 0.0))
+        buf.append(makeFrame(pts: 2.0))
         wait(for: [exp1], timeout: 1.0)
         XCTAssertEqual(buf.state, .playing)
 
@@ -80,10 +81,10 @@ final class VideoJitterBufferTests: XCTestCase {
 
     func testFlushResetsToBuffering() {
         let buf = VideoJitterBuffer()
-        buf.append(makeFrame(pts: 0.0))
-        buf.append(makeFrame(pts: 2.0))
         let exp = expectation(description: "playing")
         buf.onStateChange = { _ in exp.fulfill() }
+        buf.append(makeFrame(pts: 0.0))
+        buf.append(makeFrame(pts: 2.0))
         wait(for: [exp], timeout: 1.0)
 
         buf.flush()
@@ -105,10 +106,82 @@ final class VideoJitterBufferTests: XCTestCase {
 
     func testMaxFrameCountCapDropsOldest() {
         let buf = VideoJitterBuffer()
-        // maxFrameCount=400: adding 401 frames should cap at 400
-        for i in 0...400 {
+        for i in 0...(buf.maxFrameCount) {
             buf.append(makeFrame(pts: Double(i) * 0.04))
         }
         XCTAssertLessThanOrEqual(buf.count, buf.maxFrameCount)
+    }
+
+    // MARK: - 高帧率回归(120fps 冻结 bug)
+    //
+    // 根因:旧的 maxFrameCount 是固定 60(注释"≈2.5s at 24fps"),对 120fps 内容只等于
+    // 0.5s 时长——同时低于开播门槛 resumeDuration(1.0s)和防抖门槛 minDuration(0.5s)。
+    // 缓冲区永远攒不到能开播的量,只能靠 4 秒慢速兜底硬开;一旦弹出一帧,剩余时长立刻又
+    // 跌破 minDuration,马上打回缓冲——形成"开播→弹一帧→冻结 4 秒"的循环,肉眼看是卡死。
+    // 实测片源(4K HDR 120fps HEVC)60 秒内仅推进一次,与此机制吻合。
+
+    func testUnconfiguredFrameRateCannotReachResumeDurationAt120fps() {
+        // 未调用 configureFrameRate 时按旧行为(隐含假设低帧率内容)：以 120fps 的节奏喂帧,
+        // 固定 60 帧的上限只能攒到 0.5s,永远达不到 1.0s 的开播门槛——这就是冻结的直接成因。
+        let buf = VideoJitterBuffer()
+        for i in 0..<200 {
+            buf.append(makeFrame(pts: Double(i) / 120.0))
+        }
+        XCTAssertLessThan(buf.duration, buf.resumeDuration,
+                          "不配置帧率时,120fps 内容的缓冲区应该(错误地)攒不到开播门槛——复现冻结")
+    }
+
+    func testConfiguredFrameRateReachesResumeDurationAt120fps() {
+        // 修复:告知实际帧率后,上限按帧率换算,120fps 内容能正常攒够并开播。
+        let buf = VideoJitterBuffer()
+        buf.configureFrameRate(120)
+        var receivedState: VideoJitterBuffer.State?
+        let exp = expectation(description: "state change to playing")
+        buf.onStateChange = { state in
+            receivedState = state
+            exp.fulfill()
+        }
+        for i in 0..<200 {
+            buf.append(makeFrame(pts: Double(i) / 120.0))
+            if buf.state == .playing { break }
+        }
+        wait(for: [exp], timeout: 1.0)
+        XCTAssertEqual(receivedState, .playing)
+        XCTAssertGreaterThanOrEqual(buf.duration, buf.resumeDuration)
+    }
+
+    func testConfiguredFrameRateSurvivesOnePopWithoutImmediatelyRebuffering() {
+        // 修复的第二层:光能开播不够——原 bug 是"开播后弹一帧立刻又跌破 minDuration"的
+        // 反复横跳。验证弹出一帧后剩余时长仍 >= minDuration,不会立刻打回缓冲。
+        let buf = VideoJitterBuffer()
+        buf.configureFrameRate(120)
+        for i in 0..<200 {
+            buf.append(makeFrame(pts: Double(i) / 120.0))
+            if buf.state == .playing { break }
+        }
+        XCTAssertEqual(buf.state, .playing)
+        buf.pop()
+        XCTAssertEqual(buf.state, .playing,
+                       "120fps 下弹出一帧不应该让剩余时长跌破 minDuration、立刻打回缓冲")
+    }
+
+    func testLowFrameRateCapIsUnchanged() {
+        // 向后兼容:24fps(及默认未配置)时上限仍是 60,不因为这次修复放大内存占用。
+        let buf = VideoJitterBuffer()
+        buf.configureFrameRate(24)
+        XCTAssertEqual(buf.maxFrameCount, 60)
+    }
+
+    func testZeroOrNegativeFrameRateIsIgnored() {
+        // 防御:非法帧率(0、负数、非有限值)不应该把上限改小或崩溃,保留原有安全值。
+        let buf = VideoJitterBuffer()
+        buf.configureFrameRate(0)
+        XCTAssertEqual(buf.maxFrameCount, 60)
+        buf.configureFrameRate(-30)
+        XCTAssertEqual(buf.maxFrameCount, 60)
+        buf.configureFrameRate(.nan)
+        XCTAssertEqual(buf.maxFrameCount, 60)
+        buf.configureFrameRate(.infinity)
+        XCTAssertEqual(buf.maxFrameCount, 60)
     }
 }
