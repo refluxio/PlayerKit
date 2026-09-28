@@ -1015,6 +1015,14 @@ public final class NativeBackend: PlayerBackend {
             if let vs = demuxer.videoStream {
                 let fr = vs.pointee.avg_frame_rate
                 frameDuration = fr.num > 0 ? Double(fr.den) / Double(fr.num) : 1.0/25.0
+                // VideoJitterBuffer.maxFrameCount 按源帧率换算缓冲上限（见该文件
+                // configureFrameRate 的文档注释）——但只有真的调用这个方法才会生效。
+                // 这里是唯一一处知道 demuxer 实际帧率的地方，漏接这一行的后果是
+                // 120fps 内容仍然卡在 24fps 假设算出的 60 帧(0.5s)上限，表现为
+                // "开播→弹一帧→冻结4秒"，跟从没做过这个修复一模一样。
+                if fr.num > 0 && fr.den > 0 {
+                    jitter.configureFrameRate(Double(fr.num) / Double(fr.den))
+                }
             } else {
                 frameDuration = 1.0/25.0
             }

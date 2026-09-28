@@ -26,7 +26,41 @@ final class VideoJitterBuffer: @unchecked Sendable {
     // 5~9.5s 的抖动(Cloud115StreamReader.swift 头部注释详述),0.6s 的缓冲
     // margin 扛不住,反而更频繁触发二次卡顿——已撤销回 1.0。
     let maxDuration: Double = 2.0     // demux 背压阈值（不丢帧，只是限速）
-    let maxFrameCount: Int = 60       // ≈2.5s at 24fps; hard cap to bound memory
+    /// 帧数硬上限，本是"限制内存占用的最后防线"——正常应由上面 maxDuration 的时长背压
+    /// 先生效，这个上限极少真正绑定。但它是按固定帧数写的，原为 60（注释"≈2.5s at 24fps"）:
+    /// 对 24fps 内容对应 2.5s，远高于 maxDuration/resumeDuration，安全；但对 120fps 内容
+    /// 60 帧只等于 0.5s，反而先于 maxDuration 绑定，且同时低于 resumeDuration(1.0s)和
+    /// minDuration(0.5s)——缓冲区永远攒不到开播门槛，只能靠 4s 慢速兜底硬开，开播后弹一帧
+    /// 剩余时长又跌破 minDuration 立刻打回缓冲，形成"开播→弹一帧→冻结 4 秒"的循环，肉眼看
+    /// 就是卡死（2026-09-22 用户反馈"流浪地球直接卡住不动"，4K HDR 120fps HEVC 实测复现：
+    /// 60 秒内状态推进仅一次）。
+    ///
+    /// 修复：上限按源帧率换算 maxDuration 秒的帧数，60 帧只作为下限（保持 ≤60fps 内容的
+    /// 既有行为和内存占用不变）。`configureFrameRate` 在拿到帧率之前不调用,此时用 60
+    /// (对未知/低帧率场景安全;高帧率场景在拿到 demuxer 的帧率信息后会被立即纠正)。
+    private var framesPerSecondHint: Double = 24.0
+    /// 加锁版,给临界区外的调用方。已持 `lock` 的代码必须改用
+    /// `maxFrameCountLocked`——NSLock 不可重入,持锁时再进这里的
+    /// lock.lock() 是同线程二次加锁,必然死锁。
+    var maxFrameCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return maxFrameCountLocked
+    }
+
+    /// 不加锁版,仅在已持有 `lock` 的临界区内使用。
+    private var maxFrameCountLocked: Int {
+        max(60, Int((framesPerSecondHint * maxDuration).rounded(.up)))
+    }
+
+    /// 告知视频源的实际帧率，让 `maxFrameCount` 按真实帧率换算，而不是隐含假设
+    /// ~24fps。应在拿到 demuxer 的帧率信息后、开始给这个视频 append 帧之前调用一次
+    /// (每次打开新视频/新会话都要重新调用——帧率是流属性，不跨视频保留)。
+    /// 非法值(≤0、NaN、无穷)忽略，保留当前值。
+    func configureFrameRate(_ fps: Double) {
+        guard fps.isFinite, fps > 0 else { return }
+        lock.lock(); defer { lock.unlock() }
+        framesPerSecondHint = fps
+    }
 
     private var frames: [Frame] = []
     private let lock = NSLock()
@@ -76,7 +110,7 @@ final class VideoJitterBuffer: @unchecked Sendable {
         // Safety cap: drop oldest frame only if count exceeds absolute maximum.
         // Duration-based dropping is intentionally removed for VOD — backpressure
         // in the demux loop (duration >= maxDuration → sleep) is the right mechanism.
-        if frames.count > maxFrameCount { frames.removeFirst() }
+        if frames.count > maxFrameCountLocked { frames.removeFirst() }
 
         let dur = frames.count >= 2 ? frames.last!.pts - frames.first!.pts : 0
         if _state == .buffering, !frames.isEmpty {
