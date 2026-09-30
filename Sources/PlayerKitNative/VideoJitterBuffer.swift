@@ -8,9 +8,84 @@ final class VideoJitterBuffer: @unchecked Sendable {
         let pixelBuffer: CVPixelBuffer
         let pts: Double
         let metadata: FrameMetadata
+
+        /// Bytes this frame holds. A frame is a decoded picture, so this is what
+        /// actually costs memory (a 4K 10-bit HDR frame is ~18.5 MB).
+        var byteSize: Int { CVPixelBufferGetDataSize(pixelBuffer) }
     }
 
     enum State: Equatable { case playing, buffering }
+
+    /// Ceiling for the decoded frames held here.
+    ///
+    /// The frame cap used to be fps x maxDuration (240 frames at 120 fps) with no
+    /// regard for frame size. For 4K 10-bit HDR that is ~4.4 GB: on iPhone the app
+    /// got a memory warning ~1 s after the first frame (q=113, ~2.1 GB) and was
+    /// SIGKILLed (2026-09-30). Frames are IOSurface-backed, so this never shows in
+    /// RSS on the Mac and cannot be caught there by looking at process memory.
+    let memoryBudgetBytes: Int
+
+    /// iOS extensions/apps are killed at a few GB; a Mac has room to spare.
+    static var defaultMemoryBudgetBytes: Int {
+        #if os(iOS)
+        return 512 << 20
+        #else
+        return 2 << 30
+        #endif
+    }
+
+    /// Frames the byte budget always leaves room for, so a very large frame can
+    /// never make the buffer unusable (it must still be able to start playing).
+    private static let minBudgetFrames = 6
+    /// Frames that may already be in flight in the decoder (VT reorders and
+    /// returns asynchronously) when `isFull` starts holding the demux loop back.
+    private static let inFlightSlackFrames = 8
+
+    init(memoryBudgetBytes: Int = VideoJitterBuffer.defaultMemoryBudgetBytes) {
+        self.memoryBudgetBytes = memoryBudgetBytes
+    }
+
+    private var bufferedBytesLocked = 0
+    /// Largest frame seen. Frame size is a property of the stream, so this settles
+    /// after the first frame; until then the budget cannot be converted to frames.
+    private var frameBytesHint = 0
+
+    /// Bytes of decoded frames currently held.
+    var bufferedBytes: Int {
+        lock.lock(); defer { lock.unlock() }
+        return bufferedBytesLocked
+    }
+
+    /// True when the byte budget is used up: the demux loop should stop feeding the
+    /// decoder for a moment. Only ever true for byte pressure, so normal content
+    /// (small frames) is unaffected. Independent of the audio clock on purpose: at
+    /// start the audio clock has not advanced, the time-based throttle is inactive
+    /// and decoding ran at full speed.
+    var isFull: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return frames.count >= budgetFramesLocked
+    }
+
+    /// How many frames the byte budget allows (Int.max until a frame size is known).
+    private var budgetFramesLocked: Int {
+        guard frameBytesHint > 0 else { return Int.max }
+        return max(Self.minBudgetFrames, memoryBudgetBytes / frameBytesHint)
+    }
+
+    /// Soft capacity in frames: what the buffer is meant to hold.
+    private var capacityFramesLocked: Int {
+        min(max(60, Int((framesPerSecondHint * maxDuration).rounded(.up))), budgetFramesLocked)
+    }
+
+    /// The playing/buffering thresholds are durations sized for ~2 s of buffer. When
+    /// the byte budget shrinks the buffer below that, scale them with it - otherwise
+    /// the buffer can never reach `resumeDuration` and playback falls into the old
+    /// "start, show one frame, freeze for 4 s" loop (see the 120 fps note below).
+    private var thresholdScaleLocked: Double {
+        min(1.0, (Double(capacityFramesLocked) / framesPerSecondHint) / maxDuration)
+    }
+    private var resumeDurationLocked: Double { resumeDuration * thresholdScaleLocked }
+    private var minDurationLocked: Double { minDuration * thresholdScaleLocked }
 
     /// Called synchronously when state transitions between .playing and
     /// .buffering. Fires on the demux thread (append) or main thread (pop),
@@ -49,7 +124,9 @@ final class VideoJitterBuffer: @unchecked Sendable {
 
     /// 不加锁版,仅在已持有 `lock` 的临界区内使用。
     private var maxFrameCountLocked: Int {
-        max(60, Int((framesPerSecondHint * maxDuration).rounded(.up)))
+        let byTime = max(60, Int((framesPerSecondHint * maxDuration).rounded(.up)))
+        let budget = budgetFramesLocked
+        return budget == Int.max ? byTime : min(byTime, budget + Self.inFlightSlackFrames)
     }
 
     /// 告知视频源的实际帧率，让 `maxFrameCount` 按真实帧率换算，而不是隐含假设
@@ -106,16 +183,19 @@ final class VideoJitterBuffer: @unchecked Sendable {
         // and wrong nominalDelay in SyncController.
         let insertIdx = frames.firstIndex(where: { $0.pts > frame.pts }) ?? frames.endIndex
         frames.insert(frame, at: insertIdx)
+        let size = frame.byteSize
+        bufferedBytesLocked += size
+        if size > frameBytesHint { frameBytesHint = size }
 
         // Safety cap: drop oldest frame only if count exceeds absolute maximum.
         // Duration-based dropping is intentionally removed for VOD — backpressure
         // in the demux loop (duration >= maxDuration → sleep) is the right mechanism.
-        if frames.count > maxFrameCountLocked { frames.removeFirst() }
+        if frames.count > maxFrameCountLocked { bufferedBytesLocked -= frames.removeFirst().byteSize }
 
         let dur = frames.count >= 2 ? frames.last!.pts - frames.first!.pts : 0
         if _state == .buffering, !frames.isEmpty {
             let stalled = ProcessInfo.processInfo.systemUptime - bufferingStart > slowDecoderGrace
-            if dur >= resumeDuration || eofReached || stalled {
+            if dur >= resumeDurationLocked || eofReached || stalled {
                 _state = .playing
                 newState = .playing
             }
@@ -141,10 +221,11 @@ final class VideoJitterBuffer: @unchecked Sendable {
         lock.lock()
         guard !frames.isEmpty else { lock.unlock(); return nil }
         popped = frames.removeFirst()
+        bufferedBytesLocked -= popped?.byteSize ?? 0
         let dur = frames.count >= 2 ? frames.last!.pts - frames.first!.pts : 0
         // EOF 后不再因剩余不足回 .buffering —— 末尾帧要放完,而不是
         // 播到剩 <0.5s 又卡进 buffering 黑屏。
-        if _state == .playing, !eofReached, dur < minDuration {
+        if _state == .playing, !eofReached, dur < minDurationLocked {
             _state = .buffering
             newState = .buffering
         }
@@ -177,6 +258,7 @@ final class VideoJitterBuffer: @unchecked Sendable {
     func flush() {
         lock.lock(); defer { lock.unlock() }
         frames.removeAll()
+        bufferedBytesLocked = 0
         _state = .buffering
         eofReached = false
         bufferingStart = ProcessInfo.processInfo.systemUptime

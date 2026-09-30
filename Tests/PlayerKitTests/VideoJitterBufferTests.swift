@@ -184,4 +184,80 @@ final class VideoJitterBufferTests: XCTestCase {
         buf.configureFrameRate(.infinity)
         XCTAssertEqual(buf.maxFrameCount, 60)
     }
+
+    // MARK: - Memory budget (2026-09-30)
+    //
+    // The frame cap was fps × 2 s = 240 frames at 120 fps, with no regard for frame
+    // size. A 4K 10-bit HDR frame is ~18.5 MB, so 240 frames is ~4.4 GB: on the
+    // phone the app got a memory warning ~1 s after the first frame (q=113) and was
+    // SIGKILLed. The buffer must bound its bytes, and its playing/buffering
+    // thresholds must scale with what it can hold or it never starts playing.
+
+    private func makeBigFrame(pts: Double) -> VideoJitterBuffer.Frame {
+        var pixelBuffer: CVPixelBuffer?
+        CVPixelBufferCreate(nil, 1280, 720, kCVPixelFormatType_32BGRA, nil, &pixelBuffer)   // ~3.7 MB
+        return VideoJitterBuffer.Frame(pixelBuffer: pixelBuffer!, pts: pts, metadata: FrameMetadata())
+    }
+
+    private var bigFrameBytes: Int {
+        var pb: CVPixelBuffer?
+        CVPixelBufferCreate(nil, 1280, 720, kCVPixelFormatType_32BGRA, nil, &pb)
+        return CVPixelBufferGetDataSize(pb!)
+    }
+
+    func testByteBudgetBoundsBufferedBytes() {
+        let budget = 40 << 20
+        let buf = VideoJitterBuffer(memoryBudgetBytes: budget)
+        buf.configureFrameRate(120)
+        for i in 0..<300 { buf.append(makeBigFrame(pts: Double(i) / 120.0)) }
+        // Measure independently of the buffer's own accounting: sum what is really held.
+        var actual = 0
+        for i in 0..<buf.count { actual += CVPixelBufferGetDataSize(buf.peek(at: i)!.pixelBuffer) }
+        XCTAssertLessThanOrEqual(actual, budget + 8 * bigFrameBytes,   // 8 = in-flight decoder slack
+            "decoded frames must stay within the byte budget (plus a little in-flight slack), not fps x 2 s frames; held \(actual / (1 << 20)) MB in \(buf.count) frames")
+        XCTAssertEqual(buf.bufferedBytes, actual, "the buffer's own byte accounting must match what it holds")
+    }
+
+    func testByteBudgetedBufferStillStartsPlayingAndSurvivesAPop() {
+        // Bounding the bytes must not recreate the "start, show one frame, freeze"
+        // loop: the thresholds have to shrink with the capacity.
+        let buf = VideoJitterBuffer(memoryBudgetBytes: 40 << 20)
+        buf.configureFrameRate(120)
+        for i in 0..<300 {
+            buf.append(makeBigFrame(pts: Double(i) / 120.0))
+            if buf.state == .playing { break }
+        }
+        XCTAssertEqual(buf.state, .playing, "a byte-bounded buffer must still reach the playing threshold")
+        buf.pop()
+        XCTAssertEqual(buf.state, .playing, "popping one frame must not immediately drop back to buffering")
+    }
+
+    func testIsFullWhenBudgetReachedAndClearsAfterPops() {
+        let buf = VideoJitterBuffer(memoryBudgetBytes: 40 << 20)
+        buf.configureFrameRate(120)
+        XCTAssertFalse(buf.isFull)
+        for i in 0..<300 {
+            buf.append(makeBigFrame(pts: Double(i) / 120.0))
+            if buf.isFull { break }
+        }
+        XCTAssertTrue(buf.isFull, "the demux loop needs a signal to stop decoding once the budget is used")
+        for _ in 0..<5 { buf.pop() }
+        XCTAssertFalse(buf.isFull, "room freed by showing frames must lift the back-pressure")
+    }
+
+    func testFlushResetsBufferedBytes() {
+        let buf = VideoJitterBuffer(memoryBudgetBytes: 40 << 20)
+        for i in 0..<5 { buf.append(makeBigFrame(pts: Double(i) / 30.0)) }
+        XCTAssertGreaterThan(buf.bufferedBytes, 0)
+        buf.flush()
+        XCTAssertEqual(buf.bufferedBytes, 0)
+    }
+
+    func testSmallFramesAreNotAffectedByTheDefaultBudget() {
+        let buf = VideoJitterBuffer()
+        buf.configureFrameRate(120)
+        for i in 0..<300 { buf.append(makeFrame(pts: Double(i) / 120.0)) }
+        XCTAssertFalse(buf.isFull)
+        XCTAssertEqual(buf.count, 240, "tiny frames keep the fps x 2 s cap: existing behaviour unchanged")
+    }
 }

@@ -1250,6 +1250,17 @@ public final class NativeBackend: PlayerBackend {
                     }
                     lastThrottleAudioPos = audioPos
 
+                    // Byte back-pressure. The time throttle above is inactive until the
+                    // audio clock has advanced, so right after start (audio waits for the
+                    // buffer to fill) decoding ran at full speed. With 4K 10-bit HDR
+                    // frames (~18.5 MB each) that put >2 GB of decoded frames in memory
+                    // within a second and iOS killed the app (2026-09-30). Hold off
+                    // while the frame budget is used up; short sleep only, so the loop
+                    // keeps reading the audio packets interleaved with the video.
+                    if jitter.isFull {
+                        Thread.sleep(forTimeInterval: 0.010)
+                    }
+
                 } else if streamIndex == demuxer.audioStreamIndex {
                     let codecName = String(cString: avcodec_get_name(
                         demuxer.audioStream!.pointee.codecpar.pointee.codec_id))
