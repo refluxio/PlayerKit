@@ -175,6 +175,14 @@ public final class NativeBackend: PlayerBackend {
 
     // Pipeline control
     private let demuxLock = NSLock()
+    /// Guards ONLY the demux-loop state flags (`demuxLoopRunning`, `demuxLoopDemuxer`,
+    /// `demuxCancelled`). It is never held across I/O, so main-thread lifecycle
+    /// calls (pause/resume/startDemuxLoop) can take it without ever waiting on the
+    /// network. `demuxLock` is held by the demux loop across `readPacket()` — a
+    /// blocking network read for HTTP sources — so nothing on the main thread may
+    /// wait on it just to read a flag: a stalled read froze the main thread until
+    /// the iOS scene-update watchdog killed the app (2026-09-30, 0x8BADF00D).
+    private let demuxStateLock = NSLock()
     private let seekLock = NSLock()
     // Guarded by seekLock — safe to access from any thread holding the lock.
     private nonisolated(unsafe) var seekSerial: Int64 = 0
@@ -193,7 +201,8 @@ public final class NativeBackend: PlayerBackend {
     /// fire and advance audioClock past 0 — without this, seek-to-0 freezes because
     /// primer debt keeps audioClock at 0 while video PTS advances past the 60ms threshold.
     private nonisolated(unsafe) var audioClockReady: Bool = false
-    // demuxCancelled is read from DispatchQueue.global() under demuxLock.
+    // demuxCancelled is written under demuxStateLock (never demuxLock — see there) and
+    // read from DispatchQueue.global().
     // Bool reads/writes are atomic on ARM64 in practice; nonisolated(unsafe) makes
     // that contract explicit for the compiler's concurrency checker.
     private nonisolated(unsafe) var demuxCancelled = false
@@ -935,7 +944,7 @@ public final class NativeBackend: PlayerBackend {
     // MARK: - Demux loop
 
     private func startDemuxLoop() {
-        demuxLock.lock()
+        demuxStateLock.lock()
         if demuxLoopRunning {
             if let current = demuxer, current as AnyObject === demuxLoopDemuxer as AnyObject {
                 // PiP→resume:willResignActive 不 pause(为了让 auto-PiP 有内容
@@ -944,7 +953,7 @@ public final class NativeBackend: PlayerBackend {
                 // 出现双序列 append,视频卡住(append#87→append#1 交错日志)。
                 // 复位取消标志,让旧循环继续。
                 demuxCancelled = false
-                demuxLock.unlock()
+                demuxStateLock.unlock()
                 logger.info("startDemuxLoop: loop already running (same demuxer), reviving it")
                 return
             }
@@ -952,9 +961,9 @@ public final class NativeBackend: PlayerBackend {
             // (或 demuxCancelled)就会退出,这里等它退出再启动新循环(毫秒级)。
             var waitedTicks = 0
             while demuxLoopRunning && waitedTicks < 200 {
-                demuxLock.unlock()
+                demuxStateLock.unlock()
                 Thread.sleep(forTimeInterval: 0.005)
-                demuxLock.lock()
+                demuxStateLock.lock()
                 waitedTicks += 1
             }
             if demuxLoopRunning {
@@ -968,14 +977,14 @@ public final class NativeBackend: PlayerBackend {
         demuxLoopRunning = true
         demuxLoopDemuxer = demuxer
         demuxCancelled = false
-        demuxLock.unlock()
+        demuxStateLock.unlock()
 
         guard let demuxer = self.demuxer else {
             logger.error("startDemuxLoop: demuxer is nil (stop was called?)")
-            demuxLock.lock()
+            demuxStateLock.lock()
             demuxLoopRunning = false
             demuxLoopDemuxer = nil
-            demuxLock.unlock()
+            demuxStateLock.unlock()
             return
         }
         let audioDec = audioDecoder
@@ -990,12 +999,16 @@ public final class NativeBackend: PlayerBackend {
             // 的防重入判断始终准确。循环内所有 break 出口都发生在 dLock 解锁
             // 之后,这里锁内清理不会死锁。
             defer {
-                dLock.lock()
                 if let self {
-                    self.demuxLoopRunning = false
-                    self.demuxLoopDemuxer = nil
+                    self.demuxStateLock.lock()
+                    // Only clear what this loop registered: startDemuxLoop's forced
+                    // path may already have registered a newer loop.
+                    if let current = self.demuxLoopDemuxer, current as AnyObject === demuxer as AnyObject {
+                        self.demuxLoopRunning = false
+                        self.demuxLoopDemuxer = nil
+                    }
+                    self.demuxStateLock.unlock()
                 }
-                dLock.unlock()
             }
             var ptsValidator = PTSValidator()
             var packetCount: Int32 = 0
@@ -1869,9 +1882,9 @@ public final class NativeBackend: PlayerBackend {
         // stalled), accumulating tens of seconds of video ahead of the paused
         // audio position. On resume, freeze-ahead guard holds all frames
         // → stutter/卡顿.
-        demuxLock.lock()
+        demuxStateLock.lock()
         demuxCancelled = true
-        demuxLock.unlock()
+        demuxStateLock.unlock()
         state.isPlaying = false; notifyStateChange()
     }
 
@@ -1880,9 +1893,9 @@ public final class NativeBackend: PlayerBackend {
             logger.warning("resume: demuxer is nil, player was stopped — ignoring")
             // Don't leave demuxCancelled=true if there's no demuxer —
             // otherwise the next play() won't start the demux loop.
-            demuxLock.lock()
+            demuxStateLock.lock()
             demuxCancelled = false
-            demuxLock.unlock()
+            demuxStateLock.unlock()
             return
         }
         logger.info("resume")
@@ -1898,7 +1911,7 @@ public final class NativeBackend: PlayerBackend {
         // jitterBuffer 后恢复瞬间没有新帧可显示(主画面闪过 PiP 的最后内容)、
         // 音频时钟归零重校准产生咔哒。只有真正 pause 过(循环已取消)才需要
         // 走完整的重建路径。
-        let resumingContinuous = demuxLock.withLock { demuxLoopRunning && !demuxCancelled }
+        let resumingContinuous = demuxStateLock.withLock { demuxLoopRunning && !demuxCancelled }
         if !resumingContinuous {
             // 重建音频输出。后台期间(PiP 未激活/不支持/启动失败)音频会话被系统
             // 暂停,AudioQueue 停止消费,音频时钟停在暂停位置;而 demux/解码器在
