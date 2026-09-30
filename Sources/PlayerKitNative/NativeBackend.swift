@@ -59,6 +59,27 @@ private final class DisplayLinkProxy: NSObject {
     }
 }
 
+/// Decides whether a frame decoded by the demux loop may enter the jitter buffer after
+/// a seek. `_seek` bumps `seekSerial` immediately, but the physical demuxer seek lands
+/// 100-200 ms later; until then the loop still reads packets from the OLD position.
+/// The serial alone cannot tell those apart (the loop captures the already-bumped
+/// value), so a frame is kept only when the latest seek has PHYSICALLY landed - judged
+/// from a snapshot taken at the start of the iteration (under demuxLock, which the
+/// landing also holds), never at the end, or a frame decoded across the landing would
+/// slip in right after the flush. Seen on the phone as the progress thumb flashing back
+/// to the old position after a drag (2026-09-30).
+enum SeekFrameGate {
+    /// Snapshot at the start of a demux iteration.
+    static func landedAtIterationStart(landedSerial: Int64, iterationSerial: Int64) -> Bool {
+        landedSerial == iterationSerial
+    }
+
+    /// Whether the frame decoded in that iteration may be appended.
+    static func accepts(landedAtIterationStart: Bool, iterationSerial: Int64, latestSerial: Int64) -> Bool {
+        landedAtIterationStart && iterationSerial == latestSerial
+    }
+}
+
 @MainActor
 public final class NativeBackend: PlayerBackend {
     public private(set) var state = PlayerState()
@@ -186,6 +207,10 @@ public final class NativeBackend: PlayerBackend {
     private let seekLock = NSLock()
     // Guarded by seekLock — safe to access from any thread holding the lock.
     private nonisolated(unsafe) var seekSerial: Int64 = 0
+    /// The newest seek serial whose physical demuxer seek has landed (or that needed
+    /// none). Written under demuxLock (landing / selectAudioTrack) and read by the demux
+    /// loop under the same lock - see `SeekFrameGate`.
+    private nonisolated(unsafe) var seekLandedSerial: Int64 = 0
     /// 有别于 seekSerial(_seek() 同步调用瞬间就 +1):这个只在 demuxer.seek()
     /// 真正物理执行之后才 +1。异步 seek 下,seekSerial 会在网络 I/O 落地前
     /// 抢跑好几次(用户连续拖动/连续 seek 时尤其明显),demux 循环若拿
@@ -1055,6 +1080,10 @@ public final class NativeBackend: PlayerBackend {
                 }
 
                 let currentSerial = sLock.withLock { self.seekSerial }
+                // Under dLock, which the physical seek's landing also holds: a consistent
+                // "has the latest seek landed?" for the whole iteration (see SeekFrameGate).
+                let landedAtStart = SeekFrameGate.landedAtIterationStart(
+                    landedSerial: self.seekLandedSerial, iterationSerial: currentSerial)
 
                 // Reset state when a seek has *physically landed*(demuxer.seek()
                 // 真的执行过),不是 seekSerial 一变就 reset——异步 seek 下
@@ -1147,7 +1176,9 @@ public final class NativeBackend: PlayerBackend {
                     dLock.unlock()
 
                     if let frame = decoded,
-                       sLock.withLock({ self.seekSerial }) == currentSerial {
+                       SeekFrameGate.accepts(landedAtIterationStart: landedAtStart,
+                                             iterationSerial: currentSerial,
+                                             latestSerial: sLock.withLock({ self.seekSerial })) {
                         // With B-frames, the pixel buffer returned by THIS
                         // decode() call can correspond to an earlier-submitted
                         // packet (decoder-internal reorder) — pairing it with
@@ -2184,6 +2215,8 @@ public final class NativeBackend: PlayerBackend {
         onLanded?()
         let gen = (backend?.physicalSeekGeneration ?? 0) + 1
         backend?.physicalSeekGeneration = gen
+        // Open the gate: from the next demux iteration on, frames are from the target.
+        backend?.seekLandedSerial = expectedSerial
         logger.info("seek to \(String(format:"%.1f",secs))s landed physically, physicalSeekGeneration=\(gen)")
     }
 
@@ -2205,6 +2238,9 @@ public final class NativeBackend: PlayerBackend {
         demuxLock.lock()
         demuxer?.close(); demuxer = nil
         videoDecoder = nil; audioDecoder = nil
+        // No seek can be pending on a stream that no longer exists; never leave the
+        // frame gate (SeekFrameGate) closed for the next session.
+        seekLock.withLock { seekLandedSerial = seekSerial }
         demuxLock.unlock()
         jitterBuffer.flush()
         syncController.reset()
@@ -2272,7 +2308,7 @@ public final class NativeBackend: PlayerBackend {
         if let stream = demuxer.audioStream {
             audioDecoder = FFmpegAudioDecoder(stream: stream, sampleRate: 44100, channels: 2)
         }
-        seekLock.withLock { seekSerial += 1 }
+        seekLock.withLock { seekSerial += 1; seekLandedSerial = seekSerial }   // seeked synchronously above
         demuxLock.unlock()
 
         // 4. Flush video pipeline
