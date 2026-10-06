@@ -11,7 +11,7 @@ import AppKit
 /// tvOS fall back to the SDR 203-nit diffuse-white path.
 ///
 /// This is a pure value type — no AppKit/UIKit dependency — so PlayerKit can
-/// stay cross-platform. The caller (reflux apple `PlayerController`) probes
+/// stay cross-platform. The caller (reflex apple `PlayerController`) probes
 /// `NSScreen.maximumExtendedDynamicRangeColorComponentValue` and constructs the
 /// appropriate `DisplayCapability`. See `PlayerController.swift`.
 public struct DisplayCapability: Sendable, Equatable {

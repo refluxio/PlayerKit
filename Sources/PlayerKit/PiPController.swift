@@ -26,7 +26,7 @@ private class PiPPlaybackDelegate: NSObject, AVPictureInPictureSampleBufferPlayb
         // provider 为 nil(未设置)时恒返回"未暂停":系统 auto-PiP 始终认为
         // 有内容可播。设置 provider 时返回真实状态(807538e:修复未播放时
         // 弹空 PiP);未设置时保持"恒认为在播放"的原始行为,否则 nil → 报
-        // 暂停,auto-PiP 永不启动(与 reflux 侧"不设置 provider + app 层
+        // 暂停,auto-PiP 永不启动(与 reflex 侧"不设置 provider + app 层
         // isPlaying 拦截"的设计配合)。
         !(isPlayingProvider?() ?? true)
     }

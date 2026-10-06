@@ -14,7 +14,7 @@ private let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "multicl
 /// does for URL-addressable inputs, reimplemented here because these
 /// readers are not protocol-openable by ffmpeg. See
 /// docs/superpowers/specs/2026-08-22-disc-multiclip-pts-continuity-design.md
-/// (reflux repo) for the full rationale.
+/// (reflex repo) for the full rationale.
 final class MultiClipDemuxer: @unchecked Sendable {
     private let readers: [any MediaRandomAccessReader]
     let timeline: ClipTimeline

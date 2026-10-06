@@ -3,7 +3,7 @@
 /// Maps an ordered sequence of clips (each with its own real duration) onto
 /// one continuous presentation timeline. Pure value type — no ffmpeg/reader
 /// dependency. See docs/superpowers/specs/2026-08-22-disc-multiclip-pts-
-/// continuity-design.md in the reflux repo for the full design rationale.
+/// continuity-design.md in the reflex repo for the full design rationale.
 struct ClipTimeline: Equatable {
     /// Each clip's own real duration (caller-supplied — e.g. from BD
     /// playlist metadata — not ffmpeg-probed). Every entry must be > 0.
