@@ -2,7 +2,7 @@ import AVFoundation
 import CoreVideo
 import os
 
-private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "asbdl")
+private let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "asbdl")
 
 /// Result of tone-mapping processing: the processed pixel buffer and the
 /// color params that describe it. When tone mapping converts HDR → SDR,

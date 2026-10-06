@@ -130,7 +130,7 @@ final class FFmpegSubtitleDecoder: @unchecked Sendable {
         }
 
         // Timing diagnostics
-        let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "subtitle")
+        let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "subtitle")
         logger.debug("[pgsdec] pkt.pts=\(packet.pointee.pts) packetPts=\(String(format:"%.3f",packetPts)) sub.start_display_time=\(sub.start_display_time) pkt.duration=\(pktDuration) end_display_time=\(sub.end_display_time) → startPts=\(String(format:"%.3f",startPts)) endPts=\(String(format:"%.3f",endPts))")
 
         let normRect: CGRect

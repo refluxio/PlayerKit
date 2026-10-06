@@ -495,6 +495,6 @@ private struct ErrorOverlay: View {
 }
 
 extension Notification.Name {
-    static let openURLSubmitted = Notification.Name("io.reflux.PlayerKit.openURLSubmitted")
-    static let requestOpenURL = Notification.Name("io.reflux.PlayerKit.requestOpenURL")
+    static let openURLSubmitted = Notification.Name("io.reflex.PlayerKit.openURLSubmitted")
+    static let requestOpenURL = Notification.Name("io.reflex.PlayerKit.requestOpenURL")
 }

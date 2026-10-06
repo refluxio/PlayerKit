@@ -2,7 +2,7 @@ import Foundation
 import CFFmpeg
 import os
 
-private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "decoder.audio")
+private let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "decoder.audio")
 
 struct PCMFrame {
     let data: Data

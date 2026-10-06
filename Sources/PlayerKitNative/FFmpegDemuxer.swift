@@ -4,7 +4,7 @@ import CFFmpeg
 import PlayerKit
 import os
 
-private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "demuxer")
+private let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "demuxer")
 
 /// FFmpeg's default av_log callback fprintf()s every message straight to
 /// stderr. Some codecs log the exact same warning once per packet — e.g.

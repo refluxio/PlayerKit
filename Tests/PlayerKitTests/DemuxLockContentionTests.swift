@@ -2,7 +2,7 @@ import XCTest
 import Foundation
 @testable import PlayerKitNative
 
-/// Regression test for the 2026-09-30 "Reflux is killed by the watchdog while
+/// Regression test for the 2026-09-30 "Reflex is killed by the watchdog while
 /// casting" crash (0x8BADF00D, scene-update transgression, 10 s).
 ///
 /// The demux loop holds `demuxLock` across `demuxer.readPacket()`, which for an

@@ -7,7 +7,7 @@ import PlayerKit
 import CFFmpeg
 import os
 
-private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "decoder.video")
+private let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "decoder.video")
 
 // MARK: - VTVideoDecoder
 // Hardware video decoder using VideoToolbox for H.264 and HEVC.

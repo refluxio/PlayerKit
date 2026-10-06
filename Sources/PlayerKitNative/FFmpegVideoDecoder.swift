@@ -6,7 +6,7 @@ import PlayerKit
 import CFFmpeg
 import os
 
-private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "decoder.video.sw")
+private let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "decoder.video.sw")
 
 final class FFmpegVideoDecoder {
     private let colorParams: VideoColorParams

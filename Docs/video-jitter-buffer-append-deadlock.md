@@ -102,7 +102,7 @@ GLM 按上面的方向改的：拆出一个不加锁的私有 `maxFrameCountLock
 ### 和"沙盒猜测"的关系
 
 之前（修复前那次）没能用"reflux 打开本地文件"独立复现，笔记里猜测是沙盒挡了任意路径的文件读权限。这次
-查证：`RefluxAppleMac.entitlements` 是空 `<dict/>`，`codesign -d --entitlements -` 读出来的签名
+查证：`ReflexAppleMac.entitlements` 是空 `<dict/>`，`codesign -d --entitlements -` 读出来的签名
 entitlements 也只有调试用的 `com.apple.security.get-task-allow`，没有 `com.apple.security.app-sandbox`
 ——这个 Debug 构建根本没开 App Sandbox，沙盒猜测不成立。真正原因：死锁发作时主线程卡在
 `VideoJitterBuffer.state.getter` 里（demux 线程和主线程各卡一处，见上面复现方式 3），整个 App 处于未响应

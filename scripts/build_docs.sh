@@ -19,7 +19,7 @@ xcrun docc convert \
   --additional-symbol-graph-dir "$SYMBOL_DIR" \
   --output-dir .build/docs \
   --fallback-display-name PlayerKit \
-  --fallback-bundle-identifier io.reflux.PlayerKit
+  --fallback-bundle-identifier io.reflex.PlayerKit
 
 echo
 echo "✓ Docs generated at .build/docs/index.html"

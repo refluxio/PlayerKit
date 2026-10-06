@@ -7,7 +7,7 @@ import PlayerKit
 @_exported import CFFmpeg
 import os
 
-private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "backend")
+private let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "backend")
 
 private extension Duration {
     var secondsDouble: Double {
@@ -147,7 +147,7 @@ public final class NativeBackend: PlayerBackend {
     /// therefore audio sample order — is preserved; flush() call sites are
     /// routed through this same queue (via .sync) so they can't race a
     /// still-in-flight decode() of an earlier packet.
-    private let audioDecodeQueue = DispatchQueue(label: "io.reflux.PlayerKit.audioDecode")
+    private let audioDecodeQueue = DispatchQueue(label: "io.reflex.PlayerKit.audioDecode")
 
     // A/V sync modules
     private let audioClock = AudioClock()
@@ -467,7 +467,7 @@ public final class NativeBackend: PlayerBackend {
             // → 403) reject every clip and the whole concat open fails.
             let listContent = urls.map { concatFileEntry(url: $0, headers: hdrs) }.joined()
             let tmpDir = FileManager.default.temporaryDirectory
-            let listFile = tmpDir.appendingPathComponent("reflux-concat-\(UUID().uuidString).txt")
+            let listFile = tmpDir.appendingPathComponent("reflex-concat-\(UUID().uuidString).txt")
             do {
                 try listContent.write(to: listFile, atomically: true, encoding: .utf8)
             } catch {

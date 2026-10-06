@@ -4,7 +4,7 @@ import PlayerKit
 import CFFmpeg
 import os
 
-private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "avio")
+private let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "avio")
 
 /// Bridges a Swift `MediaRandomAccessReader` to ffmpeg's synchronous C I/O callbacks.
 ///

@@ -42,7 +42,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 <plist version="1.0">
 <dict>
   <key>CFBundleExecutable</key><string>MinimalPlayer</string>
-  <key>CFBundleIdentifier</key><string>io.reflux.MinimalPlayer</string>
+  <key>CFBundleIdentifier</key><string>io.reflex.MinimalPlayer</string>
   <key>CFBundleName</key><string>MinimalPlayer</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>

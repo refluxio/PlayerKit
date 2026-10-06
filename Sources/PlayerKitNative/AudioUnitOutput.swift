@@ -5,7 +5,7 @@ import CoreAudio
 import os
 import PlayerKit
 
-private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "audio.output")
+private let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "audio.output")
 
 public final class AudioUnitOutput: AudioOutputBackend {
     /// Guards `audioQueue`, `running`, `paused`, `bufferedFrameCount`, `enqueuedFrames`.

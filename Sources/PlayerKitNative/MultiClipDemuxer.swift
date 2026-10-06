@@ -3,7 +3,7 @@ import CFFmpeg
 import PlayerKit
 import os
 
-private let logger = Logger(subsystem: "io.reflux.PlayerKit", category: "multiclip")
+private let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "multiclip")
 
 /// Plays an ordered sequence of independently-timed clip readers as one
 /// continuous presentation timeline. Each clip is demuxed with its own
@@ -36,7 +36,7 @@ final class MultiClipDemuxer: @unchecked Sendable {
     /// packets, so without this guard every packet near the end of a clip
     /// would spawn its own concurrent open of the same next reader.
     private var preOpenInFlight = false
-    private let preOpenQueue = DispatchQueue(label: "io.reflux.PlayerKit.multiclip.preopen", qos: .userInitiated)
+    private let preOpenQueue = DispatchQueue(label: "io.reflex.PlayerKit.multiclip.preopen", qos: .userInitiated)
     /// Remaining clip time below this threshold starts the background
     /// pre-open of the next clip. ffmpeg avformat_open_input + probe
     /// measures ~1–1.5s in practice; 3s leaves margin.
