@@ -57,10 +57,15 @@ public enum DolbyVisionColorSignal: Equatable {
     /// IPT 非线性幂(Ebner 实验拟合 0.43 的逆),非 sRGB 家族的 2.4。
     public static let iptPowerExponent: Double = 1.0 / 0.43
 
-    /// 参考解码链:PQ 编码 IPT → 线性 BT.2020 RGB。shader 端逐位对齐此实现。
+    /// 参考解码链:PQ 编码 IPTPQc2 信号 → 线性 BT.2020 RGB。输入为全范围
+    /// PQ 编码信号(非 YCbCr limited range)。IPTPQc2 全范围量化,中性
+    /// 色度在数字码域中点 0.5,故 P/T 经 PQ EOTF 后减去 EOTF(0.5) 归零
+    /// 中性(偏置发生在码域中心,不是 EOTF 后的线性 0.5——PQ EOTF(0.5)
+    /// ≈ 0.0088,码域中点在线性域深压缩区)。shader 端逐位对齐此实现。
     public static func iptPQToBT2020RGB(i: Double, p: Double, t: Double) -> (r: Double, g: Double, b: Double) {
-        let lin = [pqEotf(i), pqEotf(p), pqEotf(t)]
-        let lmsP = matVec(iptToLMS, lin)
+        let neutral = pqEotf(0.5)
+        let ipt = [pqEotf(i), pqEotf(p) - neutral, pqEotf(t) - neutral]
+        let lmsP = matVec(iptToLMS, ipt)
         let lms = lmsP.map { pow(max($0, 0), iptPowerExponent) }
         let rgb = matVec(lmsToBT2020RGB, lms)
         return (rgb[0], rgb[1], rgb[2])

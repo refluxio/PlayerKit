@@ -74,11 +74,13 @@ final class DolbyVisionColorSignalTests: XCTestCase {
 
     // MARK: - 参考解码链
 
-    /// 灰轴不变性:PQ 编码的 IPT 无彩信号(I=P=T)解出 R=G=B。
-    /// IPT 第一分量携带全部亮度、P/T 为色度,I=P=T 意味着经 ipt2lms 后
-    /// L'M'S' 三通道相等(iptToLMS 每行和为 1),再经白保持矩阵出灰。
-    func testIPTPQToBT2020RGBNeutralAxisStaysGray() {
-        let sample = DolbyVisionColorSignal.iptPQToBT2020RGB(i: 0.5, p: 0.5, t: 0.5)
+    /// 信号域中性色 = 灰。IPTPQc2 全范围量化,中性色度在信号 0.5 中点
+    /// (模拟域色度拟合 [-0.5,+0.5],量化加 0.5 偏置)——P/T 信号 0.5 经
+    /// PQ EOTF 后减 0.5 才是 IPT 色度。用亮信号(0.9)保证偏差量级超过
+    /// 容差:漏掉 -0.5 偏置时,lmsP 三通道出现 ~0.4% 失衡,经幂放大后
+    /// r/b 失衡 ~4%,本测试即转红。
+    func testIPTPQToBT2020RGBNeutralSignalMidpointIsGray() {
+        let sample = DolbyVisionColorSignal.iptPQToBT2020RGB(i: 0.9, p: 0.5, t: 0.5)
         XCTAssertEqual(sample.r, sample.g, accuracy: 2e-3)
         XCTAssertEqual(sample.g, sample.b, accuracy: 2e-3)
         XCTAssertEqual(sample.r, sample.b, accuracy: 2e-3)
