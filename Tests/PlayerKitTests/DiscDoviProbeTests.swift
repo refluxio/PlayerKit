@@ -147,6 +147,60 @@ final class DiscDoviProbeTests: XCTestCase {
         XCTAssertEqual(config?.profile, 7)
     }
 
+    /// M2TS with the HEVC video on PES packets whose payload carries an
+    /// annexb unspec62 EL NAL: 2-byte NAL header + el_type(0x02) + the
+    /// 24-byte DV config record — how UHD Blu-ray P7 carries the config
+    /// (its PMT registration descriptor is 'HDMV', not 'DOVI').
+    func testExtractsDoviConfigFromUnspec62ELNal() {
+        var el = Data([0x7C, 0x01])         // NAL header: type 62, tid 1
+        el.append(0x02)                     // el_type = 2 (EL, config nested)
+        el.append(dvcc())                   // 24-byte config record
+        el.append(contentsOf: [0xAA, 0xBB, 0xCC])  // EL slice data
+        // annexb stream: IDR NAL, then the unspec62 EL NAL
+        var stream = Data()
+        stream.append(contentsOf: [0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xAF])  // IDR
+        stream.append(contentsOf: [0x00, 0x00, 0x00, 0x01])
+        stream.append(el)
+        let data = m2tsStream(doviConfig: nil) + pesPacket(pid: 0x1011, streamId: 0xE0, payload: stream)
+        let config = DiscDoviProbe.extractDoviConfig(from: data)
+        XCTAssertNotNil(config, "EL NAL 里的 24 字节 config 应被提取")
+        XCTAssertEqual(config?.profile, 7)
+        XCTAssertEqual(config?.rpuPresent, true)
+    }
+
+    /// Wraps `payload` as a PES packet on `pid` inside 192-byte M2TS
+    /// packets (multiple TS packets if it doesn't fit one).
+    private func pesPacket(pid: UInt16, streamId: UInt8, payload: Data) -> Data {
+        var pes = Data([0x00, 0x00, 0x01, streamId])
+        let len = UInt16(payload.count + 8)
+        pes.append(UInt8(len >> 8)); pes.append(UInt8(len & 0xFF))
+        pes.append(0x84)                    // flags: PTS present
+        pes.append(0x80)
+        pes.append(0x05)                    // header_data_length
+        pes.append(contentsOf: [0x21, 0x00, 0x0A, 0x7A, 0x7C])  // PTS
+        pes.append(payload)
+
+        var out = Data()
+        var i = pes.startIndex
+        var cc: UInt8 = 0
+        var first = true
+        while i < pes.endIndex {
+            let chunk = pes.subdata(in: i..<min(i + 184, pes.endIndex))
+            var p = Data([0x47])
+            p.append(UInt8((pid >> 8) & 0x1F) | (first ? 0x40 : 0))
+            p.append(UInt8(pid & 0xFF))
+            p.append(0x10 | cc)
+            p.append(chunk)
+            while p.count < 188 { p.append(0xFF) }
+            out.append(contentsOf: [0x00, 0x00, 0x00, 0x00])
+            out.append(Data(p.prefix(188)))
+            i += 184
+            cc = (cc + 1) & 0x0F
+            first = false
+        }
+        return out
+    }
+
     func testNilWhenNoDoviDescriptor() {
         let stream = m2tsStream(doviConfig: nil)
         XCTAssertNil(DiscDoviProbe.extractDoviConfig(from: stream))
