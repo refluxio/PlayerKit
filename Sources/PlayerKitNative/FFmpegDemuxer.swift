@@ -446,22 +446,44 @@ final class FFmpegDemuxer: @unchecked Sendable {
     private func maybeInjectDoviConfigFromDisc(reader: any MediaRandomAccessReader) {
         guard let vs = videoStream else { return }
         let par = vs.pointee.codecpar.pointee
-        guard par.codec_id == AV_CODEC_ID_HEVC, !isDolbyVision else { return }
-
-        // The PMT sits at the very start of an M2TS file — 2MB is far more
-        // than needed and is usually already warm in the reader's read-ahead
-        // buffer from the open probe.
-        let probeBytes = 2 * 1024 * 1024
-        let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: probeBytes,
-                                                            alignment: MemoryLayout<UInt8>.alignment)
-        defer { buffer.deallocate() }
-        guard let n = try? reader.read(offset: 0, length: probeBytes, into: buffer), n > 188,
-              let base = buffer.baseAddress else {
+        guard par.codec_id == AV_CODEC_ID_HEVC, !isDolbyVision else {
+            logger.info("disc DV probe: skipped (codecId=\(par.codec_id.rawValue, privacy: .public) alreadyDoVi=\(self.isDolbyVision, privacy: .public))")
             return
         }
-        let data = Data(bytes: base, count: n)
-        guard let config = DiscDoviProbe.extractDoviConfig(from: data) else {
-            logger.info("disc DV probe: no DOVI registration descriptor in stream head")
+
+        // The PMT sits at the very start of an M2TS file — the first block
+        // is almost always enough, and chunked reads stay within the block
+        // sizes the reader (and the CDN behind it) already serves for the
+        // open probe instead of issuing one oversized 2MB Range request.
+        let blockBytes = 256 * 1024
+        let maxBlocks = 8  // 2MB total ceiling
+        let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: blockBytes,
+                                                            alignment: MemoryLayout<UInt8>.alignment)
+        defer { buffer.deallocate() }
+        var data = Data()
+        var config: DiscDoviConfig?
+        for block in 0..<maxBlocks {
+            do {
+                let n = try reader.read(offset: Int64(block * blockBytes),
+                                        length: blockBytes, into: buffer)
+                guard n > 0, let base = buffer.baseAddress else {
+                    logger.info("disc DV probe: reader EOF at block \(block, privacy: .public) (read \(data.count, privacy: .public) bytes)")
+                    break
+                }
+                data.append(contentsOf: UnsafeRawBufferPointer(start: base, count: n))
+            } catch {
+                logger.info("disc DV probe: reader read failed at block \(block, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                break
+            }
+            if let found = DiscDoviProbe.extractDoviConfig(from: data) {
+                config = found
+                break
+            }
+            // Last block returned short — no more data to scan.
+            if block > 0 || data.count < blockBytes { break }
+        }
+        guard let config else {
+            logger.info("disc DV probe: no DOVI registration descriptor in stream head (\(data.count, privacy: .public) bytes scanned)")
             return
         }
 
@@ -487,6 +509,8 @@ final class FFmpegDemuxer: @unchecked Sendable {
                                                capacity: 1) { $0.pointee = record }
             vs.pointee.codecpar.pointee = mutablePar
             logger.info("disc DV probe: injected DOVI_CONF profile=\(config.profile, privacy: .public) level=\(config.level, privacy: .public) rpu=\(config.rpuPresent, privacy: .public) el=\(config.elPresent, privacy: .public) bl=\(config.blPresent, privacy: .public) compatId=\(config.blSignalCompatibilityId, privacy: .public)")
+        } else {
+            logger.error("disc DV probe: av_packet_side_data_new returned nil")
         }
     }
 
