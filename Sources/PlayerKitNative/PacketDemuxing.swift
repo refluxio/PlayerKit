@@ -30,6 +30,8 @@ protocol PacketDemuxing: AnyObject, Sendable {
     var doviProfile: UInt8 { get }
     var doviBLSignalCompatibilityId: UInt8 { get }
     var hasHDR10Plus: Bool { get }
+    /// Diagnostics: comma-separated side data type names on the video codecpar.
+    var sideDataTypesDescription: String { get }
     var audioIsAtmos: Bool { get }
     var sampleAspectRatio: Double { get }
     func selectAudioStream(by id: Int) -> Bool

@@ -106,6 +106,25 @@ final class FFmpegDemuxer: @unchecked Sendable {
         return false
     }
 
+    /// Side data type list on the video codecpar (diagnostics). Distinguishes
+    /// "container never produced DOVI_CONF" (mpegts on some ffmpeg versions,
+    /// e.g. raw M2TS from a Blu-ray ISO) from "side data present but failed to
+    /// parse" when isDolbyVision comes out false on a disc known to carry DV.
+    var sideDataTypesDescription: String {
+        guard let vs = videoStream else { return "no-video-stream" }
+        let par = vs.pointee.codecpar.pointee
+        guard par.nb_coded_side_data > 0, let sideData = par.coded_side_data else {
+            return "none"
+        }
+        var names: [String] = []
+        for i in 0..<Int(par.nb_coded_side_data) {
+            let raw = sideData[i].type.rawValue
+            let name = String(cString: av_packet_side_data_name(sideData[i].type))
+            names.append("\(name)(\(raw))")
+        }
+        return names.joined(separator: ",")
+    }
+
     /// Parsed Dolby Vision configuration record (profile + signal compatibility id).
     /// Returns nil for non-DV streams, or when the side data payload is too short
     /// to contain a valid `AVDOVIDecoderConfigurationRecord` (needs ≥9 bytes).

@@ -704,6 +704,7 @@ public final class NativeBackend: PlayerBackend {
             isHEVC10Bit=\(isHEVC10Bit) \
             isDoVi=\(demuxer.isDolbyVision) profile=\(demuxer.doviProfile) \
             hasHDR10Plus=\(demuxer.hasHDR10Plus) \
+            sideData=\(demuxer.sideDataTypesDescription) \
             displayEDR=\(self.displayCapability.supportsEDR) renderer10bit=\(self._renderer.prefersTenBit) \
             → \(String(describing: strat))
             """)

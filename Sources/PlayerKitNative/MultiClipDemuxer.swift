@@ -233,6 +233,7 @@ extension MultiClipDemuxer: PacketDemuxing {
     var doviProfile: UInt8 { currentDemuxer?.doviProfile ?? 0 }
     var doviBLSignalCompatibilityId: UInt8 { currentDemuxer?.doviBLSignalCompatibilityId ?? 0 }
     var hasHDR10Plus: Bool { currentDemuxer?.hasHDR10Plus ?? false }
+    var sideDataTypesDescription: String { currentDemuxer?.sideDataTypesDescription ?? "no-clip" }
     var audioIsAtmos: Bool { currentDemuxer?.audioIsAtmos ?? false }
     var sampleAspectRatio: Double { currentDemuxer?.sampleAspectRatio ?? 1.0 }
     func selectAudioStream(by id: Int) -> Bool { currentDemuxer?.selectAudioStream(by: id) ?? false }
