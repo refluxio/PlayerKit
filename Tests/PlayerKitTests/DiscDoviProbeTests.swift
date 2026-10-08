@@ -44,9 +44,9 @@ final class DiscDoviProbeTests: XCTestCase {
         return tsPacket(pid: 0x0000, payload: Data([0x00]) + section, pusi: true)
     }
 
-    /// PMT packet: video ES at `videoPid` (stream_type 0x24 HEVC) carrying a
+    /// PMT section: video ES at `videoPid` (stream_type 0x24 HEVC) carrying a
     /// 'DOVI' registration descriptor whose payload is `doviConfig`.
-    private func pmtPacket(videoPid: UInt16, doviConfig: Data) -> Data {
+    private func pmtSection(videoPid: UInt16, doviConfig: Data) -> Data {
         // Registration descriptor: tag 0x05, len = 4 ('DOVI') + config
         var desc = Data([0x05, UInt8(4 + doviConfig.count)])
         desc.append(contentsOf: [0x44, 0x4F, 0x56, 0x49])  // 'DOVI'
@@ -70,7 +70,14 @@ final class DiscDoviProbeTests: XCTestCase {
         section.append(0xF0); section.append(0x00)          // no program info
         section.append(es)
         section.append(contentsOf: [0x00, 0x00, 0x00, 0x00])
-        return tsPacket(pid: 0x1000, payload: Data([0x00]) + section, pusi: true)
+        return section
+    }
+
+    /// PMT packet: section wrapped at PID 0x1000 (a PAT-assigned PMT PID).
+    private func pmtPacket(videoPid: UInt16, doviConfig: Data) -> Data {
+        tsPacket(pid: 0x1000,
+                 payload: Data([0x00]) + pmtSection(videoPid: videoPid, doviConfig: doviConfig),
+                 pusi: true)
     }
 
     /// 24-byte DV config record (dvcC bit layout), profile 7 level 6,
@@ -126,6 +133,17 @@ final class DiscDoviProbeTests: XCTestCase {
         stream.append(pmtPacket(videoPid: 0x1011, doviConfig: dvcc()))
         let config = DiscDoviProbe.extractDoviConfig(from: stream)
         XCTAssertNotNil(config)
+        XCTAssertEqual(config?.profile, 7)
+    }
+
+    func testExtractsFromBdmvM2tsWithoutPat() {
+        // BDMV M2TS carries no PAT — the PMT lives at the fixed PID 0x0100
+        // (playlist/clpi drives stream selection instead of SI tables).
+        let pmt = tsPacket(pid: 0x0100,
+                           payload: Data([0x00]) + pmtSection(videoPid: 0x1011, doviConfig: dvcc()),
+                           pusi: true)
+        let config = DiscDoviProbe.extractDoviConfig(from: pmt)
+        XCTAssertNotNil(config, "PMT at fixed BDMV PID should be found without a PAT")
         XCTAssertEqual(config?.profile, 7)
     }
 

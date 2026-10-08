@@ -463,9 +463,10 @@ final class FFmpegDemuxer: @unchecked Sendable {
         var data = Data()
         var config: DiscDoviConfig?
         for block in 0..<maxBlocks {
+            var n = 0
             do {
-                let n = try reader.read(offset: Int64(block * blockBytes),
-                                        length: blockBytes, into: buffer)
+                n = try reader.read(offset: Int64(block * blockBytes),
+                                    length: blockBytes, into: buffer)
                 guard n > 0, let base = buffer.baseAddress else {
                     logger.info("disc DV probe: reader EOF at block \(block, privacy: .public) (read \(data.count, privacy: .public) bytes)")
                     break
@@ -479,11 +480,11 @@ final class FFmpegDemuxer: @unchecked Sendable {
                 config = found
                 break
             }
-            // Last block returned short — no more data to scan.
-            if block > 0 || data.count < blockBytes { break }
+            // Short read — the stream ends here, no point asking for more.
+            if n < blockBytes { break }
         }
         guard let config else {
-            logger.info("disc DV probe: no DOVI registration descriptor in stream head (\(data.count, privacy: .public) bytes scanned)")
+            logger.info("disc DV probe: no DOVI registration descriptor in stream head (\(data.count, privacy: .public) bytes scanned) \(DiscDoviProbe.describe(from: data), privacy: .public)")
             return
         }
 
