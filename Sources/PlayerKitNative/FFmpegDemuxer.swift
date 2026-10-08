@@ -429,6 +429,65 @@ final class FFmpegDemuxer: @unchecked Sendable {
 
         try finishOpen(skipDurationProbe: skipDurationProbe, isNetwork: true,
                        knownDurationSecs: knownDurationSecs)
+        maybeInjectDoviConfigFromDisc(reader: reader)
+    }
+
+    /// Blu-ray disc / raw TS playback: ffmpeg's mpegts demuxer never produces
+    /// codecpar side data, so the DV config record that lives in the PMT's
+    /// DOVI registration descriptor (24-byte dvcC layout) never reaches
+    /// isDolbyVision, which reads AV_PKT_DATA_DOVI_CONF side data. After a
+    /// successful open, when the video stream is HEVC and carries no
+    /// DOVI_CONF, read the stream head through the reader and inject the
+    /// extracted record. reader.read is absolute-offset (see
+    /// MediaRandomAccessReader), so this does not disturb AVIOBridge's
+    /// sequential read position. Best-effort: any failure keeps the
+    /// previous behavior (undetected DV → HDR10 static) without blocking
+    /// playback.
+    private func maybeInjectDoviConfigFromDisc(reader: any MediaRandomAccessReader) {
+        guard let vs = videoStream else { return }
+        let par = vs.pointee.codecpar.pointee
+        guard par.codec_id == AV_CODEC_ID_HEVC, !isDolbyVision else { return }
+
+        // The PMT sits at the very start of an M2TS file — 2MB is far more
+        // than needed and is usually already warm in the reader's read-ahead
+        // buffer from the open probe.
+        let probeBytes = 2 * 1024 * 1024
+        let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: probeBytes,
+                                                            alignment: MemoryLayout<UInt8>.alignment)
+        defer { buffer.deallocate() }
+        guard let n = try? reader.read(offset: 0, length: probeBytes, into: buffer), n > 188,
+              let base = buffer.baseAddress else {
+            return
+        }
+        let data = Data(bytes: base, count: n)
+        guard let config = DiscDoviProbe.extractDoviConfig(from: data) else {
+            logger.info("disc DV probe: no DOVI registration descriptor in stream head")
+            return
+        }
+
+        var record = AVDOVIDecoderConfigurationRecord()
+        record.dv_version_major = config.versionMajor
+        record.dv_version_minor = config.versionMinor
+        record.dv_profile = config.profile
+        record.dv_level = config.level
+        record.rpu_present_flag = config.rpuPresent ? 1 : 0
+        record.el_present_flag = config.elPresent ? 1 : 0
+        record.bl_present_flag = config.blPresent ? 1 : 0
+        record.dv_bl_signal_compatibility_id = config.blSignalCompatibilityId
+        // TS-carried configs carry no metadata-compression concept (pre-dvvC
+        // 24-byte layout) — NONE is the unlimited/raw semantic.
+        record.dv_md_compression = UInt8(AV_DOVI_COMPRESSION_NONE.rawValue)
+
+        var mutablePar = vs.pointee.codecpar.pointee
+        let size = MemoryLayout<AVDOVIDecoderConfigurationRecord>.size
+        if let sd = av_packet_side_data_new(&mutablePar.coded_side_data,
+                                            &mutablePar.nb_coded_side_data,
+                                            AV_PKT_DATA_DOVI_CONF, size, 0) {
+            sd.pointee.data!.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self,
+                                               capacity: 1) { $0.pointee = record }
+            vs.pointee.codecpar.pointee = mutablePar
+            logger.info("disc DV probe: injected DOVI_CONF profile=\(config.profile, privacy: .public) level=\(config.level, privacy: .public) rpu=\(config.rpuPresent, privacy: .public) el=\(config.elPresent, privacy: .public) bl=\(config.blPresent, privacy: .public) compatId=\(config.blSignalCompatibilityId, privacy: .public)")
+        }
     }
 
     private func finishOpen(skipDurationProbe: Bool, isNetwork: Bool,
