@@ -1,6 +1,8 @@
 import Foundation
 #if os(macOS)
 import AppKit
+#elseif canImport(UIKit)
+import UIKit
 #endif
 
 /// Snapshot of the output display's HDR capabilities at a given moment.
@@ -18,7 +20,9 @@ public struct DisplayCapability: Sendable, Equatable {
 
     /// Whether the display can enter EDR mode (>1.0 component values in
     /// extended-linear Display P3). On macOS this corresponds to an XDR panel
-    /// or external HDR monitor; iOS/tvOS currently report false.
+    /// or external HDR monitor; on iOS/tvOS it is probed from
+    /// `UIScreen.maximumExtendedDynamicRangeColorComponentValue` (iPhone 12+
+    /// HDR panels, iPad Pro XDR, HDR TVs on Apple TV).
     public var supportsEDR: Bool
 
     /// Peak luminance the renderer should tone-map toward, in cd/m².
@@ -55,31 +59,54 @@ public struct DisplayCapability: Sendable, Equatable {
         supportsEDR: false, targetPeakNits: 203,
         supports10Bit: true, supportsHLGOOTF: false)
 
-    /// iPhone / iPad / Apple TV. EDR is not available; HDR content is shown via
-    /// CoreImage's automatic EDR fallback path (8-bit + CIToneCurve).
+    /// iPhone / iPad / Apple TV SDR panel (no EDR headroom). HDR content on
+    /// this display is shown via the tone-mapped SDR path.
     public static let appleMobile = DisplayCapability(
         supportsEDR: false, targetPeakNits: 203,
         supports10Bit: true, supportsHLGOOTF: false)
+
+    /// iPhone / iPad / Apple TV panel currently in EDR mode — probed the same
+    /// way as `.macEDR`: `UIScreen.maximumExtendedDynamicRangeColorComponentValue`
+    /// reports the current max headroom in SDR-white multiples (iPhone 12 and
+    /// later report ~4-8 while playing HDR; SDR panels stay at 1.0). Peak target
+    /// mirrors `.macEDR` (1000 nits): iPhone HDR panels peak at ~800-1200 nits
+    /// and HDR TVs 600-1000+, so 1000 is a safe common tone-map target.
+    public static let mobileEDR = DisplayCapability(
+        supportsEDR: true, targetPeakNits: 1000,
+        supports10Bit: true, supportsHLGOOTF: true)
 }
 
 extension DisplayCapability {
 
     /// Probe the current main screen's EDR capability. On macOS reads
     /// `NSScreen.maximumExtendedDynamicRangeColorComponentValue`; on iOS/tvOS
-    /// returns `.appleMobile` (EDR is not available).
+    /// reads the same-named `UIScreen` property. Other platforms return
+    /// `.appleMobile`.
     ///
-    /// `maximumExtendedDynamicRangeColorComponentValue` is > 1.0 iff the panel
-    /// is currently in EDR mode (XDR or external HDR monitor with HDR enabled
-    /// in System Settings). The probe returns `macEDR` when the value is > 1.0,
-    /// `macSDR` otherwise.
+    /// The property is > 1.0 iff the panel is currently in EDR mode (XDR /
+    /// external HDR monitor with HDR enabled in System Settings on macOS;
+    /// HDR-capable mobile panel or HDR TV on iOS/tvOS). The probe returns
+    /// `.macEDR` / `.mobileEDR` when the value is > 1.0, the SDR variant
+    /// otherwise.
     ///
-    /// - Note: Main-thread-only on macOS (NSScreen must be accessed from main).
+    /// - Note: Main-thread-only (NSScreen/UIScreen must be accessed from main).
     @MainActor
     public static func probeCurrent() -> DisplayCapability {
 #if os(macOS)
         guard let screen = NSScreen.main else { return .macSDR }
         let peak = screen.maximumExtendedDynamicRangeColorComponentValue
         return peak > 1.0 ? .macEDR : .macSDR
+#elseif os(iOS) || os(tvOS)
+        // UIScreen.main is soft-deprecated since iOS 16 (scene-based APIs are
+        // preferred), but PlayerKit is a framework without scene context, and
+        // this remains the only context-free entry point. `potentialEDRHeadroom`
+        // is the panel's max headroom in SDR-white multiples when EDR is
+        // enabled, regardless of whether EDR is currently active (iPhone 12+
+        // HDR panels report ~4-8, HDR TVs ~2-6, SDR panels 1.0) — available on
+        // iOS 16+ / tvOS 16+, so no availability gate given the iOS 17/tvOS 17
+        // package floor.
+        let peak = UIScreen.main.potentialEDRHeadroom
+        return peak > 1.0 ? .mobileEDR : .appleMobile
 #else
         return .appleMobile
 #endif

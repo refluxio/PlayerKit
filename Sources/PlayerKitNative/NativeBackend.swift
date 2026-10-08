@@ -116,6 +116,23 @@ public final class NativeBackend: PlayerBackend {
     public private(set) var rendererStrategy: RendererStrategy?
     public var onStateChange: ((PlayerState) -> Void)?
 
+    /// Hook for stream-aware tone-mapper injection, invoked synchronously in
+    /// `_finishOpen` right after `rendererStrategy` is resolved — before the
+    /// decode loop starts, so the first rendered frame already goes through
+    /// the returned mapper. The host app decides from the full strategy +
+    /// stream attributes whether this stream needs frame-level processing;
+    /// PlayerKit installs the result on (or clears it from) the active
+    /// `ASBDLRenderer.toneMapper`. This is how PlayerKitPro's ToneMapProcessor
+    /// gets precise injection — e.g. DoVi Profile 5 needs IPT→BT.2020
+    /// correction on every frame, while HDR10/P8 base layers are better left
+    /// to the system EDR pipeline (custom processing would collapse them to
+    /// 8-bit SDR output).
+    ///
+    /// Returning nil clears the mapper for this stream. Only consulted when
+    /// the active renderer is an `ASBDLRenderer` (the built-in Metal/CI
+    /// renderers run their own strategy-driven tone-map pipeline). Main thread.
+    public var toneMapperProvider: ((RendererStrategy, VideoStreamAttributes) -> (any ToneMapping)?)?
+
     private let _renderer: any VideoRenderer
     public var renderer: any VideoRenderer { _renderer }
 
@@ -665,6 +682,15 @@ public final class NativeBackend: PlayerBackend {
                 doviEnabled: doviEnabled
             )
             self.rendererStrategy = strat
+
+            // Stream-aware tone-mapper injection (see `toneMapperProvider`).
+            // Main thread, pre-decode-loop: assigning the result — including
+            // nil — makes the provider the single decision point for the
+            // ASBDL mapper on this stream.
+            if let provider = toneMapperProvider,
+               let asbdl = _renderer as? ASBDLRenderer {
+                asbdl.toneMapper = provider(strat, attrs)
+            }
             // Verbose decision log: original container fields → resolved params →
             // final strategy. Makes "why did this stream pick SDR?" answerable
             // from a single log line at open time. See Docs/hdr-rendering.md.
