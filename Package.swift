@@ -52,7 +52,7 @@ let package = Package(
         ),
         .testTarget(
             name: "PlayerKitTests",
-            dependencies: ["PlayerKit", "PlayerKitNative"],
+            dependencies: ["PlayerKit", "PlayerKitNative", "CFFmpeg"],
             path: "Tests/PlayerKitTests",
             resources: [.copy("Fixtures")]
         ),

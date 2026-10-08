@@ -534,25 +534,74 @@ final class FFmpegVideoDecoder {
         )
     }
 
-    /// Extract the bezier curve from `AVDynamicHDRPlus`. The full struct is
-    /// large; we only read the bezier curve anchor points and the targeted
-    /// system display maximum luminance, which are what the tone-map shader uses.
+    /// Extract HDR10+ side data from a decoded frame. `data` is the payload of
+    /// `AV_FRAME_DATA_DYNAMIC_HDR_PLUS` — an `AVDynamicHDRPlus` struct.
     private func extractHDR10Plus(from data: UnsafePointer<UInt8>) -> HDR10PlusFrameMetadata? {
-        // AVDynamicHDRPlus is a complex nested struct; parsing it correctly by
-        // hand is error-prone. For the initial integration we capture only the
-        // targeted system display maximum luminance (a fixed field near the
-        // start of the payload) and leave the bezier curve nil. The shader
-        // falls back to BT.2390 static when `bezierCurve == nil`.
-        //
-        // Proper HDR10+ bezier parsing will be added in a follow-up once the
-        // EDRRenderer shader actually consumes it.
-        // Field layout: AVDynamicHDRPlus starts with itu_t_t35_country_code (1B)
-        // + application_version (1B) + num_windows (1B) ... we don't risk reading
-        // the wrong offset. Defer until the shader side needs it.
-        return HDR10PlusFrameMetadata(
-            targetedSystemDisplayMaxLuminance: 1000,
-            bezierCurve: nil
-        )
+        let hdrPlus = UnsafeRawPointer(data).load(as: AVDynamicHDRPlus.self)
+        return Self.parseHDR10Plus(hdrPlus)
+    }
+
+    /// Parse the structured `AVDynamicHDRPlus` metadata (ST 2094-40) into the
+    /// PlayerKit value type. Pure function over the C struct so it can be unit
+    /// tested with hand-built fixtures (`HDR10PlusParseTests`).
+    ///
+    /// Only window 0 (full-frame curve) is read — ROI windows 1-2 are ignored.
+    /// The curve is captured as the ST 2094-40 Annex B control-point vector
+    /// `P[0]=0, P[1..N]=SEI anchors, P[N+1]=1`; more than 8 SEI anchors are
+    /// truncated (fixed 10-slot storage; real content stays at 9 or fewer). A
+    /// missing or degenerate knee drops the curve so the shader falls back to
+    /// BT.2390 static.
+    ///
+    /// FFmpeg decodes the targeted display luminance as `{num: raw, den: 10000}`
+    /// (the bitstream stores cd/m² in 0.0001 steps), so `num/den` is already
+    /// cd/m² — same convention as the mastering-display parsing above.
+    static func parseHDR10Plus(_ hdrPlus: AVDynamicHDRPlus) -> HDR10PlusFrameMetadata? {
+        let h = hdrPlus
+        guard h.num_windows >= 1 else { return nil }
+
+        let lumDen = h.targeted_system_display_maximum_luminance.den
+        let lum = lumDen != 0
+            ? Float(h.targeted_system_display_maximum_luminance.num) / Float(lumDen)
+            : 0
+        let targetLum = UInt16(clamping: Int(lum.rounded()))
+
+        let noCurve = HDR10PlusFrameMetadata(targetedSystemDisplayMaxLuminance: targetLum,
+                                             bezierCurve: nil)
+
+        let p0 = h.params.0
+        guard p0.tone_mapping_flag == 1 else { return noCurve }
+
+        let kneeX = Float(p0.knee_point_x.num) / max(Float(p0.knee_point_x.den), 1)
+        let kneeY = Float(p0.knee_point_y.num) / max(Float(p0.knee_point_y.den), 1)
+        // kneePointX = 0 is the "unset" marker downstream; kx ≥ 1 divides by
+        // zero in the bezier segment. Either way the curve is unusable.
+        guard kneeX > 0, kneeX < 1, kneeY > 0, kneeY <= 1 else { return noCurve }
+
+        let numAnchors = min(Int(p0.num_bezier_curve_anchors), 8)
+        guard numAnchors >= 1 else { return noCurve }
+
+        var pts: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        withUnsafeMutablePointer(to: &pts) { raw in
+            raw.withMemoryRebound(to: Float.self, capacity: 10) { p in
+                // Fixed endpoints: P[0] = 0 (initialised), P[numAnchors + 1] = 1;
+                // SEI anchors fill P[1 .. numAnchors].
+                p[numAnchors + 1] = 1
+                withUnsafePointer(to: p0.bezier_curve_anchors) { tuple in
+                    tuple.withMemoryRebound(to: AVRational.self, capacity: 15) { anchors in
+                        for i in 0..<numAnchors {
+                            let a = anchors[i]
+                            p[i + 1] = a.den != 0 ? Float(a.num) / Float(a.den) : 0
+                        }
+                    }
+                }
+            }
+        }
+
+        let curve = HDR10PlusFrameMetadata.BezierCurve(
+            anchors: pts, count: numAnchors + 2,
+            kneePointX: kneeX, kneePointY: kneeY)
+        return HDR10PlusFrameMetadata(targetedSystemDisplayMaxLuminance: targetLum,
+                                      bezierCurve: curve)
     }
 
     deinit {

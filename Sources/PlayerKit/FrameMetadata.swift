@@ -102,24 +102,39 @@ public struct ContentLightLevelMetadata: Sendable, Equatable {
 /// with DoVi L1 semantics and aren't commonly authored.
 public struct HDR10PlusFrameMetadata: Sendable, Equatable {
 
-    /// Bezier curve tone-map defined by up to 9 control points (anchors).
-    /// `anchors[0]` is always 0.0, `anchors[count-1]` is always 1.0; intermediate
-    /// anchors define the knee. `count` may be 2..10 (1 fixed + up to 9 from the
-    /// SEI). We store all 10 in a fixed-size tuple for buffer-friendliness.
+    /// Bezier curve tone-map per ST 2094-40 Annex B (libplacebo `st2094_40`
+    /// layout). The curve is evaluated over the control-point vector
+    /// `P[0] = 0, P[1 .. count-2] = SEI anchors, P[count-1] = 1`, so `count` =
+    /// SEI anchor count + 2. Up to 8 SEI anchors fit the fixed 10-slot tuple
+    /// (real-world content stays at 9 or fewer); more are truncated.
+    ///
+    /// The knee point `kx/ky` splits the curve: input below `kx` maps linearly
+    /// (`y = x * ky / kx`), above it the Bernstein-form bezier applies.
     public struct BezierCurve: Sendable, Equatable {
-        /// Control point x/y values in 0..1. Unused slots are 0.
+        /// Control point x/y values in 0..1. Slots past `count` are unused (0).
         public var anchors: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float)
-        /// Actual number of valid anchors (2..10).
+        /// Number of valid control points including both fixed endpoints (3..10).
         public var count: Int
+        /// Knee point x (0..1, exclusive of 0 and 1) from the SEI. 0 = unset —
+        /// evaluators fall back to the identity in that case.
+        public var kneePointX: Float
+        /// Knee point y (0..1) from the SEI. 0 = unset.
+        public var kneePointY: Float
 
         public init(anchors: (Float, Float, Float, Float, Float, Float, Float, Float, Float, Float),
-                    count: Int) {
+                    count: Int,
+                    kneePointX: Float = 0,
+                    kneePointY: Float = 0) {
             self.anchors = anchors
             self.count = count
+            self.kneePointX = kneePointX
+            self.kneePointY = kneePointY
         }
 
         public static func == (lhs: BezierCurve, rhs: BezierCurve) -> Bool {
-            guard lhs.count == rhs.count else { return false }
+            guard lhs.count == rhs.count,
+                  lhs.kneePointX == rhs.kneePointX,
+                  lhs.kneePointY == rhs.kneePointY else { return false }
             let la = lhs.anchors, ra = rhs.anchors
             return la.0 == ra.0 && la.1 == ra.1 && la.2 == ra.2 && la.3 == ra.3
                 && la.4 == ra.4 && la.5 == ra.5 && la.6 == ra.6 && la.7 == ra.7
