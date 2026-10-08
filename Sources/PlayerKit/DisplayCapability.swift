@@ -8,9 +8,9 @@ import UIKit
 /// Snapshot of the output display's HDR capabilities at a given moment.
 ///
 /// `NativeBackend` uses this together with `VideoStreamAttributes` to pick the
-/// right `RendererStrategy`. macOS EDR-capable displays report `supportsEDR=true`
-/// and a target peak luminance (typically 1000 nits); non-EDR panels, iOS and
-/// tvOS fall back to the SDR 203-nit diffuse-white path.
+/// right `RendererStrategy`. EDR-capable displays (macOS XDR, iPhone/iPad HDR
+/// panels, Apple TV HDR TVs) report `supportsEDR=true` and a 1000-nit target
+/// peak; non-EDR panels fall back to the SDR 203-nit diffuse-white path.
 ///
 /// This is a pure value type — no AppKit/UIKit dependency — so PlayerKit can
 /// stay cross-platform. The caller (reflex apple `PlayerController`) probes

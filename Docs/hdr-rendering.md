@@ -32,11 +32,11 @@ HDR 渲染决策不是"一个格式对应一种方式",而是三个独立维度�
 | HDR10 PQ | 非 EDR | FFmpeg VT hwaccel (`ffmpegHW`) | `ciEDRFallback` | 伪 PQ (CIToneCurve) |
 | **HDR10+** (ST 2094-40) | EDR | **FFmpeg 软解** (`ffmpegSW`) | `metalHDR` | HDR10+ bezier |
 | HDR10+ | 非 EDR | FFmpeg VT hwaccel (`ffmpegHW`) | `ciEDRFallback` | 降级为 HDR10 静态 |
-| **DoVi Profile 5** | EDR | **FFmpeg 软解** (`ffmpegSW`) | `metalHDR` | BT.2390 + DoVi L1 动态 |
+| **DoVi Profile 5** | EDR | **FFmpeg 软解** (`ffmpegSW`) | `metalHDR` | BT.2390 + DoVi L1 动态 (+ L2/L3 精修) |
 | DoVi Profile 5 | 非 EDR | FFmpeg 软解 (`ffmpegSW`) | `ciEDRFallback` | 降级为 HDR10 静态 |
 | **DoVi Profile 7** (BL+EL) | EDR | VT 直解 (`vtHW`) | `metalHDR` | BT.2390 static (降级) |
 | DoVi Profile 7 | 非 EDR | VT 直解 (`vtHW`) | `ciEDRFallback` | 降级为 HDR10 静态 |
-| **DoVi Profile 8** | EDR | **FFmpeg 软解** (`ffmpegSW`) | `metalHDR` | BT.2390 + DoVi L1 (CT 模式退回静态) |
+| **DoVi Profile 8** | EDR | **FFmpeg 软解** (`ffmpegSW`) | `metalHDR` | BT.2390 + DoVi L1 动态 (+ L2/L3 精修,同 P5) |
 | DoVi Profile 8 | 非 EDR | FFmpeg 软解 (`ffmpegSW`) | `ciEDRFallback` | 降级为 HDR10 静态 |
 | **HLG** (广播) | EDR | FFmpeg VT hwaccel (`ffmpegHW`) | `metalHDR` | HLG OOTF + BT.2390 |
 | HLG | 非 EDR | FFmpeg VT hwaccel (`ffmpegHW`) | `ciEDRFallback` | 降级为 HDR10 静态 |
@@ -51,7 +51,9 @@ HDR 渲染决策不是"一个格式对应一种方式",而是三个独立维度�
 if stream.isDolbyVision:
     match stream.doviProfile:
         5 → doviProfile5      (SW + MetalHDR + L1)
-        8 → doviProfile8      (SW + MetalHDR + L1, bl_compat_id==2 时 tonemapCompat=true)
+        8 → doviProfile8      (SW + MetalHDR + L1,与 P5 同路径;
+                               bl_compat_id==2 时构造 tonemapCompat=true
+                               但该标志当前无消费方)
         7 → degradedHDR10     (VT 当 HDR10 处理,SW 双层解超出范围)
         _ → degradedHDR10
 elif stream.transfer == .pq:
@@ -70,7 +72,25 @@ else:  # .sdr
         → sdr8Bit / sdr10Bit  (VT + ciSDR + passthrough)
 ```
 
-`edrCapable = display.supportsEDR && renderer.prefersTenBit`。EDRRenderer.prefersTenBit == true,MetalRenderer.prefersTenBit == false。
+`edrCapable = display.supportsEDR && renderer.prefersTenBit`。EDRRenderer.prefersTenBit == true,MetalRenderer.prefersTenBit == false。macOS 的 `supportsEDR` 由 caller 探测 `NSScreen.maximumExtendedDynamicRangeColorComponentValue`;iOS/tvOS 用 `UIScreen` 同名 API(见 `DisplayCapability.mobileEDR`,iPhone 12+ HDR 屏 / Apple TV HDR 电视),非 EDR 才落 SDR 203-nit 路径。
+
+## DoVi 动态元数据与 L2/L3 精修
+
+`FrameMetadata.dovi` 按帧携带(全部由 `FFmpegVideoDecoder` 从 RPU DM ext blocks 解出):
+
+| 块 | 内容 | 换算约定 |
+|---|---|---|
+| **L1** | 逐帧 min/max/avg PQ | RPU 码是 **12-bit**,提取端 `<< 4` 左对齐进 16-bit 字段(消费端统一 /65535 归一) |
+| **L2 / L8** | 创作者 trim(slope/offset/power/chroma/saturation) | 12-bit 网格、**2048 中点**(libdovi XML 同款):slope/power = raw/2048(乘性,中点 1.0),offset = raw/2048−1(加性,中点 0),saturation = raw/2048。L8 是 L2 超集(target index 代替 target_max_pq),**L8 优先** |
+| **L3** | 实测 L1 偏移 | raw/2048−1,加性、归一 PQ 域,范围 [−1,1) |
+| **L6** | 静态 mastering / MaxCLL / MaxFALL | 原始值(cd/m²) |
+
+消费(两个渲染器的 BT.2390 DoVi-L1 路径):
+
+- **L3 max offset** 在进 EETF 前加到帧峰值上(归一 PQ 域,clamp 0..1)。注意方向:BT.2390 Hermite 里抬高 srcMaxPq = 压缩区间变宽 = **输出更暗**。
+- **L2 trim** 在 EETF 输出的信号线性域近似应用:`slope·x + offset → pow(power)`,再围绕 BT.2020 luma 做饱和度增益。Dolby 官方语义在 IPT 空间、studio reshape 之前;信号域是工程近似(libplacebo/mpv 同样没有 L2 直接消费路径,完整还原需要 libdovi 的 RPU reshape)。`msWeight` / `chromaWeight` 已解析但 shader 暂未消费。
+- **中性 trim 块**(全 2048)在 `makeUniform` 里被 1e-4 检测跳过,保证像素级 no-op。
+- SDR target 路径在 `ToneMapProcessor`(PlayerKitPro),EDR 直出路径在 `EDRRenderer`(L3 offset;trim 仅 SDR 路径)。
 
 ## 未标记 HDR10 的判定
 
@@ -167,7 +187,7 @@ CI SDR: coded=1918x1036                          ← 走 8-bit CI SDR pipeline
 
 ### 1. 优先级:DoVi > HDR10+ > HLG > HDR10 > SDR
 
-越靠前元数据越"动态"(per-frame 变化),必须走 FFmpeg SW + Metal HDR pipeline 才能拿到 `FrameMetadata.dovi.level1` / `hdr10Plus.bezierCurve`。SDR 没有元数据,passthrough 最快。
+越靠前元数据越"动态"(per-frame 变化),必须走 FFmpeg SW + Metal HDR pipeline 才能拿到 `FrameMetadata.dovi.level1/level2/level3` / `hdr10Plus.bezierCurve`。SDR 没有元数据,passthrough 最快。
 
 ### 2. 能力降级:任何 HDR 在非 EDR 显示器上都降级为 `hdr10Static` + `ciEDRFallback`
 
@@ -204,12 +224,14 @@ CI SDR: coded=1918x1036                          ← 走 8-bit CI SDR pipeline
 | 文件 | 作用 |
 |------|------|
 | `PlayerKit/Sources/PlayerKit/RendererStrategy.swift` | `VideoStreamAttributes` / `RendererStrategy` enum / `decideRendererStrategy` 纯函数 |
-| `PlayerKit/Sources/PlayerKit/FrameMetadata.swift` | `FrameMetadata` / `DolbyVisionFrameMetadata` / `HDR10PlusFrameMetadata` / `MasteringDisplayMetadata` |
-| `PlayerKit/Sources/PlayerKit/VideoRenderer.swift` | `VideoRenderer` 协议,`VideoColorParams`,`DisplayCapability` |
+| `PlayerKit/Sources/PlayerKit/FrameMetadata.swift` | `FrameMetadata` / `HDR10PlusFrameMetadata` / `MasteringDisplayMetadata` |
+| `PlayerKit/Sources/PlayerKit/VideoRenderer.swift` | `VideoRenderer` 协议,`VideoColorParams`,`DisplayCapability`,`DolbyVisionFrameMetadata`(L1/L2/L3/L6) |
+| `PlayerKit/Sources/PlayerKit/DisplayCapability.swift` | 显示器能力快照(`macEDR` / `macSDR` / `appleMobile` / `mobileEDR`) |
 | `PlayerKit/Sources/PlayerKitNative/NativeBackend.swift` | decoder 选择、jitter buffer、render 调用 |
 | `PlayerKit/Sources/PlayerKitNative/FFmpegVideoDecoder.swift` | FFmpeg SW/HW 解码,提取 `FrameMetadata` |
 | `PlayerKit/Sources/PlayerKitNative/VTVideoDecoder.swift` | VT 直解,返回 `FrameMetadata()` 空 |
-| `PlayerKitPro/Sources/PlayerKitPro/EDRRenderer.swift` | Metal 10-bit HDR pipeline + 5 种 tone-map algorithm |
+| `PlayerKitPro/Sources/PlayerKitPro/EDRRenderer.swift` | Metal 10-bit HDR pipeline + 5 种 tone-map algorithm(EDR 直出) |
+| `PlayerKitPro/Sources/PlayerKitPro/ToneMapProcessor.swift` | HDR → SDR tone-map processor,同 5 种 algorithm(SDR target;reflex 客户端经 `toneMapperProvider` 注入) |
 
 ## 新增 HDR 格式时的流程
 
@@ -217,12 +239,13 @@ CI SDR: coded=1918x1036                          ← 走 8-bit CI SDR pipeline
 2. 在 `RendererStrategy` enum 新增 case,同时绑定三个维度(`pixelFormat10Bit` / `decoderPreference` / `rendererEntry(display:)` / `toneMapAlgorithm`)
 3. 在 `decideRendererStrategy` 的决策树里加分支
 4. 如有新元数据类型,在 `FrameMetadata` 加 struct,FFmpegVideoDecoder 提取
-5. EDRRenderer 的 `makeToneMapUniform` 加 `algorithm` 分支,shader `fs_main` 加对应 switch case
+5. EDRRenderer / ToneMapProcessor 的 `makeToneMapUniform` 加 `algorithm` 分支,两个 shader 的 `fs_main` 加对应 case
 6. 更新本文档的决策表
 
 ## 不做
 
 - DoVi Profile 7 BL+EL 双层软件解码(复杂,留后续)
+- RPU reshape 完整链(IPT 域 + NLQ,需集成 Rust libdovi;L2 trim 已用信号域近似,见上文精修一节)
 - AV1 HDR(等 AV1 decoder 接入后再加 case)
 - HDR Vivid(国内标准,等需求)
 - DisplayCapability 的实时 NSScreen 监听(初版硬编码 1000 nits target,后续接 `NSScreen.maximumExtendedDynamicRangeColorComponentValue`)
