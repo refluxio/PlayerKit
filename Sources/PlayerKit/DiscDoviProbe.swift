@@ -252,6 +252,7 @@ public enum DiscDoviProbe {
         guard !stream.isEmpty else { return "nal=no-pes-data" }
         var samples: [String] = []
         var count = 0
+        var histogram: [Int: Int] = [:]
         let s = stream.startIndex
         var i = s
         let end = stream.endIndex
@@ -263,6 +264,7 @@ public enum DiscDoviProbe {
             let nalStart = i + 3
             guard nalStart + 2 <= end else { break }
             let nalType = (Int(stream[nalStart]) >> 1) & 0x3F
+            histogram[nalType, default: 0] += 1
             if nalType == 62 {
                 count += 1
                 if count <= 2 {
@@ -274,7 +276,15 @@ public enum DiscDoviProbe {
             }
             i = nalStart
         }
-        return "nal62=\(count) \(samples.joined(separator: " "))"
+        // A healthy HEVC annexb reassembly shows VCL (0-31), VPS/SPS/PPS
+        // (32-34), SEI (39/40) — a broken PES header strip shows garbage
+        // types or almost nothing. Sorted most-common first.
+        let hist = histogram.sorted { $0.value > $1.value }
+            .prefix(10)
+            .map { "t\($0.key)=\($0.value)" }
+            .joined(separator: ",")
+        let head = stream.subdata(in: s..<min(s + 32, end)).map { String(format: "%02X", $0) }.joined(separator: " ")
+        return "nal62=\(count) hist=[\(hist)] head[\(head)] \(samples.joined(separator: " "))"
     }
 
     // MARK: - Section layer
