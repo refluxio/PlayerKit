@@ -10,9 +10,11 @@ import QuartzCore
 /// types into the open-source PlayerKit surface.
 public struct DolbyVisionFrameMetadata: Equatable, Sendable {
 
-    /// DoVi DM Level 1 — per-frame dynamic brightness, PQ-encoded 16-bit.
+    /// DoVi DM Level 1 — per-frame dynamic brightness.
+    /// RPU PQ codes are 12-bit; the parser left-aligns them (`<< 4`) into
+    /// these 16-bit fields so consumers can normalise by 65535 throughout.
     public struct Level1: Equatable, Sendable {
-        /// Minimum PQ luminance in the frame (0..65535 → 0..1 PQ).
+        /// Minimum PQ luminance in the frame (12-bit code, MSB-aligned).
         public var minPq: UInt16
         /// Maximum PQ luminance in the frame.
         public var maxPq: UInt16
@@ -23,6 +25,54 @@ public struct DolbyVisionFrameMetadata: Equatable, Sendable {
             self.minPq = minPq
             self.maxPq = maxPq
             self.avgPq = avgPq
+        }
+    }
+
+    /// DoVi DM Level 2/8 — per-target creative trim (lift/gain/gamma/saturation).
+    /// Raw RPU fields sit on a 12-bit grid around a 2048 midpoint; the trim
+    /// values here are pre-converted to their working units (midpoint 1.0 for
+    /// multiplicative fields, 0.0 for the additive offset), following the
+    /// libdovi XML round-trip convention.
+    public struct Level2: Equatable, Sendable {
+        /// Target display peak as a 12-bit PQ code (e.g. 2081 ≈ 100 nits).
+        public var targetMaxPq: UInt16
+        /// Multiplicative gain (midpoint 1.0). Encodes trim gain + lift jointly.
+        public var trimSlope: Float
+        /// Additive lift in signal domain (midpoint 0.0).
+        public var trimOffset: Float
+        /// Gamma exponent (midpoint 1.0; <1 lifts midtones).
+        public var trimPower: Float
+        /// Chroma-vs-luma cross weight (midpoint 1.0).
+        public var trimChromaWeight: Float
+        /// Saturation multiplier applied to chroma deviation from luma (midpoint 1.0).
+        public var trimSaturationGain: Float
+        /// Mid-tone weight, raw 13-bit signed scale (2048 = neutral, -1 = unset).
+        public var msWeight: Int16
+
+        public init(targetMaxPq: UInt16, trimSlope: Float, trimOffset: Float,
+                    trimPower: Float, trimChromaWeight: Float,
+                    trimSaturationGain: Float, msWeight: Int16) {
+            self.targetMaxPq = targetMaxPq
+            self.trimSlope = trimSlope
+            self.trimOffset = trimOffset
+            self.trimPower = trimPower
+            self.trimChromaWeight = trimChromaWeight
+            self.trimSaturationGain = trimSaturationGain
+            self.msWeight = msWeight
+        }
+    }
+
+    /// DoVi DM Level 3 — measured L1 offsets, additive in normalised PQ domain
+    /// (raw/2048 - 1, range [-1, 1), midpoint 0.0).
+    public struct Level3: Equatable, Sendable {
+        public var minPqOffset: Float
+        public var maxPqOffset: Float
+        public var avgPqOffset: Float
+
+        public init(minPqOffset: Float, maxPqOffset: Float, avgPqOffset: Float) {
+            self.minPqOffset = minPqOffset
+            self.maxPqOffset = maxPqOffset
+            self.avgPqOffset = avgPqOffset
         }
     }
 
@@ -47,6 +97,11 @@ public struct DolbyVisionFrameMetadata: Equatable, Sendable {
 
     /// Per-frame dynamic Level 1 metadata. nil if the RPU carried none.
     public var level1: Level1?
+    /// Creative trim (Level 2, or Level 8 targeting our display). nil if the
+    /// RPU carried neither.
+    public var level2: Level2?
+    /// Measured L1 offsets (Level 3). nil if the RPU carried none.
+    public var level3: Level3?
     /// Static Level 6 metadata. nil if the RPU carried none.
     public var level6: Level6?
     /// Dolby Vision profile (4/5/7/8). Sourced from stream-level DOVI_CONF.

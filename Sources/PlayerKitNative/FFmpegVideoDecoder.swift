@@ -436,9 +436,70 @@ final class FFmpegVideoDecoder {
         return nil
     }
 
+    // MARK: - DoVi DM block parsing (pure, unit-tested)
+
+    /// RPU PQ codes are 12-bit; left-align into the public 16-bit fields so
+    /// consumers can keep normalising by 65535.
+    static func parseDoviLevel1(_ l1: AVDOVIDmLevel1) -> DolbyVisionFrameMetadata.Level1 {
+        DolbyVisionFrameMetadata.Level1(
+            minPq: l1.min_pq << 4,
+            maxPq: l1.max_pq << 4,
+            avgPq: l1.avg_pq << 4
+        )
+    }
+
+    /// Creative trim from a Level 2 (or Level 8, same leading fields) DM
+    /// block. Raw values sit on a 12-bit grid around 2048; conversion
+    /// follows libdovi's XML round-trip:
+    ///   slope  = raw/2048       (multiplicative, midpoint 1.0)
+    ///   offset = raw/2048 - 1   (additive, midpoint 0.0)
+    ///   power  = raw/2048       (gamma exponent, midpoint 1.0)
+    ///   chroma / saturation = raw/2048 (midpoint 1.0)
+    static func parseDoviTrim(_ dm: AVDOVIDmData) -> DolbyVisionFrameMetadata.Level2? {
+        let scale: (UInt16) -> Float = { Float($0) / 2048.0 }
+        switch dm.level {
+        case 2:
+            return DolbyVisionFrameMetadata.Level2(
+                targetMaxPq: dm.l2.target_max_pq,
+                trimSlope: scale(dm.l2.trim_slope),
+                trimOffset: scale(dm.l2.trim_offset) - 1.0,
+                trimPower: scale(dm.l2.trim_power),
+                trimChromaWeight: scale(dm.l2.trim_chroma_weight),
+                trimSaturationGain: scale(dm.l2.trim_saturation_gain),
+                msWeight: dm.l2.ms_weight)
+        case 8:
+            // L8 has no target_max_pq field (it carries a target index
+            // instead); 0 marks it unset. ms_weight is unsigned 13-bit —
+            // values above 4095 are the negative half (libdovi wraps by 8192).
+            let msRaw = dm.l8.ms_weight
+            let ms = msRaw > 4095 ? Int16(msRaw) - 8192 : Int16(msRaw)
+            return DolbyVisionFrameMetadata.Level2(
+                targetMaxPq: 0,
+                trimSlope: scale(dm.l8.trim_slope),
+                trimOffset: scale(dm.l8.trim_offset) - 1.0,
+                trimPower: scale(dm.l8.trim_power),
+                trimChromaWeight: scale(dm.l8.trim_chroma_weight),
+                trimSaturationGain: scale(dm.l8.trim_saturation_gain),
+                msWeight: ms)
+        default:
+            return nil
+        }
+    }
+
+    /// Level 3 measured offsets, additive in normalised PQ domain:
+    /// raw/2048 - 1 (range [-1, 1), midpoint 0.0 = 2048).
+    static func parseDoviLevel3(_ dm: AVDOVIDmData) -> DolbyVisionFrameMetadata.Level3? {
+        guard dm.level == 3 else { return nil }
+        return DolbyVisionFrameMetadata.Level3(
+            minPqOffset: Float(dm.l3.min_pq_offset) / 2048.0 - 1.0,
+            maxPqOffset: Float(dm.l3.max_pq_offset) / 2048.0 - 1.0,
+            avgPqOffset: Float(dm.l3.avg_pq_offset) / 2048.0 - 1.0)
+    }
+
     /// Extract all per-frame HDR side data into a `FrameMetadata` value type.
-    /// Covers Dolby Vision (Level 1 + Level 6), HDR10+ bezier curve, SMPTE
-    /// ST 2086 mastering display, and CTA-861.3 content light level.
+    /// Covers Dolby Vision (Level 1 + Level 2/8 trim + Level 3 offsets +
+    /// Level 6), HDR10+ bezier curve, SMPTE ST 2086 mastering display, and
+    /// CTA-861.3 content light level.
     ///
     /// Stream-level DV profile / bl_signal_compatibility_id (from `doviConfig`)
     /// are merged in so downstream code sees a fully populated `DolbyVisionFrameMetadata`.
@@ -447,18 +508,24 @@ final class FFmpegVideoDecoder {
     private func extractFrameMetadata(from frame: UnsafeMutablePointer<AVFrame>) -> FrameMetadata {
         var meta = FrameMetadata()
 
-        // Dolby Vision: stream-level config (profile + bl_compat_id) + per-frame L1/L6.
+        // Dolby Vision: stream-level config (profile + bl_compat_id) + per-frame
+        // L1/L2/L3/L6.
         if let cfg = doviConfig {
             var dovi = cfg
             if let sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA),
                let data = sd.pointee.data {
                 let m = UnsafeRawPointer(data).assumingMemoryBound(to: AVDOVIMetadata.self)
                 if let dm = av_dovi_find_level(m, 1), dm.pointee.level == 1 {
-                    dovi.level1 = DolbyVisionFrameMetadata.Level1(
-                        minPq: dm.pointee.l1.min_pq,
-                        maxPq: dm.pointee.l1.max_pq,
-                        avgPq: dm.pointee.l1.avg_pq
-                    )
+                    dovi.level1 = FFmpegVideoDecoder.parseDoviLevel1(dm.pointee.l1)
+                }
+                // Creative trim: Level 8 (per-target, superset) wins over Level 2.
+                if let dm = av_dovi_find_level(m, 8), dm.pointee.level == 8 {
+                    dovi.level2 = FFmpegVideoDecoder.parseDoviTrim(dm.pointee)
+                } else if let dm = av_dovi_find_level(m, 2), dm.pointee.level == 2 {
+                    dovi.level2 = FFmpegVideoDecoder.parseDoviTrim(dm.pointee)
+                }
+                if let dm = av_dovi_find_level(m, 3), dm.pointee.level == 3 {
+                    dovi.level3 = FFmpegVideoDecoder.parseDoviLevel3(dm.pointee)
                 }
                 if let dm = av_dovi_find_level(m, 6), dm.pointee.level == 6 {
                     dovi.level6 = DolbyVisionFrameMetadata.Level6(
@@ -469,7 +536,7 @@ final class FFmpegVideoDecoder {
                     )
                 }
                 if decodedFrames <= 3 {
-                    logger.info("DV frame L1: \(dovi.level1.map { "min=\($0.minPq) max=\($0.maxPq) avg=\($0.avgPq)" } ?? "nil") L6: \(dovi.level6.map { "maxLum=\($0.maxLuminance) cll=\($0.maxCll)" } ?? "nil")")
+                    logger.info("DV frame L1: \(dovi.level1.map { "min=\($0.minPq) max=\($0.maxPq) avg=\($0.avgPq)" } ?? "nil") L2: \(dovi.level2.map { "slope=\($0.trimSlope) power=\($0.trimPower)" } ?? "nil") L3: \(dovi.level3.map { "max=\($0.maxPqOffset)" } ?? "nil") L6: \(dovi.level6.map { "maxLum=\($0.maxLuminance) cll=\($0.maxCll)" } ?? "nil")")
                 }
             }
             meta.dovi = dovi
