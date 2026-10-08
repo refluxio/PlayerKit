@@ -697,16 +697,16 @@ public final class NativeBackend: PlayerBackend {
             let codecName = cp.codec_id != AV_CODEC_ID_NONE
                 ? String(cString: avcodec_get_name(cp.codec_id)) : "?"
             logger.info("""
-            strategy decision: codec=\(codecName) \(cp.width)x\(cp.height) \
-            bits_per_raw=\(cp.bits_per_raw_sample) profile=\(cp.profile) \
-            trc=\(cp.color_trc.rawValue) matrix=\(cp.color_space.rawValue) range=\(cp.color_range.rawValue) \
-            → resolved(transfer=\(String(describing: cpParams.transfer)) matrix=\(String(describing: cpParams.matrix)) range=\(String(describing: cpParams.range))) \
-            isHEVC10Bit=\(isHEVC10Bit) \
-            isDoVi=\(demuxer.isDolbyVision) profile=\(demuxer.doviProfile) \
-            hasHDR10Plus=\(demuxer.hasHDR10Plus) \
-            sideData=\(demuxer.sideDataTypesDescription) \
-            displayEDR=\(self.displayCapability.supportsEDR) renderer10bit=\(self._renderer.prefersTenBit) \
-            → \(String(describing: strat))
+            strategy decision: codec=\(codecName, privacy: .public) \(cp.width, privacy: .public)x\(cp.height, privacy: .public) \
+            bits_per_raw=\(cp.bits_per_raw_sample, privacy: .public) profile=\(cp.profile, privacy: .public) \
+            trc=\(cp.color_trc.rawValue, privacy: .public) matrix=\(cp.color_space.rawValue, privacy: .public) range=\(cp.color_range.rawValue, privacy: .public) \
+            → resolved(transfer=\(String(describing: cpParams.transfer), privacy: .public) matrix=\(String(describing: cpParams.matrix), privacy: .public) range=\(String(describing: cpParams.range), privacy: .public)) \
+            isHEVC10Bit=\(isHEVC10Bit, privacy: .public) \
+            isDoVi=\(demuxer.isDolbyVision, privacy: .public) profile=\(demuxer.doviProfile, privacy: .public) \
+            hasHDR10Plus=\(demuxer.hasHDR10Plus, privacy: .public) \
+            sideData=\(demuxer.sideDataTypesDescription, privacy: .public) \
+            displayEDR=\(self.displayCapability.supportsEDR, privacy: .public) renderer10bit=\(self._renderer.prefersTenBit, privacy: .public) \
+            → \(String(describing: strat), privacy: .public)
             """)
         }
 
