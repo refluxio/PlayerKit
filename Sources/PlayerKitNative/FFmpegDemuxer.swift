@@ -173,6 +173,51 @@ final class FFmpegDemuxer: @unchecked Sendable {
         return false
     }
 
+    /// HDR-relevant stream attributes for `decideRendererStrategy`, built from
+    /// the video stream's codec parameters plus this demuxer's side-data
+    /// scanning. Single source of truth shared by `NativeBackend` and the HDR
+    /// corpus conformance tests — constructing these inline twice invites drift
+    /// between what production decides on and what tests assert against.
+    func videoStreamAttributes() -> VideoStreamAttributes? {
+        guard let vs = videoStream else { return nil }
+        let cp = vs.pointee.codecpar.pointee
+
+        var transfer = VideoColorParams.TransferFunc.sdr
+        switch cp.color_trc {
+        case AVCOL_TRC_SMPTE2084:    transfer = .pq
+        case AVCOL_TRC_ARIB_STD_B67: transfer = .hlg
+        default: break
+        }
+        var matrix = VideoColorParams.ColorMatrix.bt709
+        switch cp.color_space {
+        case AVCOL_SPC_BT2020_NCL, AVCOL_SPC_BT2020_CL: matrix = .bt2020
+        case AVCOL_SPC_BT470BG, AVCOL_SPC_SMPTE170M:    matrix = .bt601
+        default: break
+        }
+        let range: VideoColorParams.ColorRange = cp.color_range == AVCOL_RANGE_JPEG ? .full : .limited
+
+        // HEVC 10-bit evidence: bits_per_raw_sample == 10, or Main10/REXT
+        // profile (MKV remuxes often leave bits_per_raw_sample = 0).
+        let isHEVC = cp.codec_id == AV_CODEC_ID_HEVC
+        let isHEVC10BitByProfile = isHEVC
+            && (cp.profile == AV_PROFILE_HEVC_MAIN_10 || cp.profile == AV_PROFILE_HEVC_REXT)
+        let isHEVC10Bit = isHEVC && (cp.bits_per_raw_sample == 10 || isHEVC10BitByProfile)
+
+        return VideoStreamAttributes(
+            width: Int(cp.width),
+            height: Int(cp.height),
+            codecID: UInt32(cp.codec_id.rawValue),
+            colorMatrix: matrix,
+            transfer: transfer,
+            range: range,
+            isDolbyVision: isDolbyVision,
+            doviProfile: doviProfile,
+            blSignalCompatibilityId: doviBLSignalCompatibilityId,
+            hasHDR10Plus: hasHDR10Plus,
+            isHEVC10Bit: isHEVC10Bit
+        )
+    }
+
     /// True when the active audio stream carries Dolby Atmos metadata.
     /// - TrueHD: profile == AV_PROFILE_TRUEHD_ATMOS (30)
     /// - E-AC3: stream title contains "atmos" (case-insensitive) or channel count > 8

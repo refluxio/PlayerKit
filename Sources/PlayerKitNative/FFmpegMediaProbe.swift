@@ -36,15 +36,34 @@ public struct FFmpegMediaProbe: MediaProbable {
                         let codecName = String(cString: avcodec_get_name(cp.codec_id))
                         let fr = stream.pointee.avg_frame_rate
                         let frameRate = fr.den > 0 ? Double(fr.num) / Double(fr.den) : 0
+                        // HDR recognition: transfer characteristic + DV/HDR10+ side
+                        // data from the demuxer's scan (was hardcoded `false` —
+                        // the client-side quick pre-check relied on nothing).
+                        let isPQ = cp.color_trc == AVCOL_TRC_SMPTE2084
+                        let isHLG = cp.color_trc == AVCOL_TRC_ARIB_STD_B67
+                        let isVideoStream = stream.pointee.index == demuxer.videoStreamIndex
+                        let isThisStreamDoVi = demuxer.isDolbyVision && isVideoStream
+                        let thisStreamHDR10Plus = demuxer.hasHDR10Plus && isVideoStream
+                        let isHDR = isPQ || isHLG || isThisStreamDoVi
+                        let hdrFormat: String? = {
+                            if isThisStreamDoVi { return "dolbyVision" }
+                            if thisStreamHDR10Plus { return "hdr10+" }
+                            if isPQ { return "hdr10" }
+                            if isHLG { return "hlg" }
+                            return nil
+                        }()
+                        let colorTransfer: String? = cp.color_trc == AVCOL_TRC_UNSPECIFIED
+                            ? nil
+                            : av_color_transfer_name(cp.color_trc).map { String(cString: $0) }
                         videoStreams.append(VideoStreamInfo(
                             index: Int(stream.pointee.index),
                             codec: codecName,
                             width: Int(cp.width),
                             height: Int(cp.height),
                             frameRate: frameRate,
-                            isHDR: false,
-                            hdrFormat: nil,
-                            colorTransfer: nil
+                            isHDR: isHDR,
+                            hdrFormat: hdrFormat,
+                            colorTransfer: colorTransfer
                         ))
 
                     case AVMEDIA_TYPE_AUDIO:

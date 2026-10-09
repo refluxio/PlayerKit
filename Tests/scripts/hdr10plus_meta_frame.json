@@ -1,0 +1,27 @@
+{
+  "JSONInfo": { "HDR10plusProfile": "B", "Version": "1.0" },
+  "SceneInfoSummary": { "SceneFirstFrameIndex": [0], "SceneFrameNumbers": [24] },
+  "ToolInfo": { "Tool": "generate_corpus.sh", "Version": "1.0" },
+  "SceneInfo": [
+    {
+      "NumberOfWindows": 1,
+      "TargetedSystemDisplayMaximumLuminance": 1000,
+      "SceneId": 0,
+      "SceneFrameIndex": 0,
+      "SequenceFrameIndex": 0,
+      "LuminanceParameters": {
+        "AverageRGB": 100,
+        "MaxScl": [800, 700, 600],
+        "LuminanceDistributions": {
+          "DistributionIndex": [1, 5, 10, 25, 50, 75, 90, 95, 99],
+          "DistributionValues": [0, 50, 100, 200, 400, 600, 700, 750, 800]
+        }
+      },
+      "BezierCurveData": {
+        "Anchors": [256, 512, 768, 256, 512, 768, 256, 512, 768],
+        "KneePointX": 2048,
+        "KneePointY": 2048
+      }
+    }
+  ]
+}

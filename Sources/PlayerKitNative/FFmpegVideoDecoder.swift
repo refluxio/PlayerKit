@@ -496,6 +496,17 @@ final class FFmpegVideoDecoder {
             avgPqOffset: Float(dm.l3.avg_pq_offset) / 2048.0 - 1.0)
     }
 
+    /// Level 6 static HDR10-compatible metadata. Raw fields are already in
+    /// display units (nits / 0.0001 nits) — no 2048 rescale, unlike trims.
+    static func parseDoviLevel6(_ dm: AVDOVIDmData) -> DolbyVisionFrameMetadata.Level6? {
+        guard dm.level == 6 else { return nil }
+        return DolbyVisionFrameMetadata.Level6(
+            maxLuminance: dm.l6.max_luminance,
+            minLuminance: dm.l6.min_luminance,
+            maxCll: dm.l6.max_cll,
+            maxFall: dm.l6.max_fall)
+    }
+
     /// Extract all per-frame HDR side data into a `FrameMetadata` value type.
     /// Covers Dolby Vision (Level 1 + Level 2/8 trim + Level 3 offsets +
     /// Level 6), HDR10+ bezier curve, SMPTE ST 2086 mastering display, and
@@ -528,12 +539,7 @@ final class FFmpegVideoDecoder {
                     dovi.level3 = FFmpegVideoDecoder.parseDoviLevel3(dm.pointee)
                 }
                 if let dm = av_dovi_find_level(m, 6), dm.pointee.level == 6 {
-                    dovi.level6 = DolbyVisionFrameMetadata.Level6(
-                        maxLuminance: dm.pointee.l6.max_luminance,
-                        minLuminance: dm.pointee.l6.min_luminance,
-                        maxCll:       dm.pointee.l6.max_cll,
-                        maxFall:      dm.pointee.l6.max_fall
-                    )
+                    dovi.level6 = FFmpegVideoDecoder.parseDoviLevel6(dm.pointee)
                 }
                 if decodedFrames <= 3 {
                     logger.info("DV frame L1: \(dovi.level1.map { "min=\($0.minPq) max=\($0.maxPq) avg=\($0.avgPq)" } ?? "nil") L2: \(dovi.level2.map { "slope=\($0.trimSlope) power=\($0.trimPower)" } ?? "nil") L3: \(dovi.level3.map { "max=\($0.maxPqOffset)" } ?? "nil") L6: \(dovi.level6.map { "maxLum=\($0.maxLuminance) cll=\($0.maxCll)" } ?? "nil")")
@@ -576,6 +582,11 @@ final class FFmpegVideoDecoder {
     ///   - maxLuminance: cd/m², 0..10000 (truncated)
     ///   - minLuminance: 0.0001 cd/m² steps (multiply AVRational by 10000)
     /// Primaries are stored as 0.00002-increment UInt16 (AVRational * 50000).
+    ///
+    /// Index order: ffmpeg's `AVMasteringDisplayMetadata.display_primaries` is
+    /// documented "(r, g, b)" ([0]=R, [1]=G, [2]=B — verified against the
+    /// corpus: x265-authored R(34000,16000) lands in [0]), while
+    /// `FrameMetadata.primaries` is documented G, B, R — remap accordingly.
     private func masteringDisplayMetadata(from md: AVMasteringDisplayMetadata) -> MasteringDisplayMetadata {
         func toUInt16(_ r: AVRational, scale: Int) -> UInt16 {
             let den = r.den == 0 ? 1 : Int(r.den)
@@ -592,9 +603,9 @@ final class FFmpegVideoDecoder {
             maxLuminance: UInt16(clamping: maxLum),
             minLuminance: minLum,
             primaries: (
-                toUInt16(p.0.0, scale: 50000), toUInt16(p.0.1, scale: 50000),
-                toUInt16(p.1.0, scale: 50000), toUInt16(p.1.1, scale: 50000),
-                toUInt16(p.2.0, scale: 50000), toUInt16(p.2.1, scale: 50000),
+                toUInt16(p.1.0, scale: 50000), toUInt16(p.1.1, scale: 50000),  // G — ffmpeg [1]
+                toUInt16(p.2.0, scale: 50000), toUInt16(p.2.1, scale: 50000),  // B — ffmpeg [2]
+                toUInt16(p.0.0, scale: 50000), toUInt16(p.0.1, scale: 50000),  // R — ffmpeg [0]
                 md.has_primaries != 0 ? toUInt16(wp.0, scale: 50000) : 15635,
                 md.has_primaries != 0 ? toUInt16(wp.1, scale: 50000) : 16450
             )

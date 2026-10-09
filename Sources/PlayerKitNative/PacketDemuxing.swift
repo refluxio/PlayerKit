@@ -1,5 +1,6 @@
 import Foundation
 import CFFmpeg
+import PlayerKit
 
 /// The demux-surface `NativeBackend`'s demux loop and stream-metadata reads
 /// need. Implemented by `FFmpegDemuxer` (single file / concat list) and
@@ -30,6 +31,9 @@ protocol PacketDemuxing: AnyObject, Sendable {
     var doviProfile: UInt8 { get }
     var doviBLSignalCompatibilityId: UInt8 { get }
     var hasHDR10Plus: Bool { get }
+    /// HDR-relevant stream attributes for the renderer strategy decision
+    /// (`decideRendererStrategy`). nil when there is no active video stream.
+    func videoStreamAttributes() -> VideoStreamAttributes?
     /// Diagnostics: comma-separated side data type names on the video codecpar.
     var sideDataTypesDescription: String { get }
     var audioIsAtmos: Bool { get }

@@ -693,33 +693,17 @@ public final class NativeBackend: PlayerBackend {
             }
 
             // Resolve the renderer strategy from stream attributes + display
-            // capability + renderer's 10-bit preference. DoVi profile and HDR10+
-            // presence come from the demuxer (side-data scanning at open time);
-            // matrix/transfer/range mirror the per-frame `colorParams` snapshot.
-            // Detect HEVC 10-bit for unmarked-HDR10 fallback. MKV containers
-            // often leave bits_per_raw_sample = 0 on older remuxes (verified on
-            // a 1918x1036 HEVC remux that reported bits_per_raw=0 but is PQ),
-            // so we also accept HEVC Main10 / REXT profile as 10-bit evidence —
-            // matches the fallback in VTVideoDecoder.init.
-            let isHEVC = cp.codec_id == AV_CODEC_ID_HEVC
-            let isHEVC10BitByProfile = isHEVC
-                && (cp.profile == AV_PROFILE_HEVC_MAIN_10
-                    || cp.profile == AV_PROFILE_HEVC_REXT)
-            let isHEVC10Bit = isHEVC
-                && (cp.bits_per_raw_sample == 10 || isHEVC10BitByProfile)
-            let attrs = VideoStreamAttributes(
-                width: Int(cp.width),
-                height: Int(cp.height),
-                codecID: UInt32(cp.codec_id.rawValue),
-                colorMatrix: cpParams.matrix,
-                transfer: cpParams.transfer,
-                range: cpParams.range,
-                isDolbyVision: demuxer.isDolbyVision,
-                doviProfile: demuxer.doviProfile,
-                blSignalCompatibilityId: demuxer.doviBLSignalCompatibilityId,
-                hasHDR10Plus: demuxer.hasHDR10Plus,
-                isHEVC10Bit: isHEVC10Bit
-            )
+            // capability + renderer's 10-bit preference. Stream attributes
+            // (matrix/transfer/range, HEVC 10-bit evidence, DoVi, HDR10+) all
+            // come from the demuxer's single-source videoStreamAttributes() —
+            // shared verbatim with the HDR corpus conformance tests so tests
+            // decide strategies against exactly what production decides on.
+            // This open path is synchronous (can't throw); nil attrs is
+            // unreachable inside `if let vs = demuxer.videoStream`, so the
+            // all-defaults SDR fallback only satisfies the type checker.
+            let attrs = demuxer.videoStreamAttributes()
+                ?? VideoStreamAttributes(width: 0, height: 0, codecID: 0,
+                                         colorMatrix: .bt709, transfer: .sdr, range: .limited)
             let strat = decideRendererStrategy(
                 stream: attrs,
                 prefersTenBit: _renderer.prefersTenBit,
@@ -746,7 +730,7 @@ public final class NativeBackend: PlayerBackend {
             bits_per_raw=\(cp.bits_per_raw_sample, privacy: .public) profile=\(cp.profile, privacy: .public) \
             trc=\(cp.color_trc.rawValue, privacy: .public) matrix=\(cp.color_space.rawValue, privacy: .public) range=\(cp.color_range.rawValue, privacy: .public) \
             → resolved(transfer=\(String(describing: cpParams.transfer), privacy: .public) matrix=\(String(describing: cpParams.matrix), privacy: .public) range=\(String(describing: cpParams.range), privacy: .public)) \
-            isHEVC10Bit=\(isHEVC10Bit, privacy: .public) \
+            isHEVC10Bit=\(attrs.isHEVC10Bit, privacy: .public) \
             isDoVi=\(demuxer.isDolbyVision, privacy: .public) profile=\(demuxer.doviProfile, privacy: .public) \
             hasHDR10Plus=\(demuxer.hasHDR10Plus, privacy: .public) \
             sideData=\(demuxer.sideDataTypesDescription, privacy: .public) \

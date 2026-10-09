@@ -120,4 +120,46 @@ final class DoviTrimParseTests: XCTestCase {
         dm.level = 1
         XCTAssertNil(FFmpegVideoDecoder.parseDoviLevel3(dm))
     }
+
+    // MARK: - Level 6(静态 HDR10 兼容元数据,nits 原样透传)
+
+    func testLevel6PassesStaticNitsThrough() {
+        var dm = AVDOVIDmData()
+        dm.level = 6
+        dm.l6.max_luminance = 1000
+        dm.l6.min_luminance = 1
+        dm.l6.max_cll = 1000
+        dm.l6.max_fall = 400
+        let l6 = FFmpegVideoDecoder.parseDoviLevel6(dm)
+        XCTAssertEqual(l6?.maxLuminance, 1000)
+        XCTAssertEqual(l6?.minLuminance, 1)
+        XCTAssertEqual(l6?.maxCll, 1000)
+        XCTAssertEqual(l6?.maxFall, 400)
+    }
+
+    func testLevel6IgnoresOtherLevels() {
+        var dm = AVDOVIDmData()
+        dm.level = 1
+        dm.l1.min_pq = 0; dm.l1.max_pq = 2081; dm.l1.avg_pq = 1000
+        XCTAssertNil(FFmpegVideoDecoder.parseDoviLevel6(dm))
+    }
+
+    // MARK: - L8 ms_weight 负值回绕(libdovi 语义:>4095 为负半区,按 8192 回绕)
+
+    func testLevel8NegativeMsWeightWraps() {
+        var dm = AVDOVIDmData()
+        dm.level = 8
+        dm.l8.trim_slope = 2048; dm.l8.trim_offset = 2048; dm.l8.trim_power = 2048
+        dm.l8.trim_chroma_weight = 2048; dm.l8.trim_saturation_gain = 2048
+        dm.l8.ms_weight = 8192 - 512   // 原始编码 → 语义值 -512
+        let trim = FFmpegVideoDecoder.parseDoviTrim(dm)
+        XCTAssertEqual(trim?.msWeight, -512)
+    }
+
+    func testLevel8PositiveMsWeightPassesThrough() {
+        var dm = AVDOVIDmData()
+        dm.level = 8
+        dm.l8.ms_weight = 1000
+        XCTAssertEqual(FFmpegVideoDecoder.parseDoviTrim(dm)?.msWeight, 1000)
+    }
 }
