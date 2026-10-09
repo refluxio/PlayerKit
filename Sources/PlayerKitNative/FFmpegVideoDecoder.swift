@@ -341,18 +341,30 @@ final class FFmpegVideoDecoder {
         return pb
     }
 
-    /// Pack Y plane: width × height samples, 3 × 10-bit → one UInt32 LE.
+    /// Pack Y plane: one 10-bit sample per UInt16, MSB-aligned (<< 6).
+    ///
+    /// kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange stores each 10-bit
+    /// sample MSB-aligned in its own 16-bit word — that is the format contract
+    /// every consumer follows (CVMetalTextureCache binds the planes as
+    /// .r16Unorm/.rg16Unorm, CoreImage reads the same). The previous packing
+    /// here was v210-style (3 samples per UInt32), which every consumer read
+    /// as garbage: luma aliased and chroma scrambled into wrong hues. Caught
+    /// by the HDR golden-image harness (Task 10) rendering FFmpeg-SW-decoded
+    /// HDR frames through the Metal tone-map pipeline.
     private static func pack10BitPlane(src: UnsafeMutablePointer<UInt8>!, srcStride: Int,
                                         dst: UnsafeMutableRawPointer, dstStride: Int,
                                         width: Int, height: Int) {
         for y in 0..<height {
             let srcRow = src.advanced(by: y * srcStride)
-            let dstRow = dst.advanced(by: y * dstStride).assumingMemoryBound(to: UInt32.self)
-            pack10BitRow(srcRow: srcRow, dstRow: dstRow, count: width)
+            let dstRow = dst.advanced(by: y * dstStride).assumingMemoryBound(to: UInt16.self)
+            for x in 0..<width {
+                dstRow[x] = UInt16(readU16LE(srcRow, offset: x * 2) & 0x3FF) << 6
+            }
         }
     }
 
-    /// Pack UV plane: interleave U and V, then pack 3 × 10-bit → one UInt32 LE.
+    /// Pack UV plane: interleave U,V as separate UInt16 samples, MSB-aligned
+    /// (<< 6) per the 420v contract (CbCr plane = 2 UInt16 per chroma sample).
     private static func pack10BitUVPlane(srcU: UnsafeMutablePointer<UInt8>!, srcV: UnsafeMutablePointer<UInt8>!,
                                           srcStrideU: Int, srcStrideV: Int,
                                           dst: UnsafeMutableRawPointer, dstStride: Int,
@@ -360,52 +372,19 @@ final class FFmpegVideoDecoder {
         for y in 0..<height {
             let uRow = srcU.advanced(by: y * srcStrideU)
             let vRow = srcV.advanced(by: y * srcStrideV)
-            let dstRow = dst.advanced(by: y * dstStride).assumingMemoryBound(to: UInt32.self)
-
-            // Build interleaved sample stream: U[0], V[0], U[1], V[1], ...
-            var samples = [UInt32]()
-            samples.reserveCapacity(uvWidth * 2)
+            let dstRow = dst.advanced(by: y * dstStride).assumingMemoryBound(to: UInt16.self)
             for i in 0..<uvWidth {
-                samples.append(UInt32(Self.readU16LE(uRow, offset: i * 2)) & 0x3FF)
-                samples.append(UInt32(Self.readU16LE(vRow, offset: i * 2)) & 0x3FF)
-            }
-            while samples.count % 3 != 0 { samples.append(0) }
-
-            var di = 0
-            for ri in stride(from: 0, to: samples.count, by: 3) {
-                dstRow[di] = samples[ri] | (samples[ri + 1] << 10) | (samples[ri + 2] << 20)
-                di += 1
+                dstRow[i * 2]     = UInt16(readU16LE(uRow, offset: i * 2) & 0x3FF) << 6
+                dstRow[i * 2 + 1] = UInt16(readU16LE(vRow, offset: i * 2) & 0x3FF) << 6
             }
         }
     }
 
     /// Read a UInt16 LE from an UnsafeMutablePointer<UInt8> at the given byte offset.
+    /// (YUV420P10LE is little-endian; the BE variant would need a byte swap —
+    /// not handled here, matching the pre-fix scope.)
     private static func readU16LE(_ ptr: UnsafeMutablePointer<UInt8>, offset: Int) -> UInt16 {
         UnsafeRawPointer(ptr).load(fromByteOffset: offset, as: UInt16.self)
-    }
-
-    /// Pack `count` 10-bit samples (UInt16 LE, low 10 bits) into UInt32 LE words (3 per word).
-    private static func pack10BitRow(srcRow: UnsafeMutablePointer<UInt8>,
-                                      dstRow: UnsafeMutablePointer<UInt32>,
-                                      count: Int) {
-        var si = 0, di = 0
-        while si + 2 < count {
-            let s0 = UInt32(readU16LE(srcRow, offset: si * 2)) & 0x3FF; si += 1
-            let s1 = UInt32(readU16LE(srcRow, offset: si * 2)) & 0x3FF; si += 1
-            let s2 = UInt32(readU16LE(srcRow, offset: si * 2)) & 0x3FF; si += 1
-            dstRow[di] = s0 | (s1 << 10) | (s2 << 20)
-            di += 1
-        }
-        // Remainder (1–2 samples) — pad with zero
-        if si < count {
-            var rem = [UInt32]()
-            while si < count {
-                rem.append(UInt32(readU16LE(srcRow, offset: si * 2)) & 0x3FF)
-                si += 1
-            }
-            while rem.count < 3 { rem.append(0) }
-            dstRow[di] = rem[0] | (rem[1] << 10) | (rem[2] << 20)
-        }
     }
 
     func flush() {
