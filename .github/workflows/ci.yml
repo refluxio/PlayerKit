@@ -69,8 +69,10 @@ jobs:
             --output-dir .build/docs \
             --fallback-display-name PlayerKit \
             --fallback-bundle-identifier io.reflex.PlayerKit
+      - name: Package docs archive
+        run: tar -czf PlayerKit-docs.tar.gz -C .build docs
       - name: Upload docs artifact
         uses: actions/upload-artifact@v4
         with:
           name: PlayerKit-docs
-          path: .build/docs
+          path: PlayerKit-docs.tar.gz
