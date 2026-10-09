@@ -1,0 +1,263 @@
+{
+  "cells": [
+    {
+      "file": "c1_sdr_bt709.mp4",
+      "cell": "SDR_bt709",
+      "synthetic": true,
+      "realCorpus": null,
+      "ffprobe": {
+        "codec": "hevc",
+        "trc": "bt709",
+        "primaries": "bt709",
+        "matrix": "bt709",
+        "dv_profile": 0,
+        "dv_rpu_present": false,
+        "dv_el_present": false,
+        "dv_bl_signal_compatibility_id": 0,
+        "hdr10plus": false
+      },
+      "expected": {
+        "strategyEDR": "sdr8Bit(bt709)",
+        "strategySDR": "sdr8Bit(bt709)",
+        "isDoVi": false,
+        "doviProfile": 0,
+        "hasHDR10Plus": false,
+        "blSignalCompatibilityId": 0
+      },
+      "discDovi": null
+    },
+    {
+      "file": "c2_hdr10.mp4",
+      "cell": "HDR10",
+      "synthetic": true,
+      "realCorpus": null,
+      "ffprobe": {
+        "codec": "hevc",
+        "trc": "smpte2084",
+        "primaries": "bt2020",
+        "matrix": "bt2020nc",
+        "dv_profile": 0,
+        "dv_rpu_present": false,
+        "dv_el_present": false,
+        "dv_bl_signal_compatibility_id": 0,
+        "hdr10plus": false
+      },
+      "expected": {
+        "strategyEDR": "hdr10Static(1000)",
+        "strategySDR": "hdr10Static(1000)",
+        "isDoVi": false,
+        "doviProfile": 0,
+        "hasHDR10Plus": false,
+        "blSignalCompatibilityId": 0
+      },
+      "discDovi": null
+    },
+    {
+      "file": "c3_hdr10plus.mp4",
+      "cell": "HDR10+",
+      "synthetic": true,
+      "realCorpus": null,
+      "ffprobe": {
+        "codec": "hevc",
+        "trc": "smpte2084",
+        "primaries": "bt2020",
+        "matrix": "bt2020nc",
+        "dv_profile": 0,
+        "dv_rpu_present": false,
+        "dv_el_present": false,
+        "dv_bl_signal_compatibility_id": 0,
+        "hdr10plus": true
+      },
+      "expected": {
+        "strategyEDR": "hdr10Plus",
+        "strategySDR": "hdr10Static(1000)",
+        "isDoVi": false,
+        "doviProfile": 0,
+        "hasHDR10Plus": true,
+        "blSignalCompatibilityId": 0
+      },
+      "discDovi": null
+    },
+    {
+      "file": "c4_hlg.mp4",
+      "cell": "HLG",
+      "synthetic": true,
+      "realCorpus": null,
+      "ffprobe": {
+        "codec": "hevc",
+        "trc": "arib-std-b67",
+        "primaries": "bt2020",
+        "matrix": "bt2020nc",
+        "dv_profile": 0,
+        "dv_rpu_present": false,
+        "dv_el_present": false,
+        "dv_bl_signal_compatibility_id": 0,
+        "hdr10plus": false
+      },
+      "expected": {
+        "strategyEDR": "hlgOOTF",
+        "strategySDR": "hdr10Static(1000)",
+        "isDoVi": false,
+        "doviProfile": 0,
+        "hasHDR10Plus": false,
+        "blSignalCompatibilityId": 0
+      },
+      "discDovi": null
+    },
+    {
+      "file": "c5_dv_p81.mp4",
+      "cell": "DV_P8.1",
+      "synthetic": true,
+      "realCorpus": null,
+      "ffprobe": {
+        "codec": "hevc",
+        "trc": "smpte2084",
+        "primaries": "bt2020",
+        "matrix": "bt2020nc",
+        "dv_profile": 8,
+        "dv_rpu_present": true,
+        "dv_el_present": false,
+        "dv_bl_signal_compatibility_id": 1,
+        "hdr10plus": false
+      },
+      "expected": {
+        "strategyEDR": "doviProfile8(false)",
+        "strategySDR": "degradedHDR10",
+        "isDoVi": true,
+        "doviProfile": 8,
+        "hasHDR10Plus": false,
+        "blSignalCompatibilityId": 1
+      },
+      "discDovi": null
+    },
+    {
+      "file": "c9_dv_ts.ts",
+      "cell": "DV_TS",
+      "synthetic": true,
+      "realCorpus": null,
+      "ffprobe": {
+        "codec": "hevc",
+        "trc": "smpte2084",
+        "primaries": "bt2020",
+        "matrix": "bt2020nc",
+        "dv_profile": 0,
+        "dv_rpu_present": false,
+        "dv_el_present": false,
+        "dv_bl_signal_compatibility_id": 0,
+        "hdr10plus": false
+      },
+      "expected": {
+        "strategyEDR": "doviProfile8(false)",
+        "strategySDR": "degradedHDR10",
+        "isDoVi": true,
+        "doviProfile": 8,
+        "hasHDR10Plus": false,
+        "blSignalCompatibilityId": 1
+      },
+      "discDovi": {
+        "profile": 8,
+        "rpu": true,
+        "el": false,
+        "bl": true,
+        "compatId": 1
+      },
+      "note": "ffmpeg 8.x mpegts muxer 不写 DOVI registration descriptor(mpegts demuxer 可解析),故 ffprobe 段无 DOVI 字段是工具限制的实测记录;TS 内 RPU NAL 完整保留,DOVI 断言由 Task 4 的 reader 注入路径承担"
+    },
+    {
+      "file": "",
+      "cell": "DV_P5",
+      "synthetic": false,
+      "realCorpus": {
+        "subdir": "c6_dv_p5",
+        "patterns": [
+          "*.mkv",
+          "*.mp4",
+          "*.ts",
+          "*.m2ts"
+        ]
+      },
+      "ffprobe": null,
+      "expected": {
+        "strategyEDR": "doviProfile5",
+        "strategySDR": "degradedHDR10",
+        "isDoVi": true,
+        "doviProfile": 5,
+        "hasHDR10Plus": false,
+        "blSignalCompatibilityId": 0
+      },
+      "discDovi": null
+    },
+    {
+      "file": "",
+      "cell": "DV_P7_full",
+      "synthetic": false,
+      "realCorpus": {
+        "subdir": "c7_dv_p7_full",
+        "patterns": [
+          "*.mkv",
+          "*.ts",
+          "*.m2ts"
+        ]
+      },
+      "ffprobe": null,
+      "expected": {
+        "strategyEDR": "degradedHDR10",
+        "strategySDR": "degradedHDR10",
+        "isDoVi": true,
+        "doviProfile": 7,
+        "hasHDR10Plus": false,
+        "blSignalCompatibilityId": 0
+      },
+      "discDovi": {
+        "profile": 7,
+        "rpu": true,
+        "el": true,
+        "bl": true,
+        "compatId": 0
+      }
+    },
+    {
+      "file": "",
+      "cell": "HDR10_disc_noDV",
+      "synthetic": false,
+      "realCorpus": {
+        "subdir": "c8_avengers_hdr10_disc",
+        "patterns": [
+          "*.m2ts",
+          "*.ts"
+        ]
+      },
+      "ffprobe": null,
+      "expected": {
+        "strategyEDR": "hdr10Static(1000)",
+        "strategySDR": "hdr10Static(1000)",
+        "isDoVi": false,
+        "doviProfile": 0,
+        "hasHDR10Plus": false,
+        "blSignalCompatibilityId": 0
+      },
+      "discDovi": null
+    },
+    {
+      "file": "",
+      "cell": "DV_ISO",
+      "synthetic": false,
+      "realCorpus": {
+        "subdir": "c10_dv_iso",
+        "patterns": [
+          "*.iso"
+        ]
+      },
+      "ffprobe": null,
+      "expected": {
+        "strategyEDR": "degradedHDR10",
+        "strategySDR": "degradedHDR10",
+        "isDoVi": true,
+        "doviProfile": 7,
+        "hasHDR10Plus": false,
+        "blSignalCompatibilityId": 0
+      },
+      "discDovi": null
+    }
+  ]
+}

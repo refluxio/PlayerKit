@@ -341,18 +341,30 @@ final class FFmpegVideoDecoder {
         return pb
     }
 
-    /// Pack Y plane: width × height samples, 3 × 10-bit → one UInt32 LE.
+    /// Pack Y plane: one 10-bit sample per UInt16, MSB-aligned (<< 6).
+    ///
+    /// kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange stores each 10-bit
+    /// sample MSB-aligned in its own 16-bit word — that is the format contract
+    /// every consumer follows (CVMetalTextureCache binds the planes as
+    /// .r16Unorm/.rg16Unorm, CoreImage reads the same). The previous packing
+    /// here was v210-style (3 samples per UInt32), which every consumer read
+    /// as garbage: luma aliased and chroma scrambled into wrong hues. Caught
+    /// by the HDR golden-image harness (Task 10) rendering FFmpeg-SW-decoded
+    /// HDR frames through the Metal tone-map pipeline.
     private static func pack10BitPlane(src: UnsafeMutablePointer<UInt8>!, srcStride: Int,
                                         dst: UnsafeMutableRawPointer, dstStride: Int,
                                         width: Int, height: Int) {
         for y in 0..<height {
             let srcRow = src.advanced(by: y * srcStride)
-            let dstRow = dst.advanced(by: y * dstStride).assumingMemoryBound(to: UInt32.self)
-            pack10BitRow(srcRow: srcRow, dstRow: dstRow, count: width)
+            let dstRow = dst.advanced(by: y * dstStride).assumingMemoryBound(to: UInt16.self)
+            for x in 0..<width {
+                dstRow[x] = UInt16(readU16LE(srcRow, offset: x * 2) & 0x3FF) << 6
+            }
         }
     }
 
-    /// Pack UV plane: interleave U and V, then pack 3 × 10-bit → one UInt32 LE.
+    /// Pack UV plane: interleave U,V as separate UInt16 samples, MSB-aligned
+    /// (<< 6) per the 420v contract (CbCr plane = 2 UInt16 per chroma sample).
     private static func pack10BitUVPlane(srcU: UnsafeMutablePointer<UInt8>!, srcV: UnsafeMutablePointer<UInt8>!,
                                           srcStrideU: Int, srcStrideV: Int,
                                           dst: UnsafeMutableRawPointer, dstStride: Int,
@@ -360,52 +372,19 @@ final class FFmpegVideoDecoder {
         for y in 0..<height {
             let uRow = srcU.advanced(by: y * srcStrideU)
             let vRow = srcV.advanced(by: y * srcStrideV)
-            let dstRow = dst.advanced(by: y * dstStride).assumingMemoryBound(to: UInt32.self)
-
-            // Build interleaved sample stream: U[0], V[0], U[1], V[1], ...
-            var samples = [UInt32]()
-            samples.reserveCapacity(uvWidth * 2)
+            let dstRow = dst.advanced(by: y * dstStride).assumingMemoryBound(to: UInt16.self)
             for i in 0..<uvWidth {
-                samples.append(UInt32(Self.readU16LE(uRow, offset: i * 2)) & 0x3FF)
-                samples.append(UInt32(Self.readU16LE(vRow, offset: i * 2)) & 0x3FF)
-            }
-            while samples.count % 3 != 0 { samples.append(0) }
-
-            var di = 0
-            for ri in stride(from: 0, to: samples.count, by: 3) {
-                dstRow[di] = samples[ri] | (samples[ri + 1] << 10) | (samples[ri + 2] << 20)
-                di += 1
+                dstRow[i * 2]     = UInt16(readU16LE(uRow, offset: i * 2) & 0x3FF) << 6
+                dstRow[i * 2 + 1] = UInt16(readU16LE(vRow, offset: i * 2) & 0x3FF) << 6
             }
         }
     }
 
     /// Read a UInt16 LE from an UnsafeMutablePointer<UInt8> at the given byte offset.
+    /// (YUV420P10LE is little-endian; the BE variant would need a byte swap —
+    /// not handled here, matching the pre-fix scope.)
     private static func readU16LE(_ ptr: UnsafeMutablePointer<UInt8>, offset: Int) -> UInt16 {
         UnsafeRawPointer(ptr).load(fromByteOffset: offset, as: UInt16.self)
-    }
-
-    /// Pack `count` 10-bit samples (UInt16 LE, low 10 bits) into UInt32 LE words (3 per word).
-    private static func pack10BitRow(srcRow: UnsafeMutablePointer<UInt8>,
-                                      dstRow: UnsafeMutablePointer<UInt32>,
-                                      count: Int) {
-        var si = 0, di = 0
-        while si + 2 < count {
-            let s0 = UInt32(readU16LE(srcRow, offset: si * 2)) & 0x3FF; si += 1
-            let s1 = UInt32(readU16LE(srcRow, offset: si * 2)) & 0x3FF; si += 1
-            let s2 = UInt32(readU16LE(srcRow, offset: si * 2)) & 0x3FF; si += 1
-            dstRow[di] = s0 | (s1 << 10) | (s2 << 20)
-            di += 1
-        }
-        // Remainder (1–2 samples) — pad with zero
-        if si < count {
-            var rem = [UInt32]()
-            while si < count {
-                rem.append(UInt32(readU16LE(srcRow, offset: si * 2)) & 0x3FF)
-                si += 1
-            }
-            while rem.count < 3 { rem.append(0) }
-            dstRow[di] = rem[0] | (rem[1] << 10) | (rem[2] << 20)
-        }
     }
 
     func flush() {
@@ -496,6 +475,17 @@ final class FFmpegVideoDecoder {
             avgPqOffset: Float(dm.l3.avg_pq_offset) / 2048.0 - 1.0)
     }
 
+    /// Level 6 static HDR10-compatible metadata. Raw fields are already in
+    /// display units (nits / 0.0001 nits) — no 2048 rescale, unlike trims.
+    static func parseDoviLevel6(_ dm: AVDOVIDmData) -> DolbyVisionFrameMetadata.Level6? {
+        guard dm.level == 6 else { return nil }
+        return DolbyVisionFrameMetadata.Level6(
+            maxLuminance: dm.l6.max_luminance,
+            minLuminance: dm.l6.min_luminance,
+            maxCll: dm.l6.max_cll,
+            maxFall: dm.l6.max_fall)
+    }
+
     /// Extract all per-frame HDR side data into a `FrameMetadata` value type.
     /// Covers Dolby Vision (Level 1 + Level 2/8 trim + Level 3 offsets +
     /// Level 6), HDR10+ bezier curve, SMPTE ST 2086 mastering display, and
@@ -528,12 +518,7 @@ final class FFmpegVideoDecoder {
                     dovi.level3 = FFmpegVideoDecoder.parseDoviLevel3(dm.pointee)
                 }
                 if let dm = av_dovi_find_level(m, 6), dm.pointee.level == 6 {
-                    dovi.level6 = DolbyVisionFrameMetadata.Level6(
-                        maxLuminance: dm.pointee.l6.max_luminance,
-                        minLuminance: dm.pointee.l6.min_luminance,
-                        maxCll:       dm.pointee.l6.max_cll,
-                        maxFall:      dm.pointee.l6.max_fall
-                    )
+                    dovi.level6 = FFmpegVideoDecoder.parseDoviLevel6(dm.pointee)
                 }
                 if decodedFrames <= 3 {
                     logger.info("DV frame L1: \(dovi.level1.map { "min=\($0.minPq) max=\($0.maxPq) avg=\($0.avgPq)" } ?? "nil") L2: \(dovi.level2.map { "slope=\($0.trimSlope) power=\($0.trimPower)" } ?? "nil") L3: \(dovi.level3.map { "max=\($0.maxPqOffset)" } ?? "nil") L6: \(dovi.level6.map { "maxLum=\($0.maxLuminance) cll=\($0.maxCll)" } ?? "nil")")
@@ -576,6 +561,11 @@ final class FFmpegVideoDecoder {
     ///   - maxLuminance: cd/m², 0..10000 (truncated)
     ///   - minLuminance: 0.0001 cd/m² steps (multiply AVRational by 10000)
     /// Primaries are stored as 0.00002-increment UInt16 (AVRational * 50000).
+    ///
+    /// Index order: ffmpeg's `AVMasteringDisplayMetadata.display_primaries` is
+    /// documented "(r, g, b)" ([0]=R, [1]=G, [2]=B — verified against the
+    /// corpus: x265-authored R(34000,16000) lands in [0]), while
+    /// `FrameMetadata.primaries` is documented G, B, R — remap accordingly.
     private func masteringDisplayMetadata(from md: AVMasteringDisplayMetadata) -> MasteringDisplayMetadata {
         func toUInt16(_ r: AVRational, scale: Int) -> UInt16 {
             let den = r.den == 0 ? 1 : Int(r.den)
@@ -592,9 +582,9 @@ final class FFmpegVideoDecoder {
             maxLuminance: UInt16(clamping: maxLum),
             minLuminance: minLum,
             primaries: (
-                toUInt16(p.0.0, scale: 50000), toUInt16(p.0.1, scale: 50000),
-                toUInt16(p.1.0, scale: 50000), toUInt16(p.1.1, scale: 50000),
-                toUInt16(p.2.0, scale: 50000), toUInt16(p.2.1, scale: 50000),
+                toUInt16(p.1.0, scale: 50000), toUInt16(p.1.1, scale: 50000),  // G — ffmpeg [1]
+                toUInt16(p.2.0, scale: 50000), toUInt16(p.2.1, scale: 50000),  // B — ffmpeg [2]
+                toUInt16(p.0.0, scale: 50000), toUInt16(p.0.1, scale: 50000),  // R — ffmpeg [0]
                 md.has_primaries != 0 ? toUInt16(wp.0, scale: 50000) : 15635,
                 md.has_primaries != 0 ? toUInt16(wp.1, scale: 50000) : 16450
             )
