@@ -2703,13 +2703,13 @@ public final class NativeBackend: PlayerBackend {
         displayLink = link
         let thread = Thread { [weak self] in
             let rl = RunLoop.current
-            rl.add(link, forMode: .common)
+            link.add(to: rl, forMode: .common)
             while !(self?.displayLoopStopped ?? true) {
                 rl.run(mode: .common, before: Date(timeIntervalSinceNow: 0.5))
             }
         }
         thread.name = "io.reflex.PlayerKit.displayLink"
-        thread.qualityOfService = .userInteractive
+        thread.qualityOfService = QualityOfService.userInteractive
         displayLinkThread = thread
         thread.start()
         #elseif os(macOS)
