@@ -54,6 +54,7 @@ public struct SubtitleOverlayView: View {
     /// PGS subtitle normalized coordinates are relative to the video frame, not the full
     /// screen — without mapping to the letterboxed rect, subtitles drift off-screen when
     /// the video is pillarboxed/letterboxed (especially in landscape on phones).
+    @MainActor
     private func videoDisplayRect(in geo: GeometryProxy) -> CGRect {
         guard let info = player.state.videoInfo,
               info.width > 0, info.height > 0 else {
