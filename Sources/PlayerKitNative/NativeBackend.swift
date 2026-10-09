@@ -450,7 +450,7 @@ public final class NativeBackend: PlayerBackend {
         // causing the demuxer open to be delayed 10-15s. GCD's dedicated thread
         // pool is not affected by cooperative scheduling.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
+            guard let self = self else { return }
             let t1 = Date()
             logger.info("GCD block started, delay=\(String(format: "%.0f", t1.timeIntervalSince(t0) * 1000))ms")
 
@@ -513,7 +513,7 @@ public final class NativeBackend: PlayerBackend {
         let urls = concatURLs  // capture
         let hdrs = headers
         Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self else { return }
+            guard let self = self else { return }
 
             // Write concat list to a temp file. Per-file `option` directives carry
             // auth headers to each clip's http open — the concat demuxer's own
@@ -601,7 +601,7 @@ public final class NativeBackend: PlayerBackend {
         let gen = playGeneration
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
+            guard let self = self else { return }
 
             let demuxer = MultiClipDemuxer(clips: clips)
             guard let demuxer else {
@@ -1015,13 +1015,13 @@ public final class NativeBackend: PlayerBackend {
 
     private func wireJitterBuffer() {
         jitterBuffer.onStateChange = { [weak self] newState in
-            guard let self else { return }
+            guard let self = self else { return }
             switch newState {
             case .buffering:
                 self.audioUnitOutput?.pause()
                 self._injectedAudioOutput?.pause()
                 DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
+                    guard let self = self else { return }
                     self.state.isBuffering = true
                     // Drop the tick-gap baseline so the refill-triggered resume
                     // isn't misreported as a main-thread stall by the gap
@@ -1033,7 +1033,7 @@ public final class NativeBackend: PlayerBackend {
                 self.audioUnitOutput?.resume()
                 self._injectedAudioOutput?.resume()
                 DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
+                    guard let self = self else { return }
                     self.state.isBuffering = false
                     self.notifyStateChange()
                 }
@@ -1099,7 +1099,7 @@ public final class NativeBackend: PlayerBackend {
             // 的防重入判断始终准确。循环内所有 break 出口都发生在 dLock 解锁
             // 之后,这里锁内清理不会死锁。
             defer {
-                if let self {
+                if let self = self {
                     self.demuxStateLock.lock()
                     // Only clear what this loop registered: startDemuxLoop's forced
                     // path may already have registered a newer loop.
@@ -1295,7 +1295,7 @@ public final class NativeBackend: PlayerBackend {
                         jitter.append(.init(pixelBuffer: frame.pixelBuffer, pts: framePts, metadata: frame.metadata))
                         let ptsCopy = framePts
                         DispatchQueue.main.async { [weak self] in
-                            guard let self else { return }
+                            guard let self = self else { return }
                             let d = Duration.milliseconds(Int64(ptsCopy * 1000))
                             if d > self.state.duration { self.state.duration = d }
                         }
@@ -2316,7 +2316,7 @@ public final class NativeBackend: PlayerBackend {
         // one-shot clock calibration for the first POST-landing frame.
         let onLanded: @Sendable () -> Void = { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self = self else { return }
                 self.displayLoopLock.withLock {
                     self.needsClockCalibration = true
                     self.audioClockReady = false
