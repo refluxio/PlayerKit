@@ -136,8 +136,14 @@ final class MetalRenderer: VideoRenderer {
         // opacity = 0 between stop() and the first new frame so the previous
         // video's last frame doesn't linger on screen during the (potentially
         // slow) demux + decode of the new video's first frame.
+        // P2: render() runs on the display thread — same implicit-transaction
+        // trap as ASBDLRenderer (see there). Explicit transaction so the
+        // reveal actually commits off-main.
         if metalLayer.opacity == 0 {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
             metalLayer.opacity = 1
+            CATransaction.commit()
         }
     }
 

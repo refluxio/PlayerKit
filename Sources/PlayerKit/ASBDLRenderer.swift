@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreVideo
+import QuartzCore
 import os
 
 private let logger = Logger(subsystem: "io.reflex.PlayerKit", category: "asbdl")
@@ -85,7 +86,17 @@ public class ASBDLRenderer: VideoRenderer {
             logger.info("ASBDL: makeSampleBuffer failed at pts=\(pts)")
             return
         }
+        // P2: render() runs on the display thread (CVDisplayLink / fallback
+        // queue), not main. A CALayer property write there enters an implicit
+        // CATransaction that is never committed (implicit transactions only
+        // auto-commit on the main runloop) — the reveal never takes effect and
+        // the layer stays hidden forever (black screen with normal audio, plus
+        // "deleted thread with uncommitted CATransaction" at teardown). Wrap
+        // the write in an explicit transaction, which is legal on any thread.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         displayLayer.isHidden = false
+        CATransaction.commit()
         displayLayer.enqueue(sbuf)
     }
 
