@@ -278,6 +278,107 @@ final class MultiClipDemuxerTests: XCTestCase {
             "close() must release each clip reader exactly once, only when playback stops")
     }
 
+    /// A seek that lands inside the CURRENT clip must reuse the already-open
+    /// demuxer instead of closing it and paying a full synchronous reopen
+    /// (avformat_open_input + find_stream_info measures 1.5s+ on real media,
+    /// ~5s end-to-end per seek on a BD original). Identity assertion: the
+    /// demuxer instance must survive the seek.
+    func testSeekWithinSameClipReusesOpenDemuxer() throws {
+        let clip0 = InMemoryReader(data: loadFixture("clip0_5s"))
+        let clip1 = InMemoryReader(data: loadFixture("clip1_5s"))
+        let demuxer = MultiClipDemuxer(clips: [(clip0, 5.0), (clip1, 5.0)])!
+        try demuxer.open()
+        let opened = try XCTUnwrap(demuxer.currentDemuxer)
+
+        XCTAssertTrue(demuxer.seek(to: 1.0)) // inside clip0 (0..<5)
+        XCTAssertTrue(demuxer.currentDemuxer === opened,
+            "same-clip seek must keep the already-open demuxer instead of reopening it")
+
+        // The seek still took effect: packets flow from clip0 near the
+        // target. Byte-ratio seek on this single-GOP fixture is ±1.5s
+        // imprecise, so the window is [0, 3]; a clip1 packet would carry a
+        // rebased PTS ≥ 6.48, so anything above 3.0 means wrong-clip data.
+        let nopts = Int64(bitPattern: 0x8000000000000000)
+        for _ in 0..<10 {
+            guard let result = demuxer.readPacket() else {
+                XCTFail("expected a packet after same-clip seek"); return
+            }
+            var packet: UnsafeMutablePointer<AVPacket>? = result.packet
+            defer { av_packet_free(&packet) }
+            guard result.packet.pointee.pts != nopts,
+                  let stream = demuxer.currentDemuxer?.formatContext?.pointee
+                      .streams[Int(result.streamIndex)] else { continue }
+            let tb = stream.pointee.time_base
+            let ptsSeconds = Double(result.packet.pointee.pts) * Double(tb.num) / Double(tb.den)
+            XCTAssertTrue((0...3).contains(ptsSeconds),
+                "first post-seek packet PTS \(ptsSeconds)s outside clip0's local domain near the target — seek did not take effect")
+            return
+        }
+        XCTFail("no packet with a valid PTS within 10 reads after same-clip seek")
+    }
+
+    /// A cross-clip seek whose target IS the pre-opened next clip must reuse
+    /// the background-opened demuxer (seek on a freshly-opened demuxer is
+    /// exactly what the fallback path does, minus the redundant reopen).
+    func testCrossClipSeekReusesPreOpenedTargetDemuxer() throws {
+        let clip0 = InMemoryReader(data: loadFixture("clip0_5s"))
+        let clip1 = InMemoryReader(data: loadFixture("clip1_5s"))
+        let demuxer = MultiClipDemuxer(clips: [(clip0, 5.0), (clip1, 5.0)])!
+        try demuxer.open()
+
+        // Walk into the pre-open lead window (local PTS > 2.2s, see
+        // testSwitchReusesPreOpenedNextClipWithoutReopening) and wait for the
+        // background open of clip1 to land.
+        let nopts = Int64(bitPattern: 0x8000000000000000)
+        var localPtsSecs: Double = -1
+        var n = 0
+        while let result = demuxer.readPacket(), n < 500, localPtsSecs <= 2.2 {
+            n += 1
+            var packet: UnsafeMutablePointer<AVPacket>? = result.packet
+            defer { av_packet_free(&packet) }
+            if result.packet.pointee.pts != nopts,
+               let stream = demuxer.currentDemuxer?.formatContext?.pointee
+                   .streams[Int(result.streamIndex)] {
+                let tb = stream.pointee.time_base
+                localPtsSecs = Double(result.packet.pointee.pts) * Double(tb.num) / Double(tb.den)
+            }
+        }
+        var preOpened: (index: Int, demuxer: FFmpegDemuxer)?
+        let deadline = Date().addingTimeInterval(15.0)
+        while preOpened == nil && Date() < deadline {
+            preOpened = demuxer.preOpenedNext
+            if preOpened == nil { Thread.sleep(forTimeInterval: 0.01) }
+        }
+        let capturedPreOpened = try XCTUnwrap(preOpened,
+            "background pre-open of clip1 did not land within 15s after entering the lead window")
+
+        // Seek across the seam to clip1 — the target is the pre-opened clip.
+        XCTAssertTrue(demuxer.seek(to: 7.0)) // clip1 local 2.0
+        XCTAssertTrue(demuxer.currentDemuxer === capturedPreOpened.demuxer,
+            "cross-clip seek into the pre-opened target clip discarded the cached demuxer and reopened synchronously")
+        XCTAssertEqual(demuxer.preOpenedNext?.index, nil,
+            "consumed pre-open entry should be cleared")
+
+        // First packet lands in clip1's rebased domain (same window as the
+        // routing test: [5.5, 9.5] against raw clip1 1.48–6.4 + 5.0 offset).
+        for _ in 0..<10 {
+            guard let result = demuxer.readPacket() else {
+                XCTFail("expected a packet after cross-clip seek"); return
+            }
+            var packet: UnsafeMutablePointer<AVPacket>? = result.packet
+            defer { av_packet_free(&packet) }
+            guard result.packet.pointee.pts != nopts,
+                  let stream = demuxer.currentDemuxer?.formatContext?.pointee
+                      .streams[Int(result.streamIndex)] else { continue }
+            let tb = stream.pointee.time_base
+            let ptsSeconds = Double(result.packet.pointee.pts) * Double(tb.num) / Double(tb.den)
+            XCTAssertTrue((5.5...9.5).contains(ptsSeconds),
+                "first post-seek packet PTS \(ptsSeconds)s outside clip1's rebased domain [5.5, 9.5] — pre-open reuse broke routing or rebase")
+            return
+        }
+        XCTFail("no packet with a valid PTS within 10 reads after cross-clip seek")
+    }
+
     /// C1 regression, seek variant: a cross-clip seek must not close the
     /// shared connection either. Before the fix, seek → switchTo →
     /// current?.close() → connection terminally closed → the target clip's
