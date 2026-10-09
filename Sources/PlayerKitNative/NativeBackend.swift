@@ -54,8 +54,9 @@ private final class DisplayLinkProxy: NSObject {
     weak var backend: NativeBackend?
     init(backend: NativeBackend) { self.backend = backend }
     @objc func tick() {
-        guard let b = backend else { return }
-        MainActor.assumeIsolated { b.displayNextFrame() }
+        // P2: displayNextFrame is display-thread native (all UI writes hop via
+        // applyDisplayUpdate) — call directly, no main-actor hop.
+        backend?.displayNextFrame()
     }
 }
 
@@ -87,7 +88,9 @@ public final class NativeBackend: PlayerBackend {
     public private(set) var videoHeight: Int = 0
     private var codedVideoWidth: Int = 0
     private var codedVideoHeight: Int = 0
-    public private(set) var colorParams = VideoColorParams()
+    /// P2: snapshotted by the display thread under renderConfigLock; written on
+    /// the main actor at stream open.
+    public nonisolated(unsafe) private(set) var colorParams = VideoColorParams()
     /// Display capability used to resolve `RendererStrategy`. Defaults to
     /// `appleMobile` (no EDR); PlayerController should set this to `macEDR` /
     /// `macSDR` on macOS after observing NSScreen EDR support. Propagates to
@@ -113,7 +116,8 @@ public final class NativeBackend: PlayerBackend {
     /// capability + renderer's `prefersTenBit`. Drives decoder selection and
     /// is forwarded to `VideoRenderer.render` every frame so EDRRenderer can
     /// pick its tone-map algorithm without re-reading stream attributes.
-    public private(set) var rendererStrategy: RendererStrategy?
+    /// P2: read by the display thread under renderConfigLock.
+    public nonisolated(unsafe) private(set) var rendererStrategy: RendererStrategy?
     public var onStateChange: ((PlayerState) -> Void)?
 
     /// Hook for stream-aware tone-mapper injection, invoked synchronously in
@@ -140,17 +144,14 @@ public final class NativeBackend: PlayerBackend {
     /// Written once in init(), only read afterwards — safe to access from any thread.
     private nonisolated(unsafe) var _injectedAudioOutput: (any AudioOutputBackend)?
 
-    private var _frameSinks: [WeakFrameSink] = []
-    private struct WeakFrameSink {
-        weak var sink: (any FrameSink)?
-    }
-
     private var demuxer: (any PacketDemuxing)?
     /// VT may fail on extreme-parameter streams (e.g. 4K@120fps).
     /// When that happens the demux loop hot-swaps in a software FFmpegVideoDecoder.
     /// Written once in _finishOpen(), then swapped from the demux queue on fallback.
     private nonisolated(unsafe) var videoDecoder: (any VideoDecoding)?
-    private var audioDecoder: FFmpegAudioDecoder?
+    /// Created once per stream in _finishOpen() on the main actor, only read
+    /// afterwards (display thread reads outputSampleRate for clock calibration).
+    private nonisolated(unsafe) var audioDecoder: FFmpegAudioDecoder?
     /// Serial queue audio packets are decoded on, off the demux/video loop's
     /// thread. FFmpeg's software DTS-HD MA decode can be CPU-heavy enough
     /// per packet to starve video decode when both ran serially on the same
@@ -172,14 +173,17 @@ public final class NativeBackend: PlayerBackend {
     /// True only when compressed audio passthrough is actually in use (macOS
     /// with HDMI/SPDIF). On iOS/tvOS passthrough is disabled and PCM decode
     /// via AudioUnitOutput drives the audioClock normally.
-    private var isPassthroughActive = false
+    /// Written at stream open (main actor), read every display tick.
+    private nonisolated(unsafe) var isPassthroughActive = false
     private let jitterBuffer = VideoJitterBuffer()
-    private let syncController = SyncController()
+    /// P2: ticked from the display thread; internally lock-guarded (see SyncController).
+    nonisolated(unsafe) private let syncController = SyncController()
     // Set after play() or seek(); cleared by displayNextFrame on first frame.
     // Calibrates audioClock to actual first decoded frame PTS so audio and video
     // start from the same position — required for H.264 streams whose PTS does
     // not start at 0 (e.g. B-frame reorder delays).
-    private var needsClockCalibration: Bool = false
+    // Guarded by displayLoopLock (see there).
+    private nonisolated(unsafe) var needsClockCalibration: Bool = false
     // Above this, a video/audio PTS gap at calibration time is no longer a
     // normal "nearest keyframe was slightly before the seek target" rounding
     // (typically well under a second for BD content) — see displayNextFrame().
@@ -259,27 +263,55 @@ public final class NativeBackend: PlayerBackend {
     private nonisolated(unsafe) var demuxLoopDemuxer: (any PacketDemuxing)?
     private var displayLink: CADisplayLink?
     private var displayLinkProxy: DisplayLinkProxy?
+    /// P2: iOS/tvOS display-link host thread (see startDisplayLink). Owned by
+    /// main-thread lifecycle code; the thread itself runs a dedicated runloop.
+    private var displayLinkThread: Thread?
+    /// P2: display-loop liveness flag (guarded by displayLoopLock). startDisplayLink
+    /// clears it, every teardown path sets it; the iOS/tvOS host thread polls it
+    /// to leave its run loop (checked ≤0.5s latency).
+    private nonisolated(unsafe) var displayLoopStopped = true
+    /// P2: dedicated serial queue for the macOS fallback render timer — off-main
+    /// like the CVDisplayLink thread that is the primary driver. displayNextFrame
+    /// is idempotent (renderGate), so fallback and link never corrupt each other.
+    private let displayFallbackQueue = DispatchQueue(label: "io.reflex.PlayerKit.displayFallback", qos: .userInteractive)
     #if os(macOS)
     private var cvDisplayLink: CVDisplayLink?
     /// macOS 兜底渲染驱动。CVDisplayLink 在 stop→start 之后可能延迟数秒才恢复
     /// 回调(实测:CVDisplayLinkStart 后 6.3s 才收到 first tick),期间视频冻结、
     /// state.position 不更新 → app 层 UpNext 检测读到 ~0 的初始值误触发 EOF。
-    /// 用主 queue 的 DispatchSourceTimer 兜底驱动 displayNextFrame —— 它幂等
+    /// 用后台串行 queue 的 DispatchSourceTimer 兜底驱动 displayNextFrame —— 它幂等
     /// (每 tick 最多 pop 一帧),与 CVDisplayLink 竞争无害;link 恢复后自然占主导,
-    /// 兜底 timer 空转。
+    /// 兜底 timer 空转。(P2:从主 queue 迁出,见 displayFallbackQueue。)
     private var fallbackRenderTimer: DispatchSourceTimer?
     #endif
 
-    // Cancellation: incremented on every play()/stop() to discard stale async opens
-    private var playGeneration: Int = 0
+    // Cancellation: incremented on every play()/stop() to discard stale async
+    // opens, and snapshotted by the display thread so a main-thread state apply
+    // can be discarded when the session it was computed for is already gone.
+    private nonisolated(unsafe) var playGeneration: Int = 0
+
+    // MARK: Display-loop shared state (P2: presentation runs off the main thread)
+
+    /// Serializes displayNextFrame execution. macOS drives it from two sources
+    /// (CVDisplayLink + fallback timer), both now on background queues, and
+    /// iOS from the display-link run-loop thread. tryLock makes double-drive /
+    /// reentry harmless: if the previous tick is still running (slow renderer),
+    /// this tick is skipped — idempotent, at most one frame popped per tick.
+    private let renderGate = NSLock()
+
+    /// Guards the display-loop scalars below. They are written every display
+    /// tick (now on the display-link thread) and reset from main-thread
+    /// lifecycle paths (play/seek/resume/stop) — trivially serialized when
+    /// everything lived on the main actor, which is exactly what P2 removed.
+    private let displayLoopLock = NSLock()
 
     // Logging
-    private var displayedVideoFrames = 0
-    private var framesSinceLastLog = 0
-    private var ticksSinceLastLog = 0
-    private var lastLogTime: Double = 0
+    private nonisolated(unsafe) var displayedVideoFrames = 0
+    private nonisolated(unsafe) var framesSinceLastLog = 0
+    private nonisolated(unsafe) var ticksSinceLastLog = 0
+    private nonisolated(unsafe) var lastLogTime: Double = 0
     // Diagnostic: see the gap-detection note in displayNextFrame().
-    private var lastTickWallTime: Double?
+    private nonisolated(unsafe) var lastTickWallTime: Double?
     private let tickGapWarnThreshold: Double = 0.05
     // Diagnostic: wall time startDisplayLink() was called, so the first tick
     // can log how long it took to actually arrive — distinguishes "the link
@@ -288,14 +320,14 @@ public final class NativeBackend: PlayerBackend {
     // gap check only ever compares tick-to-tick, so a slow *first* tick was
     // invisible: lastTickWallTime starts nil, so tick #1 never gets a gap
     // check — it just silently sets the baseline).
-    private var displayLinkStartWallTime: Double?
-    private var firstTickLogged = false
+    private nonisolated(unsafe) var displayLinkStartWallTime: Double?
+    private nonisolated(unsafe) var firstTickLogged = false
     /// 同步旁路(audioClockReady=false)弹帧的节拍基准:上一帧实际弹出的
     /// 墙钟时刻。旁路不再每个显示驱动 tick 都弹帧,而是按源 PTS 间隔 pacing。
     /// 初始 0 → 首个 tick 立即弹出;seek/resume/stop/flush 后复位同样立即
     /// 弹出,不会等待。
-    private var lastBypassPopTime: Double = 0
-    private var lastNotifiedPos: Duration = .zero
+    private nonisolated(unsafe) var lastBypassPopTime: Double = 0
+    private nonisolated(unsafe) var lastNotifiedPos: Duration = .zero
     /// Passthrough fallback pacing anchor (wall time ↔ read-ahead frontier PTS)
     /// used while the injected output's playbackTime is unavailable. Nil once
     /// the real passthrough clock takes over; reset per session in stop().
@@ -307,8 +339,17 @@ public final class NativeBackend: PlayerBackend {
     /// 画面长时间卡死。置位后首个校准帧强制校准(丢弃暂停期静音差距);
     /// seek 场景不置位,保持 maxCalibrationGap 对 byte-offset seek 大偏差
     /// 的掩盖保护。
-    private var forceClockCalibration = false
+    /// Guarded by displayLoopLock.
+    private nonisolated(unsafe) var forceClockCalibration = false
 
+    /// Guards render configuration (`colorParams`, `rendererStrategy`) and the
+    /// frame-sink list: written on the main actor (stream open / addFrameSink),
+    /// read every display tick. Since P2 those run concurrently.
+    private let renderConfigLock = NSLock()
+    private nonisolated(unsafe) var _frameSinks: [WeakFrameSink] = []
+    private struct WeakFrameSink {
+        weak var sink: (any FrameSink)?
+    }
 
     // Throughput tracking. Written from demux queue, read on main actor.
     private nonisolated(unsafe) var totalBytesRead: Int64 = 0
@@ -642,9 +683,13 @@ public final class NativeBackend: PlayerBackend {
             default: break
             }
             cpParams.range = cp.color_range == AVCOL_RANGE_JPEG ? .full : .limited
-            self.colorParams = cpParams
-            if self.colorParams.transfer == .pq || self.colorParams.transfer == .hlg {
-                logger.info("HDR: transfer=\(String(describing: self.colorParams.transfer)) matrix=\(String(describing: self.colorParams.matrix))")
+            // P2: displayNextFrame snapshots these on the display thread —
+            // publish under renderConfigLock.
+            renderConfigLock.withLock {
+                self.colorParams = cpParams
+                if self.colorParams.transfer == .pq || self.colorParams.transfer == .hlg {
+                    logger.info("HDR: transfer=\(String(describing: self.colorParams.transfer)) matrix=\(String(describing: self.colorParams.matrix))")
+                }
             }
 
             // Resolve the renderer strategy from stream attributes + display
@@ -681,7 +726,7 @@ public final class NativeBackend: PlayerBackend {
                 display: displayCapability,
                 doviEnabled: doviEnabled
             )
-            self.rendererStrategy = strat
+            renderConfigLock.withLock { self.rendererStrategy = strat }
 
             // Stream-aware tone-mapper injection (see `toneMapperProvider`).
             // Main thread, pre-decode-loop: assigning the result — including
@@ -956,8 +1001,11 @@ public final class NativeBackend: PlayerBackend {
         // Calibrate audioClock to first decoded frame PTS on the first display
         // tick — same as post-seek calibration. Required for H.264 B-frame streams
         // whose PTS does not start at 0 (priming delay).
-        needsClockCalibration = true
-        audioClockReady = false
+        // startDisplayLink above may already be ticking — lock the write.
+        displayLoopLock.withLock {
+            needsClockCalibration = true
+            audioClockReady = false
+        }
 
         state.isPlaying = true
         notifyStateChange()
@@ -1639,36 +1687,51 @@ public final class NativeBackend: PlayerBackend {
         return SubtitleCue(startPts: startPts, endPts: startPts + dur, text: text)
     }
 
-    // MARK: - Display (CADisplayLink)
+    // MARK: - Display (display-link thread, P2)
 
-    fileprivate func displayNextFrame() {
+    /// P2: video presentation no longer waits for the main thread. This runs
+    /// on the CVDisplayLink callback thread (macOS), the fallback timer's
+    /// background queue (macOS), or the CADisplayLink run-loop thread
+    /// (iOS/tvOS). A busy main thread (SwiftUI, navigation, scans) therefore
+    /// cannot delay or drop ticks anymore. Everything MainActor-isolated is
+    /// either behind a lock (displayLoopLock / renderConfigLock / the sync
+    /// modules' own locks) or applied via `applyDisplayUpdate` on the main
+    /// actor — PlayerState feeds SwiftUI through Player, so its writes must
+    /// stay main-thread.
+    fileprivate nonisolated func displayNextFrame() {
+        guard renderGate.try() else { return }
+        defer { renderGate.unlock() }
+
         let now = CACurrentMediaTime()
-        ticksSinceLastLog += 1
+        let bufferPlaying = jitterBuffer.state == .playing
 
-        // Diagnostic: CADisplayLink runs on the main run loop. If the main thread
-        // is busy with other work (background scan/enrich, SwiftUI updates, disk/DB
-        // I/O, ...) ticks get delayed or dropped, producing visible video judder
-        // while audio (separate real-time AudioUnit thread) stays smooth. Logging
-        // outsized tick-to-tick gaps — only while jitterBuffer actually has frames
-        // ready to show — isolates "main thread was blocked" from "video is
-        // legitimately buffering" as the stutter cause.
+        // Diagnostic: ticks fire on the display thread. An outsized tick-to-tick
+        // gap while jitterBuffer has frames ready means the *display path* was
+        // stalled — renderer encode cost, an oversubscribed core, or (iOS) a
+        // background run-loop competing for the display thread — no longer the
+        // main thread, which since P2 cannot affect presentation at all.
+        displayLoopLock.lock()
         if let last = lastTickWallTime {
             let gap = now - last
-            if gap > tickGapWarnThreshold && jitterBuffer.state == .playing {
-                logger.warning("display tick gap \(Int(gap * 1000))ms (main thread stall?)")
+            if gap > tickGapWarnThreshold && bufferPlaying {
+                logger.warning("display tick gap \(Int(gap * 1000))ms (display thread stall?)")
             }
-        } else if !firstTickLogged, let linkStart = displayLinkStartWallTime {
+        } else if !firstTickLogged {
             // First-ever tick: no prior baseline to diff against, so the check
             // above is structurally blind to this one. Log it explicitly —
             // this is the only way to tell whether a "gap" reported once
             // jitterBuffer flips to .playing was actually one late tick, or
-            // whether CADisplayLink genuinely never fired until now.
-            firstTickLogged = true
-            logger.info("first display tick \(Int((now - linkStart) * 1000))ms after startDisplayLink()")
+            // whether the display link genuinely never fired until now.
+            if let linkStart = displayLinkStartWallTime {
+                firstTickLogged = true
+                displayLoopLock.unlock()
+                logger.info("first display tick \(Int((now - linkStart) * 1000))ms after startDisplayLink()")
+                displayLoopLock.lock()
+            }
         }
         lastTickWallTime = now
-
-        guard jitterBuffer.state == .playing else { return }
+        ticksSinceLastLog += 1
+        displayLoopLock.unlock()
 
         // Calibrate audioClock to the actual first decoded frame PTS after seek.
         // seek() resets audioClock to the target position, but FFmpeg seeks to the
@@ -1685,25 +1748,30 @@ public final class NativeBackend: PlayerBackend {
         // AudioQueueStop/Start can fire async callbacks that advance the clock
         // *after* our reset; by calibrating exactly once (not clearing the flag
         // until first render), we tolerate that race without the death loop.
-        if needsClockCalibration, let firstFrame = jitterBuffer.peek(at: 0) {
-            // Only apply the small-rounding correction this was designed for.
-            // A byte-domain seek (FFmpegDemuxer.seekByByteOffset, used for raw
-            // indexless MPEG-TS) has no keyframe awareness and can land tens
-            // of seconds from the target on VBR content. Blindly relabeling
-            // audioClock to match a wildly-displaced video PTS doesn't fix
-            // that — it hides it: the audio hardware keeps playing real
-            // content from near the seek target while the clock claims to be
-            // wherever video landed, and the gap never closes (observed: a
-            // persistent, non-recovering audio-behind-video desync). For a
-            // large gap, skip calibration and let the freeze-ahead guard hold
-            // video until the real audioClock catches up instead — a one-time
-            // stall, but it converges on what's actually audible.
-            if forceClockCalibration
+        // Only apply the small-rounding correction this was designed for.
+        // A byte-domain seek (FFmpegDemuxer.seekByByteOffset, used for raw
+        // indexless MPEG-TS) has no keyframe awareness and can land tens
+        // of seconds from the target on VBR content. Blindly relabeling
+        // audioClock to match a wildly-displaced video PTS doesn't fix
+        // that — it hides it: the audio hardware keeps playing real
+        // content from near the seek target while the clock claims to be
+        // wherever video landed, and the gap never closes (observed: a
+        // persistent, non-recovering audio-behind-video desync). For a
+        // large gap, skip calibration and let the freeze-ahead guard hold
+        // video until the real audioClock catches up instead — a one-time
+        // stall, but it converges on what's actually audible.
+        let (needsCalibration, forceCalibration) = displayLoopLock.withLock {
+            (needsClockCalibration, forceClockCalibration)
+        }
+        if needsCalibration, let firstFrame = jitterBuffer.peek(at: 0) {
+            if forceCalibration
                 || abs(firstFrame.pts - audioClock.audioTime) < maxCalibrationGap {
                 audioClock.calibrate(to: firstFrame.pts, sampleRate: audioDecoder?.outputSampleRate ?? 44100)
             }
-            needsClockCalibration = false
-            forceClockCalibration = false
+            displayLoopLock.withLock {
+                needsClockCalibration = false
+                forceClockCalibration = false
+            }
         }
 
         // In passthrough mode AudioUnitOutput never runs so audioClock stays at 0.
@@ -1734,7 +1802,10 @@ public final class NativeBackend: PlayerBackend {
         // until almost every frame triggers the guard → the user sees a frozen image.
         // Draining ALL stale frames in one pass keeps video locked to audio regardless
         // of the source→display ratio.
-        if syncController.hasDisplayedFrame, !needsClockCalibration, audioClockReady {
+        let (stillNeedsCal, clockReady) = displayLoopLock.withLock {
+            (needsClockCalibration, audioClockReady)
+        }
+        if syncController.hasDisplayedFrame, !stillNeedsCal, clockReady {
             // Drain frames significantly behind audio
             while let lagging = jitterBuffer.peek(at: 0), lagging.pts < audioTime - 0.06 {
                 jitterBuffer.pop()
@@ -1742,8 +1813,10 @@ public final class NativeBackend: PlayerBackend {
             // Freeze-ahead: if the front frame is ahead of audio, stall
             if let ahead = jitterBuffer.peek(at: 0), ahead.pts > audioTime + 0.06 {
                 let pos = Duration.milliseconds(Int64(audioTime * 1000))
-                if (pos - lastNotifiedPos) >= .milliseconds(500) {
-                    state.position = pos; notifyStateChange(); lastNotifiedPos = pos
+                let due = displayLoopLock.withLock { (pos - lastNotifiedPos) >= .milliseconds(500) }
+                if due {
+                    displayLoopLock.withLock { lastNotifiedPos = pos }
+                    applyDisplayUpdate(DisplayUIUpdate(position: pos, generation: playGeneration, notify: true))
                 }
                 return
             }
@@ -1752,8 +1825,8 @@ public final class NativeBackend: PlayerBackend {
         // Detect when audioClock has started advancing (primer callbacks fired).
         // Until then, bypass syncController timing and display frames as fast as
         // they're decoded so video doesn't stall waiting for audio to catch up.
-        if !audioClockReady, audioTime > 0.001 {
-            audioClockReady = true
+        if !clockReady, audioTime > 0.001 {
+            displayLoopLock.withLock { audioClockReady = true }
         }
 
         guard let frame = jitterBuffer.peek(at: 0) else { return }
@@ -1765,7 +1838,7 @@ public final class NativeBackend: PlayerBackend {
         // syncController sees video far ahead of audio(audio=0) and holds
         // frames indefinitely → "首帧后不播放" bug.
         let (shouldShow, delay): (Bool, Double)
-        if audioClockReady {
+        if clockReady {
             (shouldShow, delay) = syncController.check(
                 nextPTS: frame.pts,
                 followingPTS: followingPTS,
@@ -1780,23 +1853,28 @@ public final class NativeBackend: PlayerBackend {
             // 加速("自动播下一集加速"的直接放大器),且弹帧快于 demux
             // 补充率会排空 jitterBuffer → .buffering → 卡死。改为按源
             // PTS 间隔 pacing:首帧立即显示,后续帧等足源帧间隔,永远不
-            // 高于 1x;主线程长卡顿积压的 tick 也只会弹出一帧,不爆发。
+            // 高于 1x;显示线程积压的 tick 也只会弹出一帧,不爆发
+            // (renderGate 串行化,tick 之间也不会并发)。
             let srcGap = followingPTS.map { max(0.01, min(0.5, $0 - frame.pts)) }
                 ?? (1.0 / 25.0)
-            if now - lastBypassPopTime >= srcGap {
-                lastBypassPopTime = now
-                (shouldShow, delay) = (true, 0)
-            } else {
-                (shouldShow, delay) = (false, 0)
+            let due = displayLoopLock.withLock {
+                if now - lastBypassPopTime >= srcGap {
+                    lastBypassPopTime = now
+                    return true
+                }
+                return false
             }
+            (shouldShow, delay) = (due, 0)
         }
 
         guard shouldShow else {
             // 旁路 pacing 等待时视频帧已在正确位置,用帧 PTS 而非 audioTime
             // (音频卡死时恒为 0,会把进度条打回 0)。
-            let pos = Duration.milliseconds(Int64((audioClockReady ? audioTime : frame.pts) * 1000))
-            if (pos - lastNotifiedPos) >= .milliseconds(500) {
-                state.position = pos; notifyStateChange(); lastNotifiedPos = pos
+            let pos = Duration.milliseconds(Int64((clockReady ? audioTime : frame.pts) * 1000))
+            let due = displayLoopLock.withLock { (pos - lastNotifiedPos) >= .milliseconds(500) }
+            if due {
+                displayLoopLock.withLock { lastNotifiedPos = pos }
+                applyDisplayUpdate(DisplayUIUpdate(position: pos, generation: playGeneration, notify: true))
             }
             return
         }
@@ -1804,56 +1882,58 @@ public final class NativeBackend: PlayerBackend {
         guard let popped = jitterBuffer.pop() else { return }
         syncController.advance(delay: delay, pts: popped.pts,
                                followingPTS: followingPTS, audioTime: audioTime, now: now)
-        var cp = colorParams
+        // Render config snapshot (colorParams/rendererStrategy are written on the
+        // main actor at stream open; the tick reads them concurrently since P2).
+        let (cpBase, strategy) = renderConfigLock.withLock { (colorParams, rendererStrategy) }
+        var cp = cpBase
         cp.dovi = popped.metadata.dovi
+        // Renderers are thread-safe by contract (ASBDL enqueue / Metal command
+        // buffers / ToneMapProcessor's own lock) — this runs on the display thread.
         _renderer.render(pixelBuffer: popped.pixelBuffer,
                          pts: popped.pts,
                          colorParams: cp,
                          metadata: popped.metadata,
-                         strategy: rendererStrategy)
+                         strategy: strategy)
         let ptsCopy = popped.pts
-        let sinks = self._frameSinks.compactMap { $0.sink }
-        for sink in sinks {
-            sink.receive(pixelBuffer: popped.pixelBuffer, pts: ptsCopy)
+        let pixelBuffer = popped.pixelBuffer
+        // FrameSink is @MainActor — deliver from the main thread (hop keeps the
+        // display tick free of MainActor requirements; the closure retains the
+        // pixel buffer for the sinks' lifetime).
+        let sinks = renderConfigLock.withLock { self._frameSinks.compactMap { $0.sink } }
+        if !sinks.isEmpty {
+            DispatchQueue.main.async {
+                for sink in sinks {
+                    sink.receive(pixelBuffer: pixelBuffer, pts: ptsCopy)
+                }
+            }
         }
-        displayedVideoFrames += 1; framesSinceLastLog += 1
+        let firstFrameRendered: Bool = displayLoopLock.withLock {
+            displayedVideoFrames += 1; framesSinceLastLog += 1
+            return displayedVideoFrames == 1
+        }
 
         // needsClockCalibration is already cleared in the calibrate block above.
         // First frame has been rendered; subsequent ticks let audioClock advance
         // naturally via AudioQueue callbacks.
 
         let posDur = Duration.milliseconds(Int64(popped.pts * 1000))
-        state.position = posDur
-        if posDur > state.duration { state.duration = posDur }
-        if displayedVideoFrames == 1 {
-            // 诊断:首帧写入 state 时的实际值与 backend 身份,
-            // 用于核对 app 层 timer 读到的 state 是否同一个对象。
-            logger.info("[diag] first frame written pos=\(String(format:"%.3f", Double(posDur.components.seconds)))s dur=\(String(format:"%.3f", Double(self.state.duration.components.seconds)))s self=\(String(format:"%p", UInt(bitPattern: Unmanaged.passUnretained(self).toOpaque())))")
+        let gen = playGeneration
+
+        // Position → UI on the 500ms throttle (or first frame). Buffered
+        // duration / cacheSpeed ride along inside applyDisplayUpdate's
+        // main-thread block (they read demuxer + state.duration).
+        let due = displayLoopLock.withLock { (posDur - lastNotifiedPos) >= .milliseconds(500) }
+        if firstFrameRendered || due {
+            if due { displayLoopLock.withLock { lastNotifiedPos = posDur } }
+            applyDisplayUpdate(DisplayUIUpdate(position: posDur, durationAtLeast: posDur,
+                                               generation: gen, notify: true))
         }
 
-        // Update bufferedDuration.
-        // Prefer reader-level download offset (reflects actual pre-fetched bytes, not just
-        // the demux-loop's throttled read position which is capped at ~2s).
-        let currentSecs = Double(posDur.components.seconds)
-        let dlOffset = demuxer?.downloadedUpToOffset ?? -1
-        let fileBytes = demuxer?.totalFileBytes ?? -1
-        if dlOffset > 0, fileBytes > 0, state.duration > .zero {
-            let dlFraction = min(1.0, Double(dlOffset) / Double(fileBytes))
-            let dlSecs = dlFraction * Double(state.duration.components.seconds)
-            let bufferedSecs = max(0, dlSecs - currentSecs)
-            state.bufferedDuration = .milliseconds(Int64(bufferedSecs * 1000))
-        } else {
-            // Fallback for URL-based streams without a custom reader.
-            let downloaded = maxDownloadedPts
-            if downloaded > currentSecs {
-                state.bufferedDuration = .milliseconds(Int64((downloaded - currentSecs) * 1000))
-            } else {
-                state.bufferedDuration = .zero
-            }
-        }
-
-        // Update active subtitle text. Only notify when the text actually changes
-        // to avoid redundant view invalidations on every frame.
+        // Update active subtitle text/image. Matching stays on the display
+        // thread (video-PTS based — see note below); the state write + notify
+        // hop to the main thread via applyDisplayUpdate. Only notify when the
+        // text/image actually changes to avoid redundant view invalidations
+        // on every frame.
         // Use the displayed frame's PTS (not audioTime) for subtitle matching —
         // this keeps subtitles in sync with the video, not the audio clock.
         // Audio clock can lag behind video (seek, primer, underrun) causing
@@ -1862,15 +1942,6 @@ public final class NativeBackend: PlayerBackend {
         let activeSub: String? = subtitleLock.withLock {
             subtitleCues.first { $0.startPts <= displayPts && displayPts < $0.endPts }?.text
         }
-        if activeSub != lastSubtitleText {
-            lastSubtitleText = activeSub
-            state.currentSubtitleText = activeSub
-            notifyStateChange()
-        } else if (posDur - lastNotifiedPos) >= .milliseconds(500) {
-            notifyStateChange()
-        }
-        if (posDur - lastNotifiedPos) >= .milliseconds(500) { lastNotifiedPos = posDur }
-
         let (newImage, newRect): (CGImage?, CGRect) = subtitleImageLock.withLock {
             // Prune expired cues so first(where:) doesn't scan a growing list.
             // Keep only cues whose endPts hasn't passed yet.
@@ -1882,36 +1953,124 @@ public final class NativeBackend: PlayerBackend {
             }
             return (nil, .zero)
         }
-        if newImage !== lastSubtitleImage {
-            lastSubtitleImage = newImage
-            state.currentSubtitleImage = newImage
-            state.currentSubtitleImageRect = newRect
-            notifyStateChange()
+        let (textChanged, imageChanged) = displayLoopLock.withLock { () -> (Bool, Bool) in
+            let t = activeSub != lastSubtitleText
+            let i = newImage !== lastSubtitleImage
+            if t { lastSubtitleText = activeSub }
+            if i { lastSubtitleImage = newImage }
+            return (t, i)
+        }
+        if textChanged || imageChanged {
+            var u = DisplayUIUpdate(position: posDur, durationAtLeast: posDur,
+                                    generation: gen, notify: true)
+            if textChanged { u.subtitleText = activeSub }
+            if imageChanged {
+                u.subtitleImage = newImage
+                u.subtitleImageRect = newRect
+            }
+            applyDisplayUpdate(u)
         }
 
         logSync(now: now, pts: popped.pts, audioTime: audioTime)
     }
 
-    private func logSync(now: Double, pts: Double, audioTime: Double) {
-        let elapsed = now - lastLogTime
+    private nonisolated func logSync(now: Double, pts: Double, audioTime: Double) {
+        let gen = playGeneration
+        let (elapsed, fpsSamples): (Double, Int) = displayLoopLock.withLock {
+            let e = now - lastLogTime
+            guard e > 5.0 else { return (0.0, 0) }
+            return (e, framesSinceLastLog)
+        }
         guard elapsed > 5.0 else { return }
-        let fps = Double(framesSinceLastLog) / elapsed
+        let fps = Double(fpsSamples) / elapsed
         let diff = Int((pts - audioTime) * 1000)
         let subCueCount = subtitleLock.withLock { subtitleCues.count }
         let subImgCount = subtitleImageLock.withLock { subtitleImageCues.count }
-        let subStreamIdx = demuxer?.subtitleStreamIndex ?? -1
-        logger.info("q=\(self.jitterBuffer.count) dur=\(Int(self.jitterBuffer.duration*1000))ms fps=\(String(format:"%.1f",fps)) diff=\(diff)ms a=\(String(format:"%.2f",audioTime))s v=\(String(format:"%.2f",pts))s buf=\(self.state.isBuffering) subStream=\(subStreamIdx) subCues=\(subCueCount) subImgCues=\(subImgCount)")
+        // state/demuxer reads + the cacheSpeed write stay on the main actor;
+        // the whole log line hops (5s cadence — the hop costs nothing).
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.playGeneration == gen else { return }
+            let subStreamIdx = self.demuxer?.subtitleStreamIndex ?? -1
+            logger.info("q=\(self.jitterBuffer.count) dur=\(Int(self.jitterBuffer.duration*1000))ms fps=\(String(format:"%.1f",fps)) diff=\(diff)ms a=\(String(format:"%.2f",audioTime))s v=\(String(format:"%.2f",pts))s buf=\(self.state.isBuffering) subStream=\(subStreamIdx) subCues=\(subCueCount) subImgCues=\(subImgCount)")
 
-        // Throughput: bytes read since last sample / elapsed.
-        let bytesDelta = totalBytesRead - lastBytesLogged
-        let tpElapsed = now - lastThroughputTime
-        if tpElapsed > 1.0 {
-            state.cacheSpeed = Int64(Double(bytesDelta) / tpElapsed)
-            lastBytesLogged = totalBytesRead
-            lastThroughputTime = now
+            // Throughput: bytes read since last sample / elapsed.
+            let (bytesDelta, tpElapsed): (Int64, Double) = displayLoopLock.withLock {
+                (self.totalBytesRead - self.lastBytesLogged, now - self.lastThroughputTime)
+            }
+            if tpElapsed > 1.0 {
+                self.state.cacheSpeed = Int64(Double(bytesDelta) / tpElapsed)
+                displayLoopLock.withLock {
+                    self.lastBytesLogged = self.totalBytesRead
+                    self.lastThroughputTime = now
+                }
+            }
+
+            displayLoopLock.withLock {
+                self.lastLogTime = now
+                self.framesSinceLastLog = 0
+                self.ticksSinceLastLog = 0
+            }
+        }
+    }
+
+    // MARK: - Display → UI bridge (P2: display thread off main)
+
+    /// One display tick's worth of UI state, produced on the display thread and
+    /// applied on the main actor. Optional fields mean "don't touch this field
+    /// this update"; the double-optional subtitle fields distinguish "no
+    /// change" (nil) from "subtitle cleared" (.some(nil)). `generation` drops
+    /// updates computed before a stop()/play() cycle — without it a stale
+    /// update would resurrect old position/subtitle values in a new session.
+    private struct DisplayUIUpdate {
+        var position: Duration? = nil
+        var durationAtLeast: Duration? = nil
+        var subtitleText: String?? = nil
+        var subtitleImage: CGImage?? = nil
+        var subtitleImageRect: CGRect? = nil
+        var generation: Int
+        var notify: Bool
+    }
+
+    /// Display-thread entry: hop to the main actor and apply.
+    private nonisolated func applyDisplayUpdate(_ u: DisplayUIUpdate) {
+        DispatchQueue.main.async { [weak self] in
+            self?.applyDisplayUpdateOnMain(u)
+        }
+    }
+
+    /// Main-actor side of the bridge. Applies position/buffered/subtitle
+    /// fields to `state` and notifies observers.
+    private func applyDisplayUpdateOnMain(_ u: DisplayUIUpdate) {
+        guard u.generation == playGeneration else { return }
+
+        if let pos = u.position { state.position = pos }
+        if let d = u.durationAtLeast, d > state.duration { state.duration = d }
+
+        // Update bufferedDuration. Prefer reader-level download offset (reflects
+        // actual pre-fetched bytes, not just the demux-loop's throttled read
+        // position which is capped at ~2s).
+        let currentSecs = Double(state.position.components.seconds)
+        let dlOffset = demuxer?.downloadedUpToOffset ?? -1
+        let fileBytes = demuxer?.totalFileBytes ?? -1
+        if dlOffset > 0, fileBytes > 0, state.duration > .zero {
+            let dlFraction = min(1.0, Double(dlOffset) / Double(fileBytes))
+            let dlSecs = dlFraction * Double(state.duration.components.seconds)
+            state.bufferedDuration = .milliseconds(Int64(max(0, dlSecs - currentSecs) * 1000))
+        } else {
+            // Fallback for URL-based streams without a custom reader.
+            let downloaded = maxDownloadedPts
+            state.bufferedDuration = downloaded > currentSecs
+                ? .milliseconds(Int64((downloaded - currentSecs) * 1000))
+                : .zero
         }
 
-        lastLogTime = now; framesSinceLastLog = 0; ticksSinceLastLog = 0
+        if let t = u.subtitleText { state.currentSubtitleText = t }
+        if let img = u.subtitleImage {
+            state.currentSubtitleImage = img
+            state.currentSubtitleImageRect = u.subtitleImageRect ?? .zero
+        }
+
+        if u.notify { notifyStateChange() }
     }
 
     // MARK: - Controls
@@ -1934,6 +2093,7 @@ public final class NativeBackend: PlayerBackend {
     public func pause() {
         logger.info("pause")
         displayLink?.invalidate(); displayLink = nil
+        displayLoopLock.withLock { displayLoopStopped = true }
         #if os(macOS)
         // Keep displayLinkProxy alive: CVDisplayLink's output callback holds an
         // unretained raw pointer to it. Releasing the proxy here would leave a
@@ -1995,7 +2155,7 @@ public final class NativeBackend: PlayerBackend {
             audioUnitOutput?.start(sampleRate: resumeSR, channels: resumeCh)
             audioUnitOutput?.pause()
             audioClock.reset(to: 0, sampleRate: resumeSR)
-            forceClockCalibration = true
+            displayLoopLock.withLock { forceClockCalibration = true }
         }
         // Continuous path (pipeline never stopped, e.g. PiP): resume audio output
         // regardless of jitter buffer state.
@@ -2025,6 +2185,7 @@ public final class NativeBackend: PlayerBackend {
         // the jitter buffer at 2× speed → stuck.
         displayLink?.invalidate()
         displayLink = nil
+        displayLoopLock.withLock { displayLoopStopped = true }
         #if os(iOS)
         displayLinkProxy = nil
         #endif
@@ -2035,7 +2196,7 @@ public final class NativeBackend: PlayerBackend {
         if !resumingContinuous {
             jitterBuffer.flush()
             syncController.reset()
-            lastBypassPopTime = 0
+            displayLoopLock.withLock { lastBypassPopTime = 0 }
             // Flush the video decoder after a pause/resume or PiP/background
             // transition. VTDecompressionSession may have been invalidated by
             // the system during the transition — VTVideoDecoder will recreate
@@ -2050,8 +2211,10 @@ public final class NativeBackend: PlayerBackend {
         // Calibrate audioClock to the first post-resume frame (like post-seek).
         // PiP 连续场景时钟从未停,无需校准。
         if !resumingContinuous {
-            needsClockCalibration = true
-            audioClockReady = false
+            displayLoopLock.withLock {
+                needsClockCalibration = true
+                audioClockReady = false
+            }
         }
         state.isPlaying = true; notifyStateChange()
     }
@@ -2079,16 +2242,16 @@ public final class NativeBackend: PlayerBackend {
         let mySerial: Int64 = seekLock.withLock { seekSerial += 1; return seekSerial }
 
         subtitleLock.withLock { subtitleCues.removeAll() }
-        lastSubtitleText = nil
+        displayLoopLock.withLock { lastSubtitleText = nil }
         state.currentSubtitleText = nil
         subtitleImageLock.withLock { subtitleImageCues.removeAll() }
-        lastSubtitleImage = nil
+        displayLoopLock.withLock { lastSubtitleImage = nil }
         state.currentSubtitleImage = nil
         state.currentSubtitleImageRect = .zero
 
         jitterBuffer.flush()
         syncController.reset()
-        lastBypassPopTime = 0
+        displayLoopLock.withLock { lastBypassPopTime = 0 }
         // The read-ahead frontier jumps to the seek target; a pre-seek wall
         // anchor would misestimate the fallback pacing position.
         passthroughWallClockAnchor = nil
@@ -2118,8 +2281,10 @@ public final class NativeBackend: PlayerBackend {
         // FFmpeg seek lands on the GOP boundary before secs, so audioClock(=secs)
         // would be ahead of the first decoded frame; without re-calibration the
         // display loop's skip-behind guard would drop the first few frames.
-        needsClockCalibration = true
-        audioClockReady = false
+        displayLoopLock.withLock {
+            needsClockCalibration = true
+            audioClockReady = false
+        }
         // 立即把 position 置为 seek 目标并通知:seek 到首帧渲染之间
         // displayNextFrame 不更新 position(渲染恢复后才写实际落点),
         // 不置位的话进度条/快进基准会停留在 seek 前的位置(旧值漂移,
@@ -2152,10 +2317,12 @@ public final class NativeBackend: PlayerBackend {
         let onLanded: @Sendable () -> Void = { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.needsClockCalibration = true
-                self.audioClockReady = false
+                self.displayLoopLock.withLock {
+                    self.needsClockCalibration = true
+                    self.audioClockReady = false
+                    self.lastBypassPopTime = 0
+                }
                 self.syncController.reset()
-                self.lastBypassPopTime = 0
             }
         }
         if synchronousDemuxerSeek {
@@ -2249,8 +2416,9 @@ public final class NativeBackend: PlayerBackend {
 
     public func stop() {
         playGeneration += 1  // discard any in-flight async open
-        logger.info("stop (displayed \(self.displayedVideoFrames) frames)")
+        logger.info("stop (displayed \(self.displayLoopLock.withLock { self.displayedVideoFrames }) frames)")
         displayLink?.invalidate(); displayLink = nil; displayLinkProxy = nil
+        displayLoopLock.withLock { displayLoopStopped = true }
         #if os(macOS)
         if let cv = cvDisplayLink, CVDisplayLinkIsRunning(cv) { CVDisplayLinkStop(cv) }
         cvDisplayLink = nil
@@ -2271,16 +2439,23 @@ public final class NativeBackend: PlayerBackend {
         demuxLock.unlock()
         jitterBuffer.flush()
         syncController.reset()
-        lastBypassPopTime = 0
-        forceClockCalibration = false
-        // Un-poison the status pipeline: without this, a position reported by a
-        // previous (e.g. frozen/free-wheeling) session persists here and every
-        // `(pos - lastNotifiedPos) >= 500ms` gate in displayNextFrame stays
-        // negative for the next session → Player/onStateChange copies freeze at
-        // 0 → cast /status reports a frozen position while the pipeline moves
-        // (2026-09-20 real-hardware regression: "next cast frozen until app
-        // restart").
-        lastNotifiedPos = .zero
+        displayLoopLock.withLock {
+            lastBypassPopTime = 0
+            forceClockCalibration = false
+            // Un-poison the status pipeline: without this, a position reported by a
+            // previous (e.g. frozen/free-wheeling) session persists here and every
+            // `(pos - lastNotifiedPos) >= 500ms` gate in displayNextFrame stays
+            // negative for the next session → Player/onStateChange copies freeze at
+            // 0 → cast /status reports a frozen position while the pipeline moves
+            // (2026-09-20 real-hardware regression: "next cast frozen until app
+            // restart").
+            lastNotifiedPos = .zero
+            displayedVideoFrames = 0
+            lastBytesLogged = 0
+            lastThroughputTime = 0
+            lastSubtitleText = nil
+            lastSubtitleImage = nil
+        }
         passthroughWallClockAnchor = nil
         audioClock.reset(to: 0, sampleRate: 44100)  // critical: must reset or stale seek position
                                                      // from previous session pollutes AudioClock
@@ -2288,14 +2463,11 @@ public final class NativeBackend: PlayerBackend {
         _renderer.clear()  // hide the previous video's last frame until the new
                            // video renders its first frame (MetalRenderer.display
                            // flips opacity back to 1 on first frame)
-        displayedVideoFrames = 0
-        totalBytesRead = 0; lastBytesLogged = 0; lastThroughputTime = 0
+        totalBytesRead = 0
         maxDownloadedPts = 0
         subtitleLock.withLock { subtitleCues.removeAll() }
-        lastSubtitleText = nil
         state.currentSubtitleText = nil
         subtitleImageLock.withLock { subtitleImageCues.removeAll() }
-        lastSubtitleImage = nil
         state.currentSubtitleImage = nil
         state.currentSubtitleImageRect = .zero
         subtitleDecoder = nil
@@ -2342,7 +2514,7 @@ public final class NativeBackend: PlayerBackend {
         videoDecoder?.flush()
         jitterBuffer.flush()
         syncController.reset()
-        lastBypassPopTime = 0
+        displayLoopLock.withLock { lastBypassPopTime = 0 }
         _renderer.flush()
 
         // 5. Recreate audio output with new decoder's parameters
@@ -2352,14 +2524,17 @@ public final class NativeBackend: PlayerBackend {
         audioUnitOutput = AudioUnitOutput(clock: audioClock)
         audioUnitOutput?.start(sampleRate: sr, channels: ch)
         audioUnitOutput?.pause()
-        needsClockCalibration = true
+        displayLoopLock.withLock {
+            needsClockCalibration = true
+            audioClockReady = false
+        }
         // Reset audioClockReady — TrueHD has significant decoder delay (first
         // several packets produce no PCM output), so audioClock stays frozen at
         // posSecs while video PTS advances.  Without this reset, the display
         // loop's freeze-ahead/skip-behind guard uses the stale audioClock and
         // produces a persistent A/V desync that never converges.  Mirrors the
         // seek()/play() paths which both set audioClockReady = false.
-        audioClockReady = false
+        displayLoopLock.withLock { audioClockReady = false }
         // Reset download tracking for the new seek position (same as seek()).
         maxDownloadedPts = posSecs
 
@@ -2404,11 +2579,11 @@ public final class NativeBackend: PlayerBackend {
         let hadImage = state.currentSubtitleImage != nil
         subtitleLock.withLock { subtitleCues.removeAll() }
         subtitleImageLock.withLock { subtitleImageCues.removeAll() }
-        lastSubtitleImage = nil
+        displayLoopLock.withLock { lastSubtitleImage = nil }
         state.currentSubtitleImage = nil
         state.currentSubtitleImageRect = .zero
 
-        lastSubtitleText = nil
+        displayLoopLock.withLock { lastSubtitleText = nil }
         state.currentSubtitleText = nil
         state.selectedSubtitleTrackId = trackId
         if hadText || hadImage {
@@ -2491,19 +2666,23 @@ public final class NativeBackend: PlayerBackend {
     public func prepareForReuse() { stop() }
 
     public func addFrameSink(_ sink: any FrameSink) {
-        _frameSinks.removeAll { $0.sink == nil }
-        _frameSinks.append(WeakFrameSink(sink: sink))
+        renderConfigLock.withLock {
+            _frameSinks.removeAll { $0.sink == nil }
+            _frameSinks.append(WeakFrameSink(sink: sink))
+        }
     }
 
     public func removeFrameSink(_ sink: any FrameSink) {
-        _frameSinks.removeAll { $0.sink == nil || $0.sink === sink }
+        renderConfigLock.withLock {
+            _frameSinks.removeAll { $0.sink == nil || $0.sink === sink }
+        }
     }
 
     // MARK: - Display link
 
     private func startDisplayLink() {
         displayLinkStartWallTime = CACurrentMediaTime()
-        firstTickLogged = false
+        displayLoopLock.withLock { firstTickLogged = false; displayLoopStopped = false }
         #if os(iOS) || os(tvOS)
         let proxy = DisplayLinkProxy(backend: self)
         displayLinkProxy = proxy
@@ -2515,12 +2694,28 @@ public final class NativeBackend: PlayerBackend {
         if #available(iOS 15.0, tvOS 15.0, *) {
             link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
         }
-        link.add(to: .main, forMode: .common)
+        // P2: run the display link on a dedicated background runloop thread
+        // instead of .main — video presentation no longer competes with UI work.
+        // The link is registered from inside the thread (a CADisplayLink must be
+        // added to its runloop before that runloop is driven; creating it on the
+        // main thread and handing it over is fine). stop()/pause()/seek() set
+        // displayLoopStopped, the loop notices within 0.5s and exits.
         displayLink = link
+        let thread = Thread { [weak self] in
+            let rl = RunLoop.current
+            rl.add(link, forMode: .common)
+            while !(self?.displayLoopStopped ?? true) {
+                rl.run(mode: .common, before: Date(timeIntervalSinceNow: 0.5))
+            }
+        }
+        thread.name = "io.reflex.PlayerKit.displayLink"
+        thread.qualityOfService = .userInteractive
+        displayLinkThread = thread
+        thread.start()
         #elseif os(macOS)
-        // CVDisplayLink runs on a high-priority background thread; the callback
-        // must hop to the main actor to call displayNextFrame (which touches
-        // @MainActor-isolated backend state and the Metal renderer).
+        // P2: CVDisplayLink's own high-priority thread drives displayNextFrame
+        // directly — no main-queue hop. displayNextFrame only touches locked /
+        // nonisolated state and hops UI writes via applyDisplayUpdate.
         if cvDisplayLink == nil {
             var link: CVDisplayLink?
             CVDisplayLinkCreateWithActiveCGDisplays(&link)
@@ -2540,20 +2735,19 @@ public final class NativeBackend: PlayerBackend {
         CVDisplayLinkSetOutputCallback(cvDisplayLink!, { _, _, _, _, _, ctx in
             guard let ctx else { return kCVReturnSuccess }
             let p = Unmanaged<DisplayLinkProxy>.fromOpaque(ctx).takeUnretainedValue()
-            DispatchQueue.main.async { p.tick() }
+            p.tick()
             return kCVReturnSuccess
         }, proxyPtr)
         if let cv = cvDisplayLink, !CVDisplayLinkIsRunning(cv) {
             CVDisplayLinkStart(cv)
         }
-        // 兜底驱动(见 fallbackRenderTimer 属性注释)。主 queue 保证与
-        // MainActor 隔离一致;displayNextFrame 幂等,双驱动无副作用。
+        // 兜底驱动(见 fallbackRenderTimer 属性注释)。displayNextFrame 幂等
+        // (renderGate tryLock),双驱动无副作用;后台串行 queue 不再占主线程。
         fallbackRenderTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: .main)
+        let timer = DispatchSource.makeTimerSource(queue: displayFallbackQueue)
         timer.schedule(deadline: .now() + 0.05, repeating: 0.033)
         timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            MainActor.assumeIsolated { self.displayNextFrame() }
+            self?.displayNextFrame()
         }
         timer.resume()
         fallbackRenderTimer = timer

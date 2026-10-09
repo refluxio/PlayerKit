@@ -60,7 +60,7 @@ public class ASBDLRenderer: VideoRenderer {
         displayLayer.videoGravity = .resizeAspect
     }
 
-    public func render(
+    public nonisolated func render(
         pixelBuffer: CVPixelBuffer,
         pts: Double,
         colorParams: VideoColorParams,
