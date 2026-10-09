@@ -1,7 +1,14 @@
 import Foundation
 
-/// ffplay-style frame_timer + low-pass A/V sync. Main-thread only — no locks needed.
+/// ffplay-style frame_timer + low-pass A/V sync.
+///
+/// Threading (P2 display-off-main): check()/advance() run on the display-link
+/// thread — video presentation no longer waits for the main thread — while
+/// reset() arrives from main-thread lifecycle paths (seek/resume/stop/open).
+/// All mutable state is therefore guarded by `lock`.
 final class SyncController {
+
+    private let lock = NSLock()
 
     let alpha: Double = 0.15
     let maxDelay: Double = 0.5
@@ -16,20 +23,24 @@ final class SyncController {
 
     private var frameTimer: Double = 0
     private var frameTimerSerial: Int64 = -1
-    private(set) var lastDisplayedPTS: Double = -1
+    private var lastDisplayedPTS: Double = -1
     private var lastDuration: Double = 0.04
 
     /// Whether at least one frame has been displayed since creation or reset.
     /// Used by display loop to gate freeze/skip — first post-seek frame always shows.
-    var hasDisplayedFrame: Bool { lastDisplayedPTS >= 0 }
+    var hasDisplayedFrame: Bool {
+        lock.withLock { lastDisplayedPTS >= 0 }
+    }
 
-    /// Call every CADisplayLink tick. Returns (shouldDisplay, computedDelay).
+    /// Call every display tick. Returns (shouldDisplay, computedDelay).
     /// Pass the returned delay to advance() when displaying.
     func check(nextPTS: Double,
                followingPTS: Double?,
                audioTime: Double,
                now: Double,
                serial: Int64) -> (Bool, Double) {
+
+        lock.lock(); defer { lock.unlock() }
 
         if frameTimerSerial != serial {
             frameTimer = now
@@ -40,7 +51,7 @@ final class SyncController {
         // leaves frameTimer at 'now', and subsequent checks use nominal delay from there.
         if lastDisplayedPTS < 0 { return (true, 0) }
 
-        let nominalDelay = nominalFrameDuration(nextPTS: nextPTS, followingPTS: followingPTS)
+        let nominalDelay = nominalFrameDurationLocked(nextPTS: nextPTS, followingPTS: followingPTS)
         let delay = computeDelay(nominalDelay: nominalDelay, nextPTS: nextPTS, audioTime: audioTime)
         return (now >= frameTimer + delay, delay)
     }
@@ -49,23 +60,25 @@ final class SyncController {
     /// Uses the delay returned from check() — not the nominal duration — so A/V corrections
     /// actually affect when the next frame is shown.
     func advance(delay: Double, pts: Double, followingPTS: Double?, audioTime: Double, now: Double) {
+        lock.lock(); defer { lock.unlock() }
         frameTimer += delay
         // AV_SYNC_FRAMEDUP_THRESHOLD: reset on system stall (e.g., app backgrounded)
         if now > frameTimer + 0.1 { frameTimer = now }
         lastDisplayedPTS = pts
-        lastDuration = nominalFrameDuration(nextPTS: pts, followingPTS: followingPTS)
+        lastDuration = nominalFrameDurationLocked(nextPTS: pts, followingPTS: followingPTS)
     }
 
     func reset() {
+        lock.lock(); defer { lock.unlock() }
         frameTimer = 0
         frameTimerSerial = -1
         lastDisplayedPTS = -1
         lastDuration = 0.04
     }
 
-    // MARK: - Private
+    // MARK: - Private (call only under lock)
 
-    private func nominalFrameDuration(nextPTS: Double, followingPTS: Double?) -> Double {
+    private func nominalFrameDurationLocked(nextPTS: Double, followingPTS: Double?) -> Double {
         if let f = followingPTS, f > nextPTS { return f - nextPTS }
         return lastDuration > 0 ? lastDuration : 0.04
     }

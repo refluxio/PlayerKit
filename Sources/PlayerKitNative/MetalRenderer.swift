@@ -146,7 +146,7 @@ final class MetalRenderer: VideoRenderer {
         self.sampleAspectRatio = sampleAspectRatio
     }
 
-    func render(pixelBuffer: CVPixelBuffer,
+    nonisolated func render(pixelBuffer: CVPixelBuffer,
                 pts: Double,
                 colorParams: VideoColorParams,
                 metadata: FrameMetadata,

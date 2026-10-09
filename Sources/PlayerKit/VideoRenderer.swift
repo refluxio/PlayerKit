@@ -165,7 +165,13 @@ public struct VideoColorParams: Equatable, Sendable {
 // MARK: - VideoRenderer
 
 /// Renders decoded video frames onto a Core Animation layer.
-@MainActor
+///
+/// P2 (display-off-main): deliberately NOT @MainActor. The protocol used to
+/// infer main-actor isolation onto every conforming renderer, which forced
+/// `displayNextFrame` to hop to the main thread each frame. Since P2 the
+/// render path runs on the display-link thread: `render` must be thread-safe,
+/// and layer manipulation stays on whatever thread the app drives UI from
+/// (unconstrained, as CALayer itself is).
 public protocol VideoRenderer: AnyObject {
     /// The Core Animation layer that displays the video content.
     var layer: CALayer { get }
@@ -190,7 +196,12 @@ public protocol VideoRenderer: AnyObject {
     ///     Empty `FrameMetadata()` for SDR / VT-decoded frames.
     ///   - strategy: The `RendererStrategy` chosen for this stream at open time,
     ///     or nil when no strategy resolution was performed (legacy callers).
-    func render(pixelBuffer: CVPixelBuffer,
+    ///
+    /// P2 (display-off-main): called from the display-link thread — every
+    /// conforming renderer's implementation must be thread-safe (ASBDL's
+    /// `AVSampleBufferDisplayLayer.enqueue`, Metal command buffers, EDR's
+    /// locked tone-map state).
+    nonisolated func render(pixelBuffer: CVPixelBuffer,
                 pts: Double,
                 colorParams: VideoColorParams,
                 metadata: FrameMetadata,

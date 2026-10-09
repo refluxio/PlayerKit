@@ -11,7 +11,9 @@ final class AudioClockTests: XCTestCase {
     func testAdvanceByOneSecond() {
         let clock = AudioClock()
         // 44100Hz, 2ch, float32: 1秒 = 44100 × 2 × 4 = 352800 bytes
-        clock.advance(byteCount: 352800, channels: 2)
+        // maxAdvanceSeconds=0.2 的单次调用上限(AudioQueue 批量回调防跳变,见
+        // AudioClock.advance 注释)是有意设计,分 5 次入账 1s。
+        for _ in 0..<5 { clock.advance(byteCount: 352800 / 5, channels: 2) }
         XCTAssertEqual(clock.audioTime, 1.0, accuracy: 0.001)
     }
 
@@ -41,8 +43,8 @@ final class AudioClockTests: XCTestCase {
         let clock = AudioClock()
         clock.reset(to: 5.0, sampleRate: 48000)
         XCTAssertEqual(clock.audioTime, 5.0, accuracy: 0.001)
-        // 48000Hz, 2ch: 1秒 = 48000 × 2 × 4 = 384000 bytes
-        clock.advance(byteCount: 384000, channels: 2)
+        // 48000Hz, 2ch: 1秒 = 48000 × 2 × 4 = 384000 bytes(单次 0.2s 上限,分 5 次)
+        for _ in 0..<5 { clock.advance(byteCount: 384000 / 5, channels: 2) }
         XCTAssertEqual(clock.audioTime, 6.0, accuracy: 0.001)
     }
 
