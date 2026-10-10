@@ -67,7 +67,11 @@ final class MultiClipDemuxer: @unchecked Sendable {
         // per seek on a BD original. The pre-opened next clip also stays
         // valid (the current clip didn't change), so nothing is discarded.
         if clipIndex == currentIndex, let current {
-            if let localSeekSecs, localSeekSecs > 0 {
+            // The open demuxer's playhead is arbitrary, so unlike the
+            // fresh-open fallback (which already sits at local 0 and may skip
+            // a zero seek) this path must issue even a seek to 0 — otherwise
+            // "seek to the current clip's start" silently no-ops.
+            if let localSeekSecs {
                 _ = current.seek(to: localSeekSecs)
             }
             return
