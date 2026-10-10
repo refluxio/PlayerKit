@@ -36,6 +36,34 @@ public final class AudioUnitOutput: AudioOutputBackend {
     // tests can play real content silently. Guarded by lock.
     nonisolated(unsafe) static var tracksPlayedContent = false
     nonisolated(unsafe) static var mutedForTesting = false
+
+    /// Test seams for the AudioQueue control entry points. Production uses the
+    /// real functions; tests substitute slow/stuck implementations to prove the
+    /// control calls never block their caller (see the non-blocking contract
+    /// tests). Reset in test tearDown.
+    nonisolated(unsafe) static var pauseImpl: (AudioQueueRef) -> OSStatus = { AudioQueuePause($0) }
+    nonisolated(unsafe) static var startImpl: (AudioQueueRef) -> OSStatus = { AudioQueueStart($0, nil) }
+
+    /// Serial queue that owns every AudioQueue control call (Pause/Start).
+    ///
+    /// These calls dispatch_sync into AudioToolbox's internal server context —
+    /// the same serial context the macOS CVDisplayLink tick runs on. The
+    /// 2026-10-10 seek freeze: the display tick (jitter pop → underrun) called
+    /// pause() and its AudioQueuePause got stuck in BeginPause's IO-cycle wait
+    /// on that context, while the demux thread (jitter append → refill resume)
+    /// dispatch_sync'd AudioQueueStart behind it — pipeline-wide deadlock, no
+    /// supply, silent logs, ~50% CPU. Hot paths (jitter append/pop callbacks,
+    /// seek path) must therefore never block on a control call: the flag flips
+    /// synchronously (enqueue cap / clock semantics unchanged) and only the
+    /// AudioQueue call is dispatched here. Serial ⇒ pause→resume order is
+    /// preserved; the queue ref is re-read under the lock inside the block so
+    /// a stop()/flush() that ran first is skipped.
+    private let controlQueue = DispatchQueue(label: "io.reflex.PlayerKit.audio.control")
+
+    private func currentQueueLocked() -> AudioQueueRef? {
+        lock.lock(); defer { lock.unlock() }
+        return audioQueue
+    }
     private var contentFifo: [(pts: Double, dur: Double)] = []
     private var playedContentEndPTS: Double = .nan
 
@@ -44,6 +72,13 @@ public final class AudioUnitOutput: AudioOutputBackend {
     func playedContentEnd() -> Double {
         lock.lock(); defer { lock.unlock() }
         return playedContentEndPTS
+    }
+
+    /// Test seam: whether a live AudioQueue exists (start() succeeded). Tests
+    /// skip the control-call contracts when the environment has no device.
+    var hasQueueForTesting: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return audioQueue != nil
     }
 
     /// Upper bound (seconds of audio) the queue may hold while it is paused.
@@ -213,33 +248,39 @@ public final class AudioUnitOutput: AudioOutputBackend {
         }
     }
 
-    /// Pause without destroying the queue or resetting the clock.
+    /// Pause without destroying the queue or resetting the clock. Non-blocking:
+    /// the AudioQueuePause is dispatched onto `controlQueue` (see its doc).
     public func pause() {
         lock.lock()
         let queue = audioQueue
         if !paused { paused = true }
         lock.unlock()
-        if let queue {
-            AudioQueuePause(queue)
+        guard queue != nil else { return }
+        controlQueue.async { [weak self] in
+            guard let self, let q = self.currentQueueLocked() else { return }
+            _ = Self.pauseImpl(q)
         }
     }
 
-    /// Resume after pause().
+    /// Resume after pause(). Non-blocking, same dispatch as pause().
     public func resume() {
         lock.lock()
         let queue = audioQueue
         if paused { paused = false }
         lock.unlock()
-        guard let queue else {
+        guard queue != nil else {
             // 音频队列尚不存在时被要求恢复:start() 未跑或队列已 dispose。
             // 若此后不再有 .playing 翻转,音频会永久暂停 → audioClock 卡 0
             // → 同步旁路加速/卡死。这是 _finishOpen 竞态的直接症状。
             logger.warning("resume() called but audioQueue is nil")
             return
         }
-        let rc = AudioQueueStart(queue, nil)
-        if rc != noErr {
-            logger.error("AudioQueueStart(resume) FAILED: \(rc)")
+        controlQueue.async { [weak self] in
+            guard let self, let q = self.currentQueueLocked() else { return }
+            let rc = Self.startImpl(q)
+            if rc != noErr {
+                logger.error("AudioQueueStart(resume) FAILED: \(rc)")
+            }
         }
     }
 
@@ -291,10 +332,17 @@ public final class AudioUnitOutput: AudioOutputBackend {
         lock.unlock()
 
         // Only (re)start if not deliberately paused by the buffering state machine.
+        // Dispatched like pause()/resume(): this runs on the demux thread, the
+        // same hot path the 2026-10-10 deadlock froze — a Start issued here just
+        // before .buffering flips the flag would otherwise dispatch_sync into
+        // the AudioToolbox server context behind a stuck BeginPause.
         if shouldRestart {
-            let rc = AudioQueueStart(queue, nil)
-            if rc != noErr {
-                logger.error("AudioQueueStart(enqueue) FAILED: \(rc)")
+            controlQueue.async { [weak self] in
+                guard let self, let q = self.currentQueueLocked() else { return }
+                let rc = Self.startImpl(q)
+                if rc != noErr {
+                    logger.error("AudioQueueStart(enqueue) FAILED: \(rc)")
+                }
             }
         }
     }

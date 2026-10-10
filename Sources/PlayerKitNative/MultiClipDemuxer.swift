@@ -59,6 +59,23 @@ final class MultiClipDemuxer: @unchecked Sendable {
     var currentDemuxer: FFmpegDemuxer? { current }
 
     private func switchTo(clipIndex: Int, localSeekSecs: Double?) throws {
+        // Same-clip seek fast path: the clip's demuxer is already fully open,
+        // and FFmpegDemuxer.seek positions it byte-domain exactly like the
+        // fallback's open-then-seek, minus the reopen. Reopening here cost
+        // avformat_open_input + find_stream_info (~1.5-2s) plus a redundant
+        // byte seek on EVERY within-clip scrub — measured 4.5-6s end-to-end
+        // per seek on a BD original. The pre-opened next clip also stays
+        // valid (the current clip didn't change), so nothing is discarded.
+        if clipIndex == currentIndex, let current {
+            // The open demuxer's playhead is arbitrary, so unlike the
+            // fresh-open fallback (which already sits at local 0 and may skip
+            // a zero seek) this path must issue even a seek to 0 — otherwise
+            // "seek to the current clip's start" silently no-ops.
+            if let localSeekSecs {
+                _ = current.seek(to: localSeekSecs)
+            }
+            return
+        }
         // Never release the outgoing clip's reader here: clip readers may
         // share one underlying connection (MediaRandomAccessReader.close()
         // is "Called by the player when playback stops"), so closing it at a
@@ -68,13 +85,17 @@ final class MultiClipDemuxer: @unchecked Sendable {
         let pre = preOpenedNext
         preOpenedNext = nil
         var reusedPreOpened = false
-        if let pre, pre.index == clipIndex, localSeekSecs == nil {
-            // EOF seam — the next clip was already opened in the background;
-            // hand it over without paying the open cost again. Only valid
-            // when not seeking: a seek target clip isn't necessarily the
-            // sequential next one, so the cache can't be trusted there.
+        if let pre, pre.index == clipIndex {
+            // The target clip was already opened in the background (EOF seam,
+            // or a seek whose target happens to be the sequential next clip —
+            // the index match is what makes the cache valid, and FFmpegDemuxer
+            // seeks byte-domain so seeking a freshly-opened demuxer equals the
+            // fallback's open-then-seek).
             current = pre.demuxer
             reusedPreOpened = true
+            if let localSeekSecs, localSeekSecs > 0 {
+                _ = pre.demuxer.seek(to: localSeekSecs)
+            }
         } else {
             // Cache miss (seek target differs from the sequential next clip,
             // or the background open hadn't landed yet) — discard the stale

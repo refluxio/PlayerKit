@@ -181,37 +181,29 @@ final class VTVideoDecoder {
         guard let session, let formatDesc else { return nil }
 
         // ── Phase 2: convert to length-prefixed AVCC/HVCC and decode ────────
+        // isIDR classifies whether this packet's NAL stream contains an IDR
+        // slice — it feeds the idr/nonIDR success/failure counters that
+        // needsSoftwareFallback uses below.
         let lpData: Data
+        var isIDR = false
         if isAnnexB {
-            let raw     = Array(UnsafeBufferPointer(start: dataPtr, count: dataSize))
-            let nalUnits = VTVideoDecoder.splitAnnexB(raw).filter { nalu -> Bool in
-                guard !nalu.isEmpty else { return false }
-                if isH264 { let t = Int(nalu[0] & 0x1F);       return t != 7 && t != 8 }
-                else       { let t = Int((nalu[0] >> 1) & 0x3F); return t != 32 && t != 33 && t != 34 }
-            }
-            guard !nalUnits.isEmpty else { return nil }
+            // Single pass over the packet's bytes: parameter-set filter +
+            // length-prefix join + IDR classification. The old path value-
+            // copied the packet into [UInt8] and ran splitAnnexB twice (once
+            // for the filter, once for the IDR probe) — measured ~90% of
+            // demux-thread CPU on 4K HEVC remuxes, pinning decode supply at
+            // ~1× realtime.
             var data = Data(capacity: dataSize)
-            for nalu in nalUnits {
-                var len = UInt32(nalu.count).bigEndian
-                withUnsafeBytes(of: &len) { data.append(contentsOf: $0) }
-                data.append(contentsOf: nalu)
-            }
+            let foundIDR = VTVideoDecoder.annexBToLengthPrefixedClassified(
+                UnsafeBufferPointer(start: dataPtr, count: dataSize),
+                isH264: isH264, into: &data)
+            guard !data.isEmpty else { return nil }
             lpData = data
+            isIDR = foundIDR
         } else {
             lpData = Data(bytes: dataPtr, count: dataSize)
         }
         guard !lpData.isEmpty else { return nil }
-
-        // Classify whether this packet's NAL stream contains an IDR slice
-        // (type 5) — feeds the idr/nonIDR success/failure counters that
-        // needsSoftwareFallback uses above.
-        var isIDR = false
-        if isAnnexB {
-            let raw = Array(UnsafeBufferPointer(start: dataPtr, count: dataSize))
-            for nalu in VTVideoDecoder.splitAnnexB(raw) where !nalu.isEmpty {
-                if Int(nalu[0] & 0x1F) == 5 { isIDR = true; break }
-            }
-        }
 
         // Build CMSampleTimingInfo from the packet's PTS/DTS so VT can
         // reorder B-frames correctly. Without this (previously all-zero),
@@ -581,6 +573,70 @@ final class VTVideoDecoder {
             result.append(contentsOf: nal)
         }
         return result
+    }
+
+    /// Single-pass per-packet Annex-B → AVCC converter. Walks the packet's
+    /// bytes once on the caller's buffer (no intermediate [UInt8] copies),
+    /// drops parameter-set NALs the way the decode path always has, writes
+    /// 4-byte length-prefixed NALs into `out`, and reports whether the kept
+    /// NALs contain an IDR slice: H.264 type 5, HEVC types 19/20
+    /// (IDR_W_RADL / IDR_N_LP). The legacy second scan probed H.264 type 5
+    /// regardless of codec, so HEVC IDR packets were silently classified as
+    /// non-IDR.
+    ///
+    /// This replaces the old per-packet pipeline (Array(UnsafeBufferPointer)
+    /// value copy + splitAnnexB for the filter + splitAnnexB again for the
+    /// IDR probe), which sampled at ~90% of demux-thread CPU on 4K HEVC
+    /// remuxes and pinned decode supply at ~1× realtime (2026-10-10
+    /// stutter investigation).
+    static func annexBToLengthPrefixedClassified(
+        _ raw: UnsafeBufferPointer<UInt8>, isH264: Bool, into out: inout Data
+    ) -> Bool {
+        let n = raw.count
+        var isIDR = false
+        out.reserveCapacity(out.count + n)
+        var i = 0
+        var start = -1
+        while i < n {
+            let is4 = i + 3 < n && raw[i] == 0 && raw[i+1] == 0 && raw[i+2] == 0 && raw[i+3] == 1
+            let is3 = !is4 && i + 2 < n && raw[i] == 0 && raw[i+1] == 0 && raw[i+2] == 1
+            if is4 || is3 {
+                if start >= 0,
+                   emitLengthPrefixedNAL(raw, start, i, isH264: isH264, into: &out) {
+                    isIDR = true
+                }
+                i += is4 ? 4 : 3
+                start = i
+            } else {
+                i += 1
+            }
+        }
+        if start >= 0,
+           emitLengthPrefixedNAL(raw, start, n, isH264: isH264, into: &out) {
+            isIDR = true
+        }
+        return isIDR
+    }
+
+    /// Emits the NAL spanning [start, end) of `raw` into `out` with a 4-byte
+    /// big-endian length prefix unless it is a parameter-set NAL (H.264
+    /// SPS/PPS, HEVC VPS/SPS/PPS). The NAL header byte is the first byte
+    /// after the start code, so it is readable directly at `start`. Returns
+    /// whether the emitted NAL is an IDR slice (H.264 type 5, HEVC 19/20).
+    private static func emitLengthPrefixedNAL(
+        _ raw: UnsafeBufferPointer<UInt8>, _ start: Int, _ end: Int,
+        isH264: Bool, into out: inout Data
+    ) -> Bool {
+        let len = end - start
+        guard len > 0 else { return false }
+        let b = raw[start]
+        let t = isH264 ? Int(b & 0x1F) : Int((b >> 1) & 0x3F)
+        let isParam = isH264 ? (t == 7 || t == 8) : (t == 32 || t == 33 || t == 34)
+        guard !isParam else { return false }
+        var lp = UInt32(len).bigEndian
+        withUnsafeBytes(of: &lp) { out.append(contentsOf: $0) }
+        out.append(contentsOf: UnsafeBufferPointer(rebasing: raw[start..<end]))
+        return isH264 ? t == 5 : (t == 19 || t == 20)
     }
 
     /// Create a VTDecompressionSession. When `is10Bit` is true, requests 10-bit
