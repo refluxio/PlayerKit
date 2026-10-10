@@ -1,0 +1,15 @@
+ci:
+  - changed-files:
+      - any-glob-to-any-file: ['.github/**']
+framework:
+  - changed-files:
+      - any-glob-to-any-file: ['Sources/**']
+tests:
+  - changed-files:
+      - any-glob-to-any-file: ['Tests/**']
+examples:
+  - changed-files:
+      - any-glob-to-any-file: ['Examples/**']
+documentation:
+  - changed-files:
+      - any-glob-to-any-file: ['docs/**', '**/*.md']
