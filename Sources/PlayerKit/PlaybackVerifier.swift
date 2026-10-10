@@ -339,10 +339,10 @@ public final class PlaybackVerifier: VideoRenderer {
         stateLock.withLock { _probeMapping = probe }
     }
 
-    private var probeMapping: ProbeToneMapping? {
-        get { stateLock.withLock { _probeMapping } }
-        set { stateLock.withLock { _probeMapping = newValue } }
-    }
+    /// Lock discipline: writes go through `_probeMapping` under `stateLock`
+    /// directly (callers already hold the lock); a computed setter here would
+    /// re-take the non-recursive lock from inside `withLock` closures.
+    private var probeMapping: ProbeToneMapping? { stateLock.withLock { _probeMapping } }
     private var _probeMapping: ProbeToneMapping?
 
     // MARK: VideoRenderer (forwarding + observation)
