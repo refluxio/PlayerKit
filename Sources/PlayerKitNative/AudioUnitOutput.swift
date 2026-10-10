@@ -332,10 +332,17 @@ public final class AudioUnitOutput: AudioOutputBackend {
         lock.unlock()
 
         // Only (re)start if not deliberately paused by the buffering state machine.
+        // Dispatched like pause()/resume(): this runs on the demux thread, the
+        // same hot path the 2026-10-10 deadlock froze — a Start issued here just
+        // before .buffering flips the flag would otherwise dispatch_sync into
+        // the AudioToolbox server context behind a stuck BeginPause.
         if shouldRestart {
-            let rc = AudioQueueStart(queue, nil)
-            if rc != noErr {
-                logger.error("AudioQueueStart(enqueue) FAILED: \(rc)")
+            controlQueue.async { [weak self] in
+                guard let self, let q = self.currentQueueLocked() else { return }
+                let rc = Self.startImpl(q)
+                if rc != noErr {
+                    logger.error("AudioQueueStart(enqueue) FAILED: \(rc)")
+                }
             }
         }
     }

@@ -90,6 +90,38 @@ final class AudioUnitOutputControlNonBlockingTests: XCTestCase {
         releaseControlCall.signal()
     }
 
+    /// enqueue() must not block its caller on the restart AudioQueueStart
+    /// either — it runs on the demux thread, the same hot path the 2026-10-10
+    /// deadlock froze (via resume()'s synchronous Start). Contract mirrors the
+    /// pause/resume tests: the buffer goes into the queue synchronously and the
+    /// control call is issued off-thread.
+    func testEnqueueDoesNotBlockCallerWhenAudioQueueStartIsStuck() throws {
+        let output = makeStartedOutput()
+        defer { output.stop() }
+        guard output.hasQueueForTesting else {
+            throw XCTSkip("no AudioQueue available in this environment")
+        }
+
+        let enteredControlCall = DispatchSemaphore(value: 0)
+        let releaseControlCall = DispatchSemaphore(value: 0)
+        AudioUnitOutput.startImpl = { _ in
+            enteredControlCall.signal()
+            releaseControlCall.wait()   // simulate a stuck AudioToolbox server context
+            return noErr
+        }
+
+        let callerReturned = expectation(description: "enqueue() returned to caller")
+        DispatchQueue.global().async {
+            output.enqueue(PCMFrame(data: Data(count: 512 * 2 * 4), pts: 0, sampleCount: 512))
+            callerReturned.fulfill()
+        }
+        wait(for: [callerReturned], timeout: 5)
+
+        XCTAssertEqual(enteredControlCall.wait(timeout: .now() + 5), .success,
+            "enqueue() must still issue the restart AudioQueueStart, only asynchronously")
+        releaseControlCall.signal()
+    }
+
     /// pause() → resume() must end UP resumed: the serial control queue keeps
     /// the Start after the Pause even though both are async, and the flush+
     /// enqueue-after-pause semantics (see PausedEnqueue tests) still play out.
