@@ -1,0 +1,86 @@
+# Nightly corpus regression (P6b): ci.yml + schedule, nothing else.
+# On failure the run just fails (existing notifications cover it). To file a
+# hdr-verify issue from a locally archived session, run the reflux repo's
+# `Tools/verify-report-to-issue.py` (dry-run by default) and
+# `Tools/hdr-session-compare.py` manually.
+
+name: Nightly
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build & Test (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Select Xcode
+        run: |
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          XCODE_APP=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$XCODE_APP" ]; then
+            echo "Selecting $XCODE_APP"
+            sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          else
+            echo "No explicit Xcode.app found — keeping runner default"
+            xcode-select -p
+          fi
+
+      - name: Print environment
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build
+        run: xcrun swift build -v
+
+      - name: Test
+        run: xcrun swift test --parallel
+
+  lint:
+    name: SwiftFormat (dry run)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: |
+          # No swift-format installed by default — skip until added.
+          echo "swift-format check disabled (tool not yet wired)."
+
+  docs:
+    name: Generate Docs
+    runs-on: macos-14
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - name: Dump symbol graph
+        run: xcrun swift package dump-symbol-graph --minimum-access-level public
+      - name: Generate DocC archive
+        run: |
+          xcrun docc convert \
+            --additional-symbol-graph-dir .build/*/symbolgraph \
+            --output-dir .build/docs \
+            --fallback-display-name PlayerKit \
+            --fallback-bundle-identifier io.reflex.PlayerKit
+      - name: Package docs archive
+        run: tar -czf PlayerKit-docs.tar.gz -C .build docs
+      - name: Upload docs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlayerKit-docs
+          path: PlayerKit-docs.tar.gz
