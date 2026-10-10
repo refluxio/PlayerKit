@@ -2,14 +2,32 @@ name: lgtm-merge
 on:
   pull_request:
     types: [labeled]
+  issue_comment:
+    types: [created]
 permissions:
   contents: write
   pull-requests: write
 jobs:
   lgtm:
-    if: github.event.label.name == 'lgtm' && github.event.pull_request.state == 'open'
+    if: >-
+      (github.event_name == 'pull_request' && github.event.label.name == 'lgtm' && github.event.pull_request.state == 'open') ||
+      (github.event_name == 'issue_comment' && github.event.issue.state == 'open' && github.event.issue.pull_request != null && startsWith(github.event.comment.body, '/lgtm'))
     runs-on: ubuntu-latest
     steps:
+      # Anyone can comment on a public repo, so a comment trigger MUST verify
+      # the commenter has write access — otherwise /lgtm would let any passerby
+      # merge into main. Labels are inherently safe (triage+ only).
+      - name: Verify commenter can write
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          perm=$(gh api "repos/$GH_REPO/collaborators/${{ github.event.comment.user.login }}/permission" --jq .permission)
+          if [ "$perm" != "admin" ] && [ "$perm" != "write" ]; then
+            echo "commenter ${{ github.event.comment.user.login }} has '$perm' access — not authorized to /lgtm"
+            exit 1
+          fi
       - name: Enable auto-merge
         env:
           GH_TOKEN: ${{ github.token }}
@@ -18,7 +36,9 @@ jobs:
         # checks / reviews before merging. Private repos on a free org cannot
         # enable allow_auto_merge (API silently rejects it) and have no branch
         # protection to wait for either, so --auto errors out — fall back to a
-        # direct merge there. The lgtm label itself is the human approval.
+        # direct merge there. The lgtm label or /lgtm comment is the human
+        # approval.
         run: |
-          gh pr merge ${{ github.event.pull_request.number }} --merge --auto --delete-branch || \
-            gh pr merge ${{ github.event.pull_request.number }} --merge --delete-branch
+          n=${{ github.event.pull_request.number || github.event.issue.number }}
+          gh pr merge $n --merge --auto --delete-branch || \
+            gh pr merge $n --merge --delete-branch
